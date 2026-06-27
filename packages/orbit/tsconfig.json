@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "types": ["node"],
+    "paths": {
+      "@zeronsh/orbit/client": ["./client/src/index.ts"],
+      "@zeronsh/orbit/react": ["./react/src/index.ts"],
+      "@zeronsh/orbit/server": ["./server/src/index.ts"],
+      "@zeronsh/orbit/server/pg": ["./server/src/pg.ts"],
+      "@zeronsh/orbit/orm-core": ["./orm-core/src/index.ts"],
+      "@zeronsh/orbit/drizzle": ["./drizzle/src/index.ts"],
+      "@zeronsh/orbit/drizzle/cli": ["./drizzle/src/cli/index.ts"]
+    }
+  },
+  "include": ["client", "react", "server", "orm-core", "drizzle"]
+}

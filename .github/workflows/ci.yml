@@ -1,0 +1,38 @@
+name: ci
+
+# Runs on Blacksmith runners. Upstream cache actions (setup-node/rust-cache) are
+# transparently accelerated by Blacksmith's in-datacenter cache — no fork needed.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  js:
+    runs-on: blacksmith
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @zeronsh/orbit typecheck
+      - run: pnpm --filter @zeronsh/orbit test
+      - run: pnpm --filter @zeronsh/orbit build
+
+  rust:
+    runs-on: blacksmith
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+      # Advisory: surfaces clippy lints without failing CI (newer clippy versions
+      # add lints over time). Enforce locally with `pnpm lint` (clippy -D warnings).
+      - name: clippy (advisory)
+        run: cargo clippy --all-targets -- -D warnings
+        continue-on-error: true

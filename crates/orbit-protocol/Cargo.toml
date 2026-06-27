@@ -1,0 +1,14 @@
+[package]
+name = "orbit-protocol"
+description = "Orbit client/server wire protocol message types. Rust port of Zero's zero-protocol; serde-compatible with Zero's JSON."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+oql = { path = "../oql" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "oql"
+description = "Orbit Query Language: AST, query builder, and incremental view maintenance (IVM) engine. Rust port of Zero's zql."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+smallvec = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

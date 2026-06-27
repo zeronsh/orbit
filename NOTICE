@@ -1,0 +1,11 @@
+Orbit
+Copyright 2026 Orbit authors
+
+This product includes software ported and derived from Zero, developed by
+Rocicorp (https://github.com/rocicorp/mono), licensed under the Apache
+License, Version 2.0.
+
+Orbit is an independent, unofficial Rust reimplementation of Zero. It is not
+affiliated with, sponsored by, or endorsed by Rocicorp. "Zero" and "Rocicorp"
+are used only descriptively to identify the upstream project from which parts
+of Orbit are derived.

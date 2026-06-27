@@ -1,0 +1,77 @@
+name: release
+
+# One pipeline that publishes everything, on Blacksmith runners:
+#  - `release` job: changesets opens/updates a "Version Packages" PR; merging it
+#    publishes @zeronsh/orbit to npm.
+#  - `docker` job: builds + pushes ghcr.io/zeronsh/orbit-server on every push to
+#    main (`latest` + commit sha), and additionally tags the released version
+#    whenever the npm package was just published.
+# Manual run (workflow_dispatch) rebuilds/pushes the server image with no release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: blacksmith
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write # npm provenance
+    outputs:
+      published: ${{ steps.changesets.outputs.published }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @zeronsh/orbit build
+      - id: changesets
+        uses: changesets/action@v1
+        with:
+          version: pnpm version-packages
+          publish: pnpm release
+          commit: "chore: version packages"
+          title: "chore: version packages"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - id: version
+        if: steps.changesets.outputs.published == 'true'
+        run: echo "version=$(echo '${{ steps.changesets.outputs.publishedPackages }}' | jq -r '.[0].version')" >> "$GITHUB_OUTPUT"
+
+  docker:
+    needs: release
+    runs-on: blacksmith
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/zeronsh/orbit-server
+          tags: |
+            type=raw,value=latest
+            type=sha
+            type=raw,value=v${{ needs.release.outputs.version }},enable=${{ needs.release.outputs.published == 'true' }}
+      - uses: useblacksmith/build-push-action@v1
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

@@ -1,0 +1,198 @@
+// Codegen: turn a {@link SchemaIR} into Orbit-schema TypeScript *source*. Unlike
+// the runtime builder, this preserves each column's custom `$type<>()` and enum
+// types (emitted as `string<...>()` / `json<...>()`), so the generated schema is
+// fully typed. Output is plain text; the CLI optionally runs Prettier over it.
+
+import type { IRColumn, IRRelationship, IRTable, SchemaIR } from './ir.ts';
+
+export interface EmitOptions {
+  /** Module the Orbit schema helpers are imported from. Default `@orbit/client`. */
+  readonly importFrom?: string;
+  /** Append `.js` to the import (Node16/NodeNext ESM). Default false. */
+  readonly jsExtension?: boolean;
+  /** Exported schema const name. Default `schema`. */
+  readonly schemaName?: string;
+  /** Also emit `export type <Table> = RowOf<typeof <table>>` for each table. Default true. */
+  readonly rowTypes?: boolean;
+  /** Header comment lines (without leading `//`). */
+  readonly header?: readonly string[];
+  /**
+   * Extra `import type { ... } from '...'` lines to prepend — used to bring in the
+   * named TypeScript types referenced by resolved custom column types (e.g. a
+   * `jsonb().$type<PostMeta>()` resolves to `PostMeta`, imported from the schema).
+   */
+  readonly typeImports?: readonly { readonly module: string; readonly names: readonly string[] }[];
+}
+
+const RESERVED = new Set([
+  'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger', 'default', 'delete', 'do', 'else',
+  'export', 'extends', 'false', 'finally', 'for', 'function', 'if', 'import', 'in', 'instanceof', 'new',
+  'null', 'return', 'super', 'switch', 'this', 'throw', 'true', 'try', 'typeof', 'var', 'void', 'while',
+  'with', 'yield', 'let', 'static', 'enum', 'await', 'implements', 'package', 'protected', 'interface',
+  'private', 'public', 'schema', 'table', 'string', 'number', 'boolean', 'json', 'optional', 'createSchema',
+  'relationships', 'RowOf', 'one', 'many',
+]);
+
+const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+function isValidIdent(s: string): boolean {
+  return IDENT_RE.test(s);
+}
+
+/** A stable, collision-free identifier for each table name (used as the const). */
+function tableIdentifiers(tables: readonly IRTable[]): Map<string, string> {
+  const out = new Map<string, string>();
+  const used = new Set<string>();
+  for (const t of tables) {
+    let base = t.name.replace(/[^A-Za-z0-9_$]/g, '_');
+    if (!IDENT_RE.test(base) || base.startsWith('_') === false && /^[0-9]/.test(base)) base = `t_${base}`;
+    if (RESERVED.has(base)) base = `${base}_`;
+    let ident = base;
+    let i = 2;
+    while (used.has(ident)) ident = `${base}${i++}`;
+    used.add(ident);
+    out.set(t.name, ident);
+  }
+  return out;
+}
+
+function pascal(name: string): string {
+  return name
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join('') || 'Row';
+}
+
+function keyLiteral(name: string): string {
+  return isValidIdent(name) && !RESERVED.has(name) ? name : JSON.stringify(name);
+}
+
+function fieldArray(fields: readonly string[]): string {
+  return `[${fields.map((f) => JSON.stringify(f)).join(', ')}]`;
+}
+
+function columnExpr(c: IRColumn): string {
+  const generic = c.customType ? `<${c.customType}>` : '';
+  const call = `${c.type}${generic}()`;
+  return c.optional ? `optional(${call})` : call;
+}
+
+function emitTable(t: IRTable, ident: string): string {
+  const cols = t.columns.map((c) => `    ${keyLiteral(c.name)}: ${columnExpr(c)},`).join('\n');
+  const pk = (t.primaryKey.length ? t.primaryKey : ['id']).map((k) => JSON.stringify(k)).join(', ');
+  return `const ${ident} = table(${JSON.stringify(t.name)})\n  .columns({\n${cols}\n  })\n  .primaryKey(${pk});`;
+}
+
+function emitRelationshipsBlock(
+  tableName: string,
+  rels: readonly IRRelationship[],
+  idents: Map<string, string>,
+): string {
+  const srcIdent = idents.get(tableName)!;
+  const entries = rels
+    .map((r) => {
+      const last = r.chain[r.chain.length - 1];
+      const fn = last.cardinality === 'one' ? 'one' : 'many';
+      const hops = r.chain.map((c) => {
+        const destIdent = idents.get(c.destSchema);
+        if (!destIdent) throw new Error(`@orbit/orm-core: relationship "${tableName}.${r.name}" references unknown table "${c.destSchema}"`);
+        return `{ sourceField: ${fieldArray(c.sourceField)}, destField: ${fieldArray(c.destField)}, destSchema: ${destIdent} }`;
+      });
+      const body = hops.length === 1 ? `${fn}(${hops[0]})` : `${fn}(\n        ${hops.join(',\n        ')},\n      )`;
+      return `      ${keyLiteral(r.name)}: ${body},`;
+    })
+    .join('\n');
+  return `  relationships(${srcIdent}, ({ one, many }) => ({\n${entries}\n  })),`;
+}
+
+/** Emit the full Orbit-schema TypeScript source for an IR. */
+export function emitSchema(ir: SchemaIR, options: EmitOptions = {}): string {
+  const {
+    importFrom = '@zeronsh/orbit/client',
+    jsExtension = false,
+    schemaName = 'schema',
+    rowTypes = true,
+    header = ['Generated by @orbit/orm-core — do not edit by hand.'],
+  } = options;
+
+  const idents = tableIdentifiers(ir.tables);
+
+  // Which helpers do we actually use?
+  const used = new Set<string>(['createSchema', 'table']);
+  for (const t of ir.tables) {
+    for (const c of t.columns) {
+      used.add(c.type);
+      if (c.optional) used.add('optional');
+    }
+  }
+  const hasRels = ir.relationships.length > 0;
+  if (hasRels) used.add('relationships');
+  if (rowTypes) used.add('RowOf');
+
+  // `RowOf` is a type-only export; keep it in a separate `import type` for clarity.
+  const valueImports = [...used].filter((u) => u !== 'RowOf');
+  const order = ['createSchema', 'relationships', 'table', 'string', 'number', 'boolean', 'json', 'optional'];
+  valueImports.sort((a, b) => {
+    const ia = order.indexOf(a);
+    const ib = order.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+
+  const spec = jsExtension ? `${importFrom}` : importFrom; // import path unchanged; subpath rarely needs .js
+  const lines: string[] = [];
+
+  for (const h of header) lines.push(`// ${h}`);
+  if (header.length) lines.push('');
+
+  lines.push(`import {`);
+  for (const v of valueImports) lines.push(`  ${v},`);
+  lines.push(`} from ${JSON.stringify(spec)};`);
+  if (rowTypes) lines.push(`import type { RowOf } from ${JSON.stringify(spec)};`);
+  for (const imp of options.typeImports ?? []) {
+    if (imp.names.length) lines.push(`import type { ${[...imp.names].join(', ')} } from ${JSON.stringify(imp.module)};`);
+  }
+  lines.push('');
+
+  // Tables.
+  for (const t of ir.tables) {
+    lines.push(emitTable(t, idents.get(t.name)!));
+    lines.push('');
+  }
+
+  // Schema.
+  const tableList = ir.tables.map((t) => idents.get(t.name)!).join(', ');
+  lines.push(`export const ${schemaName} = createSchema({`);
+  lines.push(`  tables: [${tableList}],`);
+  if (hasRels) {
+    const byTable = new Map<string, IRRelationship[]>();
+    for (const r of ir.relationships) {
+      const l = byTable.get(r.table) ?? [];
+      l.push(r);
+      byTable.set(r.table, l);
+    }
+    lines.push(`  relationships: [`);
+    for (const t of ir.tables) {
+      const list = byTable.get(t.name);
+      if (list && list.length) lines.push(emitRelationshipsBlock(t.name, list, idents));
+    }
+    lines.push(`  ],`);
+  }
+  lines.push(`});`);
+  lines.push('');
+  lines.push(`export type ${pascal(schemaName)} = typeof ${schemaName};`);
+
+  // Row types.
+  if (rowTypes) {
+    lines.push('');
+    const seen = new Set<string>([pascal(schemaName)]);
+    for (const t of ir.tables) {
+      let name = pascal(t.name);
+      while (seen.has(name)) name = `${name}Row`;
+      seen.add(name);
+      lines.push(`export type ${name} = RowOf<typeof ${idents.get(t.name)!}>;`);
+    }
+  }
+
+  return lines.join('\n') + '\n';
+}

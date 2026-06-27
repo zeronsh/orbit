@@ -1,0 +1,37 @@
+{
+  "name": "@zeronsh/orbit-demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev --port 5173 --host 127.0.0.1",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "generate:schema": "node --experimental-strip-types ../../packages/orbit/drizzle/src/cli/bin.ts -c orbit-drizzle.config.ts",
+    "auth:migrate": "node --experimental-strip-types scripts/migrate.ts",
+    "start": "node server-prod.mjs"
+  },
+  "dependencies": {
+    "@zeronsh/orbit": "workspace:*",
+    "@tanstack/react-router": "^1.170.16",
+    "@tanstack/react-start": "^1.168.26",
+    "@wingleeio/ori-core": "^0.5.0",
+    "@wingleeio/ori-react": "^0.5.0",
+    "better-auth": "^1.2.8",
+    "pg": "^8.13.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "yjs": "^13.6.31"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "@types/pg": "^8.11.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "drizzle-orm": "1.0.0-rc.3",
+    "ts-morph": "^27.0.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.0"
+  }
+}

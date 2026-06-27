@@ -1,0 +1,14 @@
+[package]
+name = "orbit-schema"
+description = "Orbit schema definition types + builder. Rust port of Zero's zero-schema."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+oql = { path = "../oql" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,54 @@
+# Self-contained Orbit stack: Postgres (logical replication) + orbit-server.
+#   ORBIT_TABLES=issue:id,comment:id docker compose -f deploy/docker-compose.yml up
+# Build locally instead of pulling: `docker compose ... up --build`.
+
+services:
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10"]
+    environment:
+      POSTGRES_USER: orbit
+      POSTGRES_DB: orbit
+      # orbit-server connects without a password; use trust on the internal network.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5433:5432" # host:container — matches the dev default of 5433
+    volumes:
+      - orbit-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbit -d orbit"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  orbit-server:
+    image: ghcr.io/zeronsh/orbit-server:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ORBIT_PG_HOST: postgres
+      ORBIT_PG_PORT: "5432"
+      ORBIT_PG_USER: orbit
+      ORBIT_PG_DB: orbit
+      ORBIT_LISTEN: 0.0.0.0:4848
+      # Required: comma-separated `table:pkColumn` specs Orbit replicates + serves.
+      ORBIT_TABLES: ${ORBIT_TABLES:?set ORBIT_TABLES, e.g. issue:id,comment:id}
+      # Durable replica on a volume (omit / set "memory" for ephemeral).
+      ORBIT_REPLICA: sqlite
+      ORBIT_REPLICA_DIR: /data
+      # Custom mutators/queries: forward to your app's endpoints (Zero-style).
+      # ORBIT_MUTATE_URL: http://your-app:3000/api/push
+      # ORBIT_QUERY_URL: http://your-app:3000/api/query
+      # ORBIT_API_KEY: ${ORBIT_API_KEY}
+    volumes:
+      - orbit-data:/data
+    ports:
+      - "4848:4848"
+
+volumes:
+  orbit-pg:
+  orbit-data:

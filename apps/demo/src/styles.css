@@ -1,0 +1,382 @@
+/* Orbit Pixels — a realtime collaborative canvas. Clean, high-contrast, grayscale
+   "Vercel/Geist" aesthetic: near-white surfaces, hairline borders, black ink, a
+   single live-green accent. The color lives only in the pixels people paint. */
+
+:root {
+  --bg: #fafafa;
+  --panel: #ffffff;
+  --ink: #171717;
+  --ink-soft: #2a2a2a;
+  --muted: #666666;
+  --faint: #8f8f8f;
+
+  --line: #ededed;
+  --line-2: #e2e2e2;
+  --hover: #f4f4f4;
+  --active: #ececec;
+
+  --board: #ffffff;
+  --live: #16a34a;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow: 0 4px 16px -4px rgba(0, 0, 0, 0.1), 0 2px 6px -2px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 16px 48px -12px rgba(0, 0, 0, 0.18), 0 4px 12px -4px rgba(0, 0, 0, 0.1);
+
+  --radius: 14px;
+  --radius-sm: 9px;
+
+  --sans: 'Geist', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 13.5px;
+  line-height: 1.5;
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button {
+  font-family: inherit;
+  color: inherit;
+  border: none;
+  background: none;
+  cursor: pointer;
+  letter-spacing: inherit;
+}
+
+/* ---------- shell ---------- */
+
+.app {
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+}
+
+/* floating top-right cluster (live count + identity) over the full-screen canvas */
+.bar {
+  position: fixed;
+  top: max(14px, env(safe-area-inset-top, 0px));
+  right: max(14px, env(safe-area-inset-right, 0px));
+  z-index: 5;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 14px;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+.brand b {
+  font-weight: 600;
+}
+.logo {
+  width: 17px;
+  height: 17px;
+  border-radius: 5px;
+  background: var(--ink);
+  position: relative;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+.logo::after {
+  content: '';
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  border-radius: 2px;
+  background: #fff;
+  right: 3px;
+  bottom: 3px;
+}
+
+.bar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.live,
+.me {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line-2);
+  background: var(--panel);
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--live);
+  box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.5);
+  animation: pulse 2s infinite;
+}
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.45);
+  }
+  70% {
+    box-shadow: 0 0 0 6px rgba(22, 163, 74, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(22, 163, 74, 0);
+  }
+}
+.me {
+  color: var(--ink-soft);
+  font-weight: 500;
+}
+.me-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.ghost {
+  height: 28px;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  color: var(--muted);
+  font-size: 12px;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.ghost:hover {
+  background: var(--hover);
+  color: var(--ink);
+  border-color: var(--line-2);
+}
+.ghost.danger:hover {
+  color: #dc2626;
+  border-color: #f3c9c9;
+  background: #fef2f2;
+}
+
+/* ---------- full-screen canvas ---------- */
+
+.canvas {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  touch-action: none;
+  background: var(--bg);
+  z-index: 0;
+}
+.canvas.paint {
+  cursor: crosshair;
+}
+.canvas.erase {
+  cursor: cell;
+}
+.canvas.pan {
+  cursor: grab;
+}
+.canvas.pan:active {
+  cursor: grabbing;
+}
+
+/* ---------- toolbar ---------- */
+
+.toolbar {
+  position: fixed;
+  left: 50%;
+  bottom: max(24px, env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100vw - 16px);
+  padding: 7px;
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: saturate(180%) blur(14px);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  z-index: 10;
+}
+.toolbar .div {
+  width: 1px;
+  height: 22px;
+  background: var(--line-2);
+}
+
+.seg {
+  display: flex;
+  gap: 3px;
+}
+.tool {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  transition: background 0.12s, color 0.12s;
+}
+.tool:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+.tool.on {
+  background: var(--ink);
+  color: #fff;
+}
+
+.swatches {
+  display: flex;
+  gap: 5px;
+  transition: opacity 0.15s;
+}
+.swatches.dim {
+  opacity: 0.4;
+  pointer-events: none;
+}
+.swatch {
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+  transition: transform 0.1s, box-shadow 0.1s;
+}
+.swatch:hover {
+  transform: translateY(-1px);
+}
+.swatch.on {
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12), 0 0 0 2px #fff, 0 0 0 4px var(--ink);
+}
+
+.sizes {
+  display: flex;
+  gap: 2px;
+}
+.size {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  transition: background 0.12s;
+}
+.size:hover {
+  background: var(--hover);
+}
+.size.on {
+  background: var(--active);
+}
+.size-dot {
+  display: block;
+  border-radius: 50%;
+  background: var(--ink);
+}
+.size:not(.on) .size-dot {
+  background: var(--faint);
+}
+
+/* ---------- splash ---------- */
+
+.splash,
+.loading-screen {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.splash-logo {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  background: var(--ink);
+  animation: bob 1.1s ease-in-out infinite;
+}
+@keyframes bob {
+  0%,
+  100% {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: translateY(-5px) scale(0.94);
+    opacity: 0.65;
+  }
+}
+.splash-label {
+  letter-spacing: -0.01em;
+}
+
+/* ---------- mobile ---------- */
+/* On a phone the single-row toolbar overflows. Drop the dividers, give the swatches
+   their own full-width row (wrapping if needed), and enlarge the tap targets. */
+@media (max-width: 560px) {
+  .toolbar {
+    gap: 8px 6px;
+    padding: 8px;
+  }
+  .toolbar .div {
+    display: none;
+  }
+  .seg {
+    gap: 5px;
+  }
+  .tool {
+    width: 40px;
+    height: 40px;
+  }
+  .swatches {
+    order: 3;
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 7px;
+  }
+  .swatch {
+    width: 27px;
+    height: 27px;
+    border-radius: 8px;
+  }
+  .swatch.on {
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12), 0 0 0 2px #fff, 0 0 0 3px var(--ink);
+  }
+  .sizes {
+    gap: 4px;
+  }
+  .size {
+    width: 36px;
+    height: 36px;
+  }
+  .live,
+  .me {
+    height: 30px;
+    font-size: 12.5px;
+  }
+}

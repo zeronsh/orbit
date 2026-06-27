@@ -1,0 +1,2033 @@
+[
+  {
+    "name": "filter_eq_with_mutations",
+    "tables": {
+      "t": {
+        "columns": {
+          "a": {
+            "type": "number"
+          },
+          "b": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "a"
+        ],
+        "rows": [
+          {
+            "a": 1,
+            "b": "foo"
+          },
+          {
+            "a": 2,
+            "b": "bar"
+          },
+          {
+            "a": 3,
+            "b": "foo"
+          }
+        ]
+      }
+    },
+    "ast": {
+      "table": "t",
+      "where": {
+        "type": "simple",
+        "op": "=",
+        "left": {
+          "type": "column",
+          "name": "b"
+        },
+        "right": {
+          "type": "literal",
+          "value": "foo"
+        }
+      },
+      "orderBy": [
+        [
+          "a",
+          "asc"
+        ]
+      ]
+    },
+    "pushes": [
+      {
+        "table": "t",
+        "op": "add",
+        "row": {
+          "a": 4,
+          "b": "foo"
+        }
+      },
+      {
+        "table": "t",
+        "op": "add",
+        "row": {
+          "a": 5,
+          "b": "bar"
+        }
+      },
+      {
+        "table": "t",
+        "op": "remove",
+        "row": {
+          "a": 1,
+          "b": "foo"
+        }
+      },
+      {
+        "table": "t",
+        "op": "edit",
+        "row": {
+          "a": 2,
+          "b": "foo"
+        },
+        "oldRow": {
+          "a": 2,
+          "b": "bar"
+        }
+      }
+    ],
+    "snapshots": [
+      [
+        {
+          "row": {
+            "a": 1,
+            "b": "foo"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 3,
+            "b": "foo"
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "a": 1,
+            "b": "foo"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 3,
+            "b": "foo"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 4,
+            "b": "foo"
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "a": 1,
+            "b": "foo"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 3,
+            "b": "foo"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 4,
+            "b": "foo"
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "a": 3,
+            "b": "foo"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 4,
+            "b": "foo"
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "a": 2,
+            "b": "foo"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 3,
+            "b": "foo"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 4,
+            "b": "foo"
+          },
+          "rels": {}
+        }
+      ]
+    ]
+  },
+  {
+    "name": "filter_range_and_orderby_desc",
+    "tables": {
+      "t": {
+        "columns": {
+          "a": {
+            "type": "number"
+          }
+        },
+        "pk": [
+          "a"
+        ],
+        "rows": [
+          {
+            "a": 1
+          },
+          {
+            "a": 2
+          },
+          {
+            "a": 3
+          },
+          {
+            "a": 4
+          },
+          {
+            "a": 5
+          }
+        ]
+      }
+    },
+    "ast": {
+      "table": "t",
+      "where": {
+        "type": "simple",
+        "op": ">=",
+        "left": {
+          "type": "column",
+          "name": "a"
+        },
+        "right": {
+          "type": "literal",
+          "value": 3
+        }
+      },
+      "orderBy": [
+        [
+          "a",
+          "desc"
+        ]
+      ]
+    },
+    "pushes": [
+      {
+        "table": "t",
+        "op": "add",
+        "row": {
+          "a": 6
+        }
+      },
+      {
+        "table": "t",
+        "op": "edit",
+        "row": {
+          "a": 2
+        },
+        "oldRow": {
+          "a": 4
+        }
+      }
+    ],
+    "snapshots": [
+      [
+        {
+          "row": {
+            "a": 5
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 4
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 3
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "a": 6
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 5
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 4
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 3
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "a": 6
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 5
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 3
+          },
+          "rels": {}
+        }
+      ]
+    ]
+  },
+  {
+    "name": "limit_take",
+    "tables": {
+      "t": {
+        "columns": {
+          "a": {
+            "type": "number"
+          }
+        },
+        "pk": [
+          "a"
+        ],
+        "rows": [
+          {
+            "a": 3
+          },
+          {
+            "a": 1
+          },
+          {
+            "a": 2
+          }
+        ]
+      }
+    },
+    "ast": {
+      "table": "t",
+      "orderBy": [
+        [
+          "a",
+          "asc"
+        ]
+      ],
+      "limit": 2
+    },
+    "pushes": [
+      {
+        "table": "t",
+        "op": "add",
+        "row": {
+          "a": 0
+        }
+      },
+      {
+        "table": "t",
+        "op": "remove",
+        "row": {
+          "a": 1
+        }
+      },
+      {
+        "table": "t",
+        "op": "add",
+        "row": {
+          "a": 5
+        }
+      }
+    ],
+    "snapshots": [
+      [
+        {
+          "row": {
+            "a": 1
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 2
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "a": 0
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 1
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "a": 0
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 2
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "a": 0
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "a": 2
+          },
+          "rels": {}
+        }
+      ]
+    ]
+  },
+  {
+    "name": "related_join",
+    "tables": {
+      "issue": {
+        "columns": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "i1"
+          },
+          {
+            "id": "i2"
+          }
+        ]
+      },
+      "comment": {
+        "columns": {
+          "id": {
+            "type": "string"
+          },
+          "issueID": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "c1",
+            "issueID": "i1"
+          }
+        ]
+      }
+    },
+    "ast": {
+      "table": "issue",
+      "orderBy": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "related": [
+        {
+          "correlation": {
+            "parentField": [
+              "id"
+            ],
+            "childField": [
+              "issueID"
+            ]
+          },
+          "subquery": {
+            "table": "comment",
+            "alias": "comments",
+            "orderBy": [
+              [
+                "id",
+                "asc"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    "pushes": [
+      {
+        "table": "comment",
+        "op": "add",
+        "row": {
+          "id": "c2",
+          "issueID": "i2"
+        }
+      },
+      {
+        "table": "comment",
+        "op": "add",
+        "row": {
+          "id": "c3",
+          "issueID": "i1"
+        }
+      },
+      {
+        "table": "comment",
+        "op": "remove",
+        "row": {
+          "id": "c1",
+          "issueID": "i1"
+        }
+      },
+      {
+        "table": "issue",
+        "op": "add",
+        "row": {
+          "id": "i3"
+        }
+      }
+    ],
+    "snapshots": [
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c1",
+                  "issueID": "i1"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        },
+        {
+          "row": {
+            "id": "i2"
+          },
+          "rels": {
+            "comments": []
+          }
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c1",
+                  "issueID": "i1"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        },
+        {
+          "row": {
+            "id": "i2"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c2",
+                  "issueID": "i2"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c1",
+                  "issueID": "i1"
+                },
+                "rels": {}
+              },
+              {
+                "row": {
+                  "id": "c3",
+                  "issueID": "i1"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        },
+        {
+          "row": {
+            "id": "i2"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c2",
+                  "issueID": "i2"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c3",
+                  "issueID": "i1"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        },
+        {
+          "row": {
+            "id": "i2"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c2",
+                  "issueID": "i2"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c3",
+                  "issueID": "i1"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        },
+        {
+          "row": {
+            "id": "i2"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c2",
+                  "issueID": "i2"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        },
+        {
+          "row": {
+            "id": "i3"
+          },
+          "rels": {
+            "comments": []
+          }
+        }
+      ]
+    ]
+  },
+  {
+    "name": "related_join_per_parent_limit",
+    "tables": {
+      "issue": {
+        "columns": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "i1"
+          },
+          {
+            "id": "i2"
+          }
+        ]
+      },
+      "comment": {
+        "columns": {
+          "id": {
+            "type": "string"
+          },
+          "issueID": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "c1",
+            "issueID": "i1"
+          },
+          {
+            "id": "c2",
+            "issueID": "i1"
+          },
+          {
+            "id": "c3",
+            "issueID": "i1"
+          },
+          {
+            "id": "c4",
+            "issueID": "i2"
+          }
+        ]
+      }
+    },
+    "ast": {
+      "table": "issue",
+      "orderBy": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "related": [
+        {
+          "correlation": {
+            "parentField": [
+              "id"
+            ],
+            "childField": [
+              "issueID"
+            ]
+          },
+          "subquery": {
+            "table": "comment",
+            "alias": "comments",
+            "orderBy": [
+              [
+                "id",
+                "asc"
+              ]
+            ],
+            "limit": 2
+          }
+        }
+      ]
+    },
+    "pushes": [
+      {
+        "table": "comment",
+        "op": "add",
+        "row": {
+          "id": "c0",
+          "issueID": "i1"
+        }
+      }
+    ],
+    "snapshots": [
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c1",
+                  "issueID": "i1"
+                },
+                "rels": {}
+              },
+              {
+                "row": {
+                  "id": "c2",
+                  "issueID": "i1"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        },
+        {
+          "row": {
+            "id": "i2"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c4",
+                  "issueID": "i2"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c0",
+                  "issueID": "i1"
+                },
+                "rels": {}
+              },
+              {
+                "row": {
+                  "id": "c1",
+                  "issueID": "i1"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        },
+        {
+          "row": {
+            "id": "i2"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c4",
+                  "issueID": "i2"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        }
+      ]
+    ]
+  },
+  {
+    "name": "where_exists",
+    "tables": {
+      "issue": {
+        "columns": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "i1"
+          },
+          {
+            "id": "i2"
+          },
+          {
+            "id": "i3"
+          }
+        ]
+      },
+      "comment": {
+        "columns": {
+          "id": {
+            "type": "string"
+          },
+          "issueID": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "c1",
+            "issueID": "i2"
+          }
+        ]
+      }
+    },
+    "ast": {
+      "table": "issue",
+      "orderBy": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "where": {
+        "type": "correlatedSubquery",
+        "related": {
+          "correlation": {
+            "parentField": [
+              "id"
+            ],
+            "childField": [
+              "issueID"
+            ]
+          },
+          "subquery": {
+            "table": "comment",
+            "alias": "comments"
+          }
+        },
+        "op": "EXISTS"
+      }
+    },
+    "pushes": [
+      {
+        "table": "comment",
+        "op": "add",
+        "row": {
+          "id": "c2",
+          "issueID": "i1"
+        }
+      },
+      {
+        "table": "comment",
+        "op": "remove",
+        "row": {
+          "id": "c1",
+          "issueID": "i2"
+        }
+      }
+    ],
+    "snapshots": [
+      [
+        {
+          "row": {
+            "id": "i2"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c1",
+                  "issueID": "i2"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c2",
+                  "issueID": "i1"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        },
+        {
+          "row": {
+            "id": "i2"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c1",
+                  "issueID": "i2"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c2",
+                  "issueID": "i1"
+                },
+                "rels": {}
+              }
+            ]
+          }
+        }
+      ]
+    ]
+  },
+  {
+    "name": "not_exists",
+    "tables": {
+      "issue": {
+        "columns": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "i1"
+          },
+          {
+            "id": "i2"
+          },
+          {
+            "id": "i3"
+          }
+        ]
+      },
+      "comment": {
+        "columns": {
+          "id": {
+            "type": "string"
+          },
+          "issueID": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "c1",
+            "issueID": "i2"
+          }
+        ]
+      }
+    },
+    "ast": {
+      "table": "issue",
+      "orderBy": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "where": {
+        "type": "correlatedSubquery",
+        "related": {
+          "correlation": {
+            "parentField": [
+              "id"
+            ],
+            "childField": [
+              "issueID"
+            ]
+          },
+          "subquery": {
+            "table": "comment",
+            "alias": "comments"
+          }
+        },
+        "op": "NOT EXISTS"
+      }
+    },
+    "pushes": [
+      {
+        "table": "comment",
+        "op": "add",
+        "row": {
+          "id": "c2",
+          "issueID": "i1"
+        }
+      },
+      {
+        "table": "comment",
+        "op": "remove",
+        "row": {
+          "id": "c1",
+          "issueID": "i2"
+        }
+      }
+    ],
+    "snapshots": [
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": []
+          }
+        },
+        {
+          "row": {
+            "id": "i3"
+          },
+          "rels": {
+            "comments": []
+          }
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "i3"
+          },
+          "rels": {
+            "comments": []
+          }
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "i2"
+          },
+          "rels": {
+            "comments": []
+          }
+        },
+        {
+          "row": {
+            "id": "i3"
+          },
+          "rels": {
+            "comments": []
+          }
+        }
+      ]
+    ]
+  },
+  {
+    "name": "or_condition",
+    "tables": {
+      "t": {
+        "columns": {
+          "id": {
+            "type": "string"
+          },
+          "v": {
+            "type": "number"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "a",
+            "v": 1
+          },
+          {
+            "id": "b",
+            "v": 2
+          },
+          {
+            "id": "c",
+            "v": 3
+          }
+        ]
+      }
+    },
+    "ast": {
+      "table": "t",
+      "orderBy": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "where": {
+        "type": "or",
+        "conditions": [
+          {
+            "type": "simple",
+            "op": "=",
+            "left": {
+              "type": "column",
+              "name": "id"
+            },
+            "right": {
+              "type": "literal",
+              "value": "a"
+            }
+          },
+          {
+            "type": "simple",
+            "op": ">",
+            "left": {
+              "type": "column",
+              "name": "v"
+            },
+            "right": {
+              "type": "literal",
+              "value": 2
+            }
+          }
+        ]
+      }
+    },
+    "pushes": [
+      {
+        "table": "t",
+        "op": "edit",
+        "row": {
+          "id": "b",
+          "v": 5
+        },
+        "oldRow": {
+          "id": "b",
+          "v": 2
+        }
+      },
+      {
+        "table": "t",
+        "op": "edit",
+        "row": {
+          "id": "c",
+          "v": 0
+        },
+        "oldRow": {
+          "id": "c",
+          "v": 3
+        }
+      }
+    ],
+    "snapshots": [
+      [
+        {
+          "row": {
+            "id": "a",
+            "v": 1
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": "c",
+            "v": 3
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "a",
+            "v": 1
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": "b",
+            "v": 5
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": "c",
+            "v": 3
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "a",
+            "v": 1
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": "b",
+            "v": 5
+          },
+          "rels": {}
+        }
+      ]
+    ]
+  },
+  {
+    "name": "in_and_like",
+    "tables": {
+      "t": {
+        "columns": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "1",
+            "name": "apple"
+          },
+          {
+            "id": "2",
+            "name": "apricot"
+          },
+          {
+            "id": "3",
+            "name": "banana"
+          }
+        ]
+      }
+    },
+    "ast": {
+      "table": "t",
+      "orderBy": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "where": {
+        "type": "and",
+        "conditions": [
+          {
+            "type": "simple",
+            "op": "LIKE",
+            "left": {
+              "type": "column",
+              "name": "name"
+            },
+            "right": {
+              "type": "literal",
+              "value": "a%"
+            }
+          },
+          {
+            "type": "simple",
+            "op": "IN",
+            "left": {
+              "type": "column",
+              "name": "id"
+            },
+            "right": {
+              "type": "literal",
+              "value": [
+                "1",
+                "2",
+                "3"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "pushes": [
+      {
+        "table": "t",
+        "op": "add",
+        "row": {
+          "id": "4",
+          "name": "avocado"
+        }
+      },
+      {
+        "table": "t",
+        "op": "add",
+        "row": {
+          "id": "5",
+          "name": "cherry"
+        }
+      }
+    ],
+    "snapshots": [
+      [
+        {
+          "row": {
+            "id": "1",
+            "name": "apple"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": "2",
+            "name": "apricot"
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "1",
+            "name": "apple"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": "2",
+            "name": "apricot"
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "1",
+            "name": "apple"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": "2",
+            "name": "apricot"
+          },
+          "rels": {}
+        }
+      ]
+    ]
+  },
+  {
+    "name": "nested_related",
+    "tables": {
+      "issue": {
+        "columns": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "i1"
+          }
+        ]
+      },
+      "comment": {
+        "columns": {
+          "id": {
+            "type": "string"
+          },
+          "issueID": {
+            "type": "string"
+          },
+          "authorID": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "c1",
+            "issueID": "i1",
+            "authorID": "u1"
+          }
+        ]
+      },
+      "user": {
+        "columns": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": "u1",
+            "name": "Ada"
+          }
+        ]
+      }
+    },
+    "ast": {
+      "table": "issue",
+      "orderBy": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "related": [
+        {
+          "correlation": {
+            "parentField": [
+              "id"
+            ],
+            "childField": [
+              "issueID"
+            ]
+          },
+          "subquery": {
+            "table": "comment",
+            "alias": "comments",
+            "orderBy": [
+              [
+                "id",
+                "asc"
+              ]
+            ],
+            "related": [
+              {
+                "correlation": {
+                  "parentField": [
+                    "authorID"
+                  ],
+                  "childField": [
+                    "id"
+                  ]
+                },
+                "subquery": {
+                  "table": "user",
+                  "alias": "author",
+                  "orderBy": [
+                    [
+                      "id",
+                      "asc"
+                    ]
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "pushes": [
+      {
+        "table": "user",
+        "op": "edit",
+        "row": {
+          "id": "u1",
+          "name": "Ada L"
+        },
+        "oldRow": {
+          "id": "u1",
+          "name": "Ada"
+        }
+      },
+      {
+        "table": "comment",
+        "op": "add",
+        "row": {
+          "id": "c2",
+          "issueID": "i1",
+          "authorID": "u1"
+        }
+      }
+    ],
+    "snapshots": [
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c1",
+                  "issueID": "i1",
+                  "authorID": "u1"
+                },
+                "rels": {
+                  "author": [
+                    {
+                      "row": {
+                        "id": "u1",
+                        "name": "Ada"
+                      },
+                      "rels": {}
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c1",
+                  "issueID": "i1",
+                  "authorID": "u1"
+                },
+                "rels": {
+                  "author": [
+                    {
+                      "row": {
+                        "id": "u1",
+                        "name": "Ada L"
+                      },
+                      "rels": {}
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": "i1"
+          },
+          "rels": {
+            "comments": [
+              {
+                "row": {
+                  "id": "c1",
+                  "issueID": "i1",
+                  "authorID": "u1"
+                },
+                "rels": {
+                  "author": [
+                    {
+                      "row": {
+                        "id": "u1",
+                        "name": "Ada L"
+                      },
+                      "rels": {}
+                    }
+                  ]
+                }
+              },
+              {
+                "row": {
+                  "id": "c2",
+                  "issueID": "i1",
+                  "authorID": "u1"
+                },
+                "rels": {
+                  "author": [
+                    {
+                      "row": {
+                        "id": "u1",
+                        "name": "Ada L"
+                      },
+                      "rels": {}
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    ]
+  },
+  {
+    "name": "start_cursor",
+    "tables": {
+      "t": {
+        "columns": {
+          "id": {
+            "type": "number"
+          }
+        },
+        "pk": [
+          "id"
+        ],
+        "rows": [
+          {
+            "id": 1
+          },
+          {
+            "id": 2
+          },
+          {
+            "id": 3
+          },
+          {
+            "id": 4
+          },
+          {
+            "id": 5
+          }
+        ]
+      }
+    },
+    "ast": {
+      "table": "t",
+      "orderBy": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "start": {
+        "row": {
+          "id": 2
+        },
+        "exclusive": true
+      }
+    },
+    "pushes": [
+      {
+        "table": "t",
+        "op": "add",
+        "row": {
+          "id": 6
+        }
+      },
+      {
+        "table": "t",
+        "op": "remove",
+        "row": {
+          "id": 3
+        }
+      }
+    ],
+    "snapshots": [
+      [
+        {
+          "row": {
+            "id": 3
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": 4
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": 5
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": 3
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": 4
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": 5
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": 6
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "id": 4
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": 5
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "id": 6
+          },
+          "rels": {}
+        }
+      ]
+    ]
+  },
+  {
+    "name": "compound_pk_orderby",
+    "tables": {
+      "t": {
+        "columns": {
+          "region": {
+            "type": "string"
+          },
+          "id": {
+            "type": "number"
+          },
+          "v": {
+            "type": "string"
+          }
+        },
+        "pk": [
+          "region",
+          "id"
+        ],
+        "rows": [
+          {
+            "region": "us",
+            "id": 1,
+            "v": "a"
+          },
+          {
+            "region": "eu",
+            "id": 1,
+            "v": "b"
+          },
+          {
+            "region": "us",
+            "id": 2,
+            "v": "c"
+          }
+        ]
+      }
+    },
+    "ast": {
+      "table": "t",
+      "orderBy": [
+        [
+          "region",
+          "asc"
+        ],
+        [
+          "id",
+          "asc"
+        ]
+      ]
+    },
+    "pushes": [
+      {
+        "table": "t",
+        "op": "remove",
+        "row": {
+          "region": "us",
+          "id": 1,
+          "v": "a"
+        }
+      },
+      {
+        "table": "t",
+        "op": "add",
+        "row": {
+          "region": "eu",
+          "id": 2,
+          "v": "d"
+        }
+      }
+    ],
+    "snapshots": [
+      [
+        {
+          "row": {
+            "region": "eu",
+            "id": 1,
+            "v": "b"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "region": "us",
+            "id": 1,
+            "v": "a"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "region": "us",
+            "id": 2,
+            "v": "c"
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "region": "eu",
+            "id": 1,
+            "v": "b"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "region": "us",
+            "id": 2,
+            "v": "c"
+          },
+          "rels": {}
+        }
+      ],
+      [
+        {
+          "row": {
+            "region": "eu",
+            "id": 1,
+            "v": "b"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "region": "eu",
+            "id": 2,
+            "v": "d"
+          },
+          "rels": {}
+        },
+        {
+          "row": {
+            "region": "us",
+            "id": 2,
+            "v": "c"
+          },
+          "rels": {}
+        }
+      ]
+    ]
+  }
+]

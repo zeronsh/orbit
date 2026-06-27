@@ -1,0 +1,11 @@
+{
+  "name": "@zeronsh/orbit-crates",
+  "private": true,
+  "description": "The Rust crates (Cargo workspace), wrapped so Turbo can orchestrate them alongside the JS packages. cargo finds the workspace Cargo.toml in the parent dir.",
+  "scripts": {
+    "rust:build": "cargo build --release",
+    "rust:test": "cargo test",
+    "rust:check": "cargo check --all-targets",
+    "rust:lint": "cargo clippy --all-targets -- -D warnings"
+  }
+}

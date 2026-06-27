@@ -1,0 +1,13 @@
+# Orbit cluster node (replicator | view-syncer) for Railway.
+# Build context = repo root. Role + config come from env (see src/bin/orbit-node.rs).
+FROM rust:1-bookworm AS build
+WORKDIR /app
+COPY . .
+RUN cargo build --release -p orbit-cache --features s3 --bin orbit-node
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /app/target/release/orbit-node /usr/local/bin/orbit-node
+ENV ORBIT_TABLES=user:id,issue:id,comment:id
+CMD ["orbit-node"]

@@ -1,0 +1,5 @@
+# Postgres with logical replication for Railway (Orbit needs wal_level=logical).
+# Deploy this as its own service + a volume mounted at /var/lib/postgresql/data,
+# with POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB set.
+FROM postgres:16
+CMD ["postgres", "-c", "wal_level=logical", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10"]

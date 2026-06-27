@@ -1,0 +1,29 @@
+# Postgres configured for logical replication, with the `todo` table seeded.
+# `docker compose up -d` and you have everything the Orbit server needs.
+services:
+  postgres:
+    image: postgres:16
+    container_name: orbit-todo-pg
+    environment:
+      POSTGRES_USER: orbit
+      POSTGRES_DB: orbit
+      POSTGRES_HOST_AUTH_METHOD: trust
+    # wal_level=logical is required for logical replication (Orbit's change feed).
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./postgres/00-hba.sh:/docker-entrypoint-initdb.d/00-hba.sh
+      - ./postgres/01-init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbit -d orbit"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

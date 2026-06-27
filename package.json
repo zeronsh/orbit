@@ -1,0 +1,24 @@
+{
+  "name": "orbit",
+  "private": true,
+  "description": "Orbit: a Rust rebuild of Zero. Turborepo monorepo — JS packages + apps + Rust crates.",
+  "packageManager": "pnpm@10.32.1",
+  "scripts": {
+    "build": "turbo run build rust:build",
+    "test": "turbo run test rust:test",
+    "typecheck": "turbo run typecheck rust:check",
+    "lint": "turbo run lint rust:lint",
+    "check": "turbo run typecheck test rust:check rust:test",
+    "dev": "turbo run dev",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "changeset publish"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.0",
+    "turbo": "^2.3.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}

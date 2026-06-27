@@ -1,0 +1,55 @@
+[package]
+name = "orbit-cache"
+description = "Orbit sync engine: Postgres logical replication, replica, and view-syncer. Rust port of Zero's zero-cache."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+oql = { path = "../oql" }
+orbit-protocol = { path = "../orbit-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+postgres-protocol = "0.6"
+postgres-types = "0.2"
+futures-util = "0.3"
+bytes = "1"
+tokio-tungstenite = "0.24"
+base64 = { workspace = true }
+percent-encoding = { workspace = true }
+rusqlite = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# SCRAM-SHA-256 auth for the raw logical-replication connection (managed Postgres).
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+rand = "0.8"
+# S3/Tigris-backed object store (replica snapshots). Enable with --features s3.
+object_store = { version = "0.11", features = ["aws"], optional = true }
+
+[features]
+# An S3-compatible (AWS S3, Tigris, MinIO, …) ObjectStore for replica snapshots.
+s3 = ["dep:object_store"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+# Scalable multithread allocator for the multinode benchmark (the system malloc
+# serializes under per-core fan-out allocation). Representative of production.
+mimalloc = "0.1"
+
+[[example]]
+name = "multinode_bench"
+path = "examples/multinode_bench.rs"
+
+# Multinode cluster node (replicator | view-syncer). Needs the s3 object store.
+[[bin]]
+name = "orbit-node"
+path = "src/bin/orbit-node.rs"
+required-features = ["s3"]
