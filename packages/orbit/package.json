@@ -1,6 +1,6 @@
 {
   "name": "@zeronsh/orbit",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Orbit — a Rust rebuild of Zero. Type-safe sync client, React bindings, server helpers, and Drizzle schema generation, all under one tree-shakeable package.",
   "type": "module",
   "license": "MIT",
@@ -66,11 +66,21 @@
     "ts-morph": ">=24.0.0"
   },
   "peerDependenciesMeta": {
-    "drizzle-orm": { "optional": true },
-    "pg": { "optional": true },
-    "prettier": { "optional": true },
-    "react": { "optional": true },
-    "ts-morph": { "optional": true }
+    "drizzle-orm": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    },
+    "prettier": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "ts-morph": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22",
