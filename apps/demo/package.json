@@ -7,12 +7,12 @@
     "dev": "vite dev --port 5173 --host 127.0.0.1",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "generate:schema": "node --experimental-strip-types ../../packages/orbit/drizzle/src/cli/bin.ts -c orbit-drizzle.config.ts",
+    "generate:schema": "orbit-drizzle -c orbit-drizzle.config.ts",
     "auth:migrate": "node --experimental-strip-types scripts/migrate.ts",
     "start": "node server-prod.mjs"
   },
   "dependencies": {
-    "@zeronsh/orbit": "workspace:*",
+    "@zeronsh/orbit": "^0.1.0",
     "@tanstack/react-router": "^1.170.16",
     "@tanstack/react-start": "^1.168.26",
     "@wingleeio/ori-core": "^0.5.0",

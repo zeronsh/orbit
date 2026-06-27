@@ -30,8 +30,8 @@ importers:
         specifier: ^0.5.0
         version: 0.5.0(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(yjs@13.6.31)
       '@zeronsh/orbit':
-        specifier: workspace:*
-        version: link:../../packages/orbit
+        specifier: ^0.1.0
+        version: 0.1.0(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(prettier@3.8.4)(react@19.2.7)(ts-morph@27.0.2)
       better-auth:
         specifier: ^1.2.8
         version: 1.6.20(@tanstack/react-start@1.168.26(esbuild@0.27.7)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(rolldown@1.1.3)(rollup@4.62.2)(vite@8.1.0(@types/node@26.0.0)(esbuild@0.27.7)(jiti@2.7.0)))(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
@@ -1032,6 +1032,27 @@ packages:
       react: ^18 || ^19
       react-dom: ^18 || ^19
       yjs: ^13.6.0
+
+  '@zeronsh/orbit@0.1.0':
+    resolution: {integrity: sha512-6l39E2tffIpob/otVlInNnap5Mc3XZ8tf2U3Yy50qPl0GzjfTnCdvHhCpkBpVGQDD3vUs/wvowhztjpAioQPVw==}
+    hasBin: true
+    peerDependencies:
+      drizzle-orm: '>=0.36.0'
+      pg: ^8
+      prettier: '>=3.0.0'
+      react: '>=18'
+      ts-morph: '>=24.0.0'
+    peerDependenciesMeta:
+      drizzle-orm:
+        optional: true
+      pg:
+        optional: true
+      prettier:
+        optional: true
+      react:
+        optional: true
+      ts-morph:
+        optional: true
 
   acorn@8.17.0:
     resolution: {integrity: sha512-xRQbDb9BnwDafYNn6Vwl839DYVjqXYb1XVGtWAZ1kcDc6iwAL4hg3B1dZlRiuENFeO2H53gFG3in621AdERVAg==}
@@ -3078,6 +3099,16 @@ snapshots:
       react: 19.2.7
       react-dom: 19.2.7(react@19.2.7)
       yjs: 13.6.31
+
+  '@zeronsh/orbit@0.1.0(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(prettier@3.8.4)(react@19.2.7)(ts-morph@27.0.2)':
+    dependencies:
+      commander: 14.0.3
+    optionalDependencies:
+      drizzle-orm: 1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3)
+      pg: 8.22.0
+      prettier: 3.8.4
+      react: 19.2.7
+      ts-morph: 27.0.2
 
   acorn@8.17.0: {}
 
