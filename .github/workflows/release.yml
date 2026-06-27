@@ -1,12 +1,14 @@
 name: release
 
-# One pipeline that publishes everything, on Blacksmith runners:
+# One pipeline that publishes everything in lockstep, on Blacksmith runners:
 #  - `release` job: changesets opens/updates a "Version Packages" PR; merging it
-#    publishes @zeronsh/orbit to npm.
-#  - `docker` job: builds + pushes ghcr.io/zeronsh/orbit-server on every push to
-#    main (`latest` + commit sha), and additionally tags the released version
-#    whenever the npm package was just published.
-# Manual run (workflow_dispatch) rebuilds/pushes the server image with no release.
+#    publishes @zeronsh/orbit to npm. `version-packages` also syncs the Rust
+#    workspace version (scripts/sync-versions.mjs), so the binary + image carry
+#    the same version as the npm package.
+#  - `docker` job: ONLY on an actual publish, builds + pushes
+#    ghcr.io/zeronsh/orbit-server tagged `vX.Y.Z` + `latest` — the SAME version as
+#    the npm package. `latest` therefore always equals the latest published
+#    @zeronsh/orbit (no unversioned drift).
 on:
   push:
     branches: [main]
@@ -49,6 +51,9 @@ jobs:
 
   docker:
     needs: release
+    # Only build/push when a version was actually published, and tag it with that
+    # exact version — so the image and the npm package are always the same version.
+    if: needs.release.outputs.published == 'true'
     runs-on: blacksmith
     permissions:
       contents: read
@@ -65,9 +70,8 @@ jobs:
         with:
           images: ghcr.io/zeronsh/orbit-server
           tags: |
+            type=raw,value=v${{ needs.release.outputs.version }}
             type=raw,value=latest
-            type=sha
-            type=raw,value=v${{ needs.release.outputs.version }},enable=${{ needs.release.outputs.published == 'true' }}
       - uses: useblacksmith/build-push-action@v1
         with:
           context: .

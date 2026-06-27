@@ -11,7 +11,7 @@
     "check": "turbo run typecheck test rust:check rust:test",
     "dev": "turbo run dev",
     "changeset": "changeset",
-    "version-packages": "changeset version",
+    "version-packages": "changeset version && node scripts/sync-versions.mjs",
     "release": "changeset publish"
   },
   "devDependencies": {

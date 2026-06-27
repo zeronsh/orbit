@@ -3,6 +3,26 @@
 CI runs on **Blacksmith** runners (`runs-on: blacksmith`). One `release` workflow
 publishes **everything** — the npm package and the GHCR server image.
 
+## One version, in lockstep
+
+The client (`@zeronsh/orbit`) and the server image (`ghcr.io/zeronsh/orbit-server`)
+are two halves of one system and **always ship at the same version**. The single
+source of truth is `@zeronsh/orbit`'s `package.json` version (managed by changesets):
+
+- `pnpm version-packages` runs `changeset version` **then**
+  [`scripts/sync-versions.mjs`](./scripts/sync-versions.mjs), which writes that
+  version into the Rust workspace (`Cargo.toml` + `Cargo.lock`). So the Version
+  Packages PR bumps npm **and** Rust together.
+- On publish, the `docker` job builds the image **only** when a version was
+  published and tags it `vX.Y.Z` + `latest` — the exact npm version. `latest`
+  therefore always equals the latest `@zeronsh/orbit` (no unversioned drift).
+- The running server prints `orbit-server vX.Y.Z` (= `CARGO_PKG_VERSION`) on
+  startup, and CI fails on any drift (`node scripts/sync-versions.mjs --check`).
+
+So for any release, `npm i @zeronsh/orbit@X.Y.Z` pairs with
+`ghcr.io/zeronsh/orbit-server:vX.Y.Z`. A server-only change still goes through a
+changeset (bumping the shared version), keeping client and server in step.
+
 ## npm — `@zeronsh/orbit`
 
 Versioning + publishing is automated with [changesets](https://github.com/changesets/changesets)

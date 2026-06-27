@@ -18,6 +18,8 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Guard: the npm package version and the Rust workspace version must match.
+      - run: node scripts/sync-versions.mjs --check
       - run: pnpm --filter @zeronsh/orbit typecheck
       - run: pnpm --filter @zeronsh/orbit test
       - run: pnpm --filter @zeronsh/orbit build

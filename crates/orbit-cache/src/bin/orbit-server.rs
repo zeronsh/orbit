@@ -15,6 +15,10 @@ use orbit_cache::{run_server, run_server_sqlite, MutatorRegistry, ServerConfig, 
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Version is kept in lockstep with the `@zeronsh/orbit` npm package + the
+    // `ghcr.io/zeronsh/orbit-server` image (see scripts/sync-versions.mjs).
+    eprintln!("orbit-server v{}", env!("CARGO_PKG_VERSION"));
+
     let host = env("ORBIT_PG_HOST", "127.0.0.1");
     let port: u16 = env("ORBIT_PG_PORT", "5433").parse().unwrap_or(5433);
     let user = env("ORBIT_PG_USER", "orbit");
