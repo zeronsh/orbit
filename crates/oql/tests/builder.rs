@@ -260,7 +260,6 @@ fn where_or_with_exists() {
                 child_field: vec!["issueID".into()],
             },
             subquery: Box::new(Query::table("comment").build()),
-            system: None,
             hidden: None,
         },
         op: ExistsOp::Exists,

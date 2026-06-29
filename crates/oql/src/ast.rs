@@ -23,16 +23,6 @@ pub type OrderPart = (String, Direction);
 /// Multi-column ordering.
 pub type Ordering = Vec<OrderPart>;
 
-/// Which "system" is responsible for a node being in the query. Data produced by
-/// the `permissions` system is never synced to clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum System {
-    Permissions,
-    Client,
-    Test,
-}
-
 /// The comparison operators usable in a [`SimpleCondition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SimpleOperator {
@@ -88,8 +78,8 @@ pub enum LiteralPrimitive {
     String(String),
 }
 
-/// A position in a condition: a literal, a column reference, or a runtime
-/// parameter. Internally tagged by `type`.
+/// A position in a condition: a literal or a column reference. Internally
+/// tagged by `type`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ValuePosition {
@@ -97,28 +87,6 @@ pub enum ValuePosition {
     Literal { value: LiteralValue },
     #[serde(rename = "column")]
     Column { name: String },
-    #[serde(rename = "static")]
-    Static {
-        anchor: ParameterAnchor,
-        field: ParameterField,
-    },
-}
-
-/// Source of an injected static parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ParameterAnchor {
-    #[serde(rename = "authData")]
-    AuthData,
-    #[serde(rename = "preMutationRow")]
-    PreMutationRow,
-}
-
-/// A parameter field path: a single field or a path of fields.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ParameterField {
-    Single(String),
-    Path(Vec<String>),
 }
 
 /// A compound key: at least one column. Modeled as a `Vec` with a runtime
@@ -140,8 +108,6 @@ pub struct Correlation {
 pub struct CorrelatedSubquery {
     pub correlation: Correlation,
     pub subquery: Box<Ast>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub system: Option<System>,
     /// When true, this hop is not included in the output view but its children
     /// are (used to hide junction edges).
     #[serde(skip_serializing_if = "Option::is_none", default)]

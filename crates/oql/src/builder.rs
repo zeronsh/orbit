@@ -89,7 +89,6 @@ fn build_pipeline_partitioned(
                     related.correlation.child_field.clone(),
                     rel_name,
                     true, // hidden
-                    related.system.unwrap_or(crate::ast::System::Client),
                 );
                 current = OpHandle::new(join);
             }
@@ -116,7 +115,6 @@ fn build_pipeline_partitioned(
                 sub.correlation.child_field.clone(),
                 rel_name,
                 sub.hidden.unwrap_or(false),
-                sub.system.unwrap_or(crate::ast::System::Client),
             );
             current = OpHandle::new(join);
         }
@@ -231,127 +229,6 @@ fn condition_has_exists(cond: &Condition) -> bool {
     }
 }
 
-/// Resolve `static` (`authData`) parameters in an AST into literals, using the
-/// provided auth-data JSON. Used to inject the authenticated user's data into
-/// permission rules and parameterized queries before building the pipeline.
-///
-/// `preMutationRow` parameters are left unchanged (only meaningful in write
-/// authorization, which resolves them per-mutation).
-pub fn resolve_static_params(ast: &Ast, auth: &serde_json::Value) -> Ast {
-    resolve_static_params_with_row(ast, auth, None)
-}
-
-/// Like [`resolve_static_params`], also resolving `preMutationRow` params from
-/// `pre_row` (used by write authorization).
-pub fn resolve_static_params_with_row(ast: &Ast, auth: &serde_json::Value, pre_row: Option<&Row>) -> Ast {
-    let mut out = ast.clone();
-    out.where_ = ast.where_.as_ref().map(|c| resolve_cond_params_with_row(c, auth, pre_row));
-    out.related = ast.related.as_ref().map(|rels| {
-        rels.iter()
-            .map(|r| {
-                let mut r2 = r.clone();
-                r2.subquery = Box::new(resolve_static_params_with_row(&r.subquery, auth, pre_row));
-                r2
-            })
-            .collect()
-    });
-    out
-}
-
-/// Resolve `authData` / `preMutationRow` params in a single condition.
-pub fn resolve_cond_params_with_row(
-    cond: &Condition,
-    auth: &serde_json::Value,
-    pre_row: Option<&Row>,
-) -> Condition {
-    match cond {
-        Condition::Simple { op, left, right } => Condition::Simple {
-            op: *op,
-            left: resolve_value_pos(left, auth, pre_row),
-            right: resolve_value_pos(right, auth, pre_row),
-        },
-        Condition::And { conditions } => Condition::And {
-            conditions: conditions.iter().map(|c| resolve_cond_params_with_row(c, auth, pre_row)).collect(),
-        },
-        Condition::Or { conditions } => Condition::Or {
-            conditions: conditions.iter().map(|c| resolve_cond_params_with_row(c, auth, pre_row)).collect(),
-        },
-        Condition::CorrelatedSubquery { related, op, flip, scalar } => {
-            let mut related = related.clone();
-            related.subquery = Box::new(resolve_static_params_with_row(&related.subquery, auth, pre_row));
-            Condition::CorrelatedSubquery { related, op: *op, flip: *flip, scalar: *scalar }
-        }
-    }
-}
-
-fn resolve_value_pos(pos: &ValuePosition, auth: &serde_json::Value, pre_row: Option<&Row>) -> ValuePosition {
-    match pos {
-        ValuePosition::Static {
-            anchor: crate::ast::ParameterAnchor::AuthData,
-            field,
-        } => ValuePosition::Literal {
-            value: json_to_literal(&lookup_auth_field(auth, field)),
-        },
-        ValuePosition::Static {
-            anchor: crate::ast::ParameterAnchor::PreMutationRow,
-            field,
-        } => match (pre_row, field) {
-            (Some(row), crate::ast::ParameterField::Single(name)) => ValuePosition::Literal {
-                value: value_to_literal(row.get(name).unwrap_or(&crate::value::Value::Null)),
-            },
-            _ => pos.clone(),
-        },
-        other => other.clone(),
-    }
-}
-
-fn value_to_literal(v: &crate::value::Value) -> LiteralValue {
-    match v {
-        crate::value::Value::Null => LiteralValue::Null,
-        crate::value::Value::Bool(b) => LiteralValue::Bool(*b),
-        crate::value::Value::Number(n) => LiteralValue::Number(*n),
-        crate::value::Value::String(s) => LiteralValue::String(s.clone()),
-        crate::value::Value::Json(_) => LiteralValue::Null,
-    }
-}
-
-fn lookup_auth_field(auth: &serde_json::Value, field: &crate::ast::ParameterField) -> serde_json::Value {
-    match field {
-        crate::ast::ParameterField::Single(name) => auth.get(name).cloned().unwrap_or(serde_json::Value::Null),
-        crate::ast::ParameterField::Path(parts) => {
-            let mut cur = auth;
-            for p in parts {
-                match cur.get(p) {
-                    Some(v) => cur = v,
-                    None => return serde_json::Value::Null,
-                }
-            }
-            cur.clone()
-        }
-    }
-}
-
-fn json_to_literal(v: &serde_json::Value) -> LiteralValue {
-    match v {
-        serde_json::Value::Null => LiteralValue::Null,
-        serde_json::Value::Bool(b) => LiteralValue::Bool(*b),
-        serde_json::Value::Number(n) => LiteralValue::Number(n.as_f64().unwrap_or(f64::NAN)),
-        serde_json::Value::String(s) => LiteralValue::String(s.clone()),
-        serde_json::Value::Array(items) => LiteralValue::Array(
-            items
-                .iter()
-                .filter_map(|i| match i {
-                    serde_json::Value::Bool(b) => Some(LiteralPrimitive::Bool(*b)),
-                    serde_json::Value::Number(n) => Some(LiteralPrimitive::Number(n.as_f64()?)),
-                    serde_json::Value::String(s) => Some(LiteralPrimitive::String(s.clone())),
-                    _ => None,
-                })
-                .collect(),
-        ),
-        serde_json::Value::Object(_) => LiteralValue::Null,
-    }
-}
-
 /// Compile a [`Condition`] into a row [`Predicate`].
 pub fn create_predicate(cond: &Condition) -> Predicate {
     let cond = cond.clone();
@@ -447,14 +324,11 @@ fn eval_simple(op: SimpleOperator, left: &ValuePosition, right: &ValuePosition, 
 }
 
 /// Resolve a value position to a concrete value for the given row. Returns
-/// `None` when the column is absent. Static parameters are not yet supported.
+/// `None` when the column is absent.
 fn value_at(pos: &ValuePosition, row: &Row) -> Option<Value> {
     match pos {
         ValuePosition::Column { name } => row.get(name).cloned(),
         ValuePosition::Literal { value } => Some(literal_scalar(value)),
-        ValuePosition::Static { .. } => {
-            panic!("static parameters must be resolved before building the pipeline")
-        }
     }
 }
 
@@ -463,7 +337,6 @@ fn scalar_literal(pos: &ValuePosition) -> Option<Value> {
         ValuePosition::Literal { value } => Some(literal_scalar(value)),
         // The AST forbids a column on the right of a simple condition.
         ValuePosition::Column { .. } => None,
-        ValuePosition::Static { .. } => None,
     }
 }
 

@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use oql::ast::{Direction as AstDir, System};
+use oql::ast::Direction as AstDir;
 use oql::ivm::operator::{Link, OpHandle};
 use oql::ivm::{
     connect, source_push, Catch, Change, ColumnType, Filter, Join, MemorySource, Node, Predicate,
@@ -98,7 +98,6 @@ fn join_child_add_fans_to_all_matching_parents() {
         vec!["g".into()],
         "children",
         false,
-        System::Client,
     );
     let jh = OpHandle::new(join);
     let catch = Catch::new(jh.input.clone());
@@ -204,7 +203,6 @@ fn join_child_remove_leaves_parent_with_empty_relationship() {
         vec!["pid".into()],
         "children",
         false,
-        System::Client,
     );
     let jh = OpHandle::new(join);
     let catch = Catch::new(jh.input.clone());

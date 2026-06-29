@@ -14,9 +14,6 @@ pub mod ivm;
 pub mod query;
 pub mod value;
 
-pub use builder::{
-    build_pipeline, create_predicate, eval_condition, resolve_cond_params_with_row,
-    resolve_static_params, resolve_static_params_with_row, SourceProvider,
-};
+pub use builder::{build_pipeline, create_predicate, eval_condition, SourceProvider};
 pub use query::{correlation, Query};
 pub use value::{Direction, Row, Value};

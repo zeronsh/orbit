@@ -201,7 +201,6 @@ fn join_bench(n: usize, m: usize) {
         vec!["issueID".into()],
         "comments",
         false,
-        oql::ast::System::Client,
     );
     let jh = OpHandle::new(join);
     let catch = Catch::new(jh.input.clone());

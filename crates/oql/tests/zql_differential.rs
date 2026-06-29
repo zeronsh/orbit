@@ -15,7 +15,7 @@ use oql::ast::Ast;
 use oql::ivm::operator::Link;
 use oql::ivm::{source_push, Catch, ColumnType, MemorySource, Node, SourceChange};
 use oql::value::Row;
-use oql::{build_pipeline, resolve_static_params, SourceProvider};
+use oql::{build_pipeline, SourceProvider};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -25,10 +25,6 @@ struct Golden {
     ast: serde_json::Value,
     pushes: Vec<GPush>,
     snapshots: Vec<serde_json::Value>,
-    /// Read-permission auth data; when present the ast's `static` params are
-    /// resolved against it before the pipeline is built.
-    #[serde(default, rename = "authData")]
-    auth_data: Option<serde_json::Value>,
 }
 #[derive(Deserialize)]
 struct GTable {
@@ -106,12 +102,7 @@ fn run_scenario(g: &Golden) -> Result<(), String> {
     }
     let provider = Provider(map);
 
-    let mut ast: Ast = serde_json::from_value(g.ast.clone()).map_err(|e| format!("parse ast: {e}"))?;
-    // Read-permission scenarios carry `authData`; resolve the ast's `static`
-    // parameters against it (the same step orbit-cache does) before building.
-    if let Some(auth) = &g.auth_data {
-        ast = resolve_static_params(&ast, auth);
-    }
+    let ast: Ast = serde_json::from_value(g.ast.clone()).map_err(|e| format!("parse ast: {e}"))?;
     let top = build_pipeline(&ast, &provider);
     let catch = Catch::new(top.input.clone());
     let link: Link = catch.clone();
@@ -188,22 +179,6 @@ fn orbit_matches_zero_fuzz() {
     assert!(
         failures.is_empty(),
         "{} fuzz mismatches (showing {}):\n{}",
-        failures.len(),
-        shown.len(),
-        shown.join("\n")
-    );
-}
-
-#[test]
-fn orbit_matches_zero_permissions() {
-    let goldens: Vec<Golden> = serde_json::from_str(include_str!("golden/zql_permissions_golden.json"))
-        .expect("parse permissions golden");
-    let (passed, failures) = run_all(&goldens);
-    eprintln!("permissions (authData): {passed}/{} matched Zero", goldens.len());
-    let shown: Vec<_> = failures.iter().take(8).cloned().collect();
-    assert!(
-        failures.is_empty(),
-        "{} permission mismatches (showing {}):\n{}",
         failures.len(),
         shown.len(),
         shown.join("\n")

@@ -2,7 +2,7 @@
 //!
 //! Port of `SourceSchema` in `zql/src/ivm/schema.ts`.
 
-use crate::ast::{Ordering, System};
+use crate::ast::Ordering;
 use crate::value::Comparator;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -27,7 +27,6 @@ pub struct Schema {
     /// Child relationships, keyed by relationship name.
     pub relationships: BTreeMap<String, Rc<Schema>>,
     pub is_hidden: bool,
-    pub system: System,
     /// Comparator establishing the order rows are emitted in.
     pub compare_rows: Comparator,
     /// The ordering rows are emitted in, if any. `None` means unordered.
@@ -49,7 +48,6 @@ impl Schema {
             primary_key,
             relationships: BTreeMap::new(),
             is_hidden: false,
-            system: System::Client,
             compare_rows,
             sort,
         }

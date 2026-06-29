@@ -107,8 +107,8 @@ impl Forwarder {
         Ok(())
     }
 
-    /// Forward a named query to the query endpoint; it returns the (possibly
-    /// permission-filtered) AST to materialize.
+    /// Forward a named query to the query endpoint; it returns the AST to
+    /// materialize.
     pub async fn transform(
         &self,
         auth: &AuthContext,

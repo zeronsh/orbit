@@ -61,8 +61,7 @@ function likeToRegExp(pattern: string, ci: boolean): RegExp {
 
 function resolve(row: Row, pos: ValuePosition): Value | readonly Value[] | undefined {
   if (pos.type === 'column') return row[pos.name] as Value;
-  if (pos.type === 'literal') return pos.value as Value | readonly Value[];
-  return undefined; // 'static' (authData/preMutationRow) — server-side only
+  return pos.value as Value | readonly Value[]; // 'literal'
 }
 
 function evalSimple(row: Row, op: SimpleOperator, left: ValuePosition, right: ValuePosition): boolean {

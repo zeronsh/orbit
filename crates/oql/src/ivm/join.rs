@@ -17,7 +17,6 @@
 use super::node::{Change, Changes, Node, RowRef};
 use super::operator::{FetchRequest, Input, Link, OpHandle, Operator};
 use super::schema::Schema;
-use crate::ast::System;
 use crate::ivm::constraint::{build_join_constraint, row_equals_for_compound_key};
 use smallvec::{smallvec, SmallVec};
 use std::cell::RefCell;
@@ -46,7 +45,6 @@ impl Join {
         child_key: Vec<String>,
         relationship_name: impl Into<String>,
         hidden: bool,
-        system: System,
     ) -> Rc<RefCell<Join>> {
         assert_eq!(
             parent_key.len(),
@@ -59,7 +57,6 @@ impl Join {
         let child_schema = child.input.borrow().get_schema();
         let mut child_schema_for_rel = (*child_schema).clone();
         child_schema_for_rel.is_hidden = hidden;
-        child_schema_for_rel.system = system;
         let mut schema = (*parent_schema).clone();
         schema
             .relationships

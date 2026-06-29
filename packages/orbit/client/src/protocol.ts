@@ -16,8 +16,7 @@ export type SimpleOperator =
 
 export type ValuePosition =
   | { type: 'literal'; value: Value | readonly (string | number | boolean)[] }
-  | { type: 'column'; name: string }
-  | { type: 'static'; anchor: 'authData' | 'preMutationRow'; field: string | string[] };
+  | { type: 'column'; name: string };
 
 export type Condition =
   | { type: 'simple'; op: SimpleOperator; left: ValuePosition; right: ValuePosition }

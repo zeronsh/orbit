@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use oql::ast::{Direction as AstDir, System};
+use oql::ast::Direction as AstDir;
 use oql::ivm::operator::{Link, OpHandle};
 use oql::ivm::{
     connect, source_push, Catch, Change, Filter, Join, MemorySource, Node, Predicate, SourceChange,
@@ -110,7 +110,6 @@ fn build_issue_comments() -> (
         vec!["issueID".into()],
         "comments",
         false,
-        System::Client,
     );
     let join_h = OpHandle::new(join);
     let catch = Catch::new(join_h.input.clone());

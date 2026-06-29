@@ -56,7 +56,6 @@ impl Query {
             related: CorrelatedSubquery {
                 correlation,
                 subquery: Box::new(subquery.build()),
-                system: None,
                 hidden: None,
             },
             op: if negated {
@@ -79,7 +78,6 @@ impl Query {
         related.push(CorrelatedSubquery {
             correlation,
             subquery: Box::new(subquery.build()),
-            system: None,
             hidden: None,
         });
         self
