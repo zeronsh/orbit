@@ -1,5 +1,11 @@
 # @zeronsh/orbit
 
+## 0.2.0
+
+### Minor Changes
+
+- 62388ed: Remove the permission system. Access is now gated only by custom queries/mutators. The `static` (authData/preMutationRow) value position has been removed from the wire protocol and AST types.
+
 ## 0.1.0
 
 ### Minor Changes
