@@ -124,34 +124,48 @@ const putTodo = (id: string) => ({
 });
 const settle = () => new Promise((r) => setTimeout(r, 0));
 
+// These two only exercise persistence, not the socket. Force `#connect` to be a
+// no-op by removing the global WebSocket: Node 21+ exposes one, so otherwise the
+// client opens a real (failing) connection to ws://x whose async cleanup lands
+// after the test ends (undici → "Maximum call stack size exceeded").
 test('persist: clientID + mutation-id survive a reload (fast resume, ids keep climbing)', async () => {
+  const prevWS = (globalThis as { WebSocket?: unknown }).WebSocket;
+  (globalThis as { WebSocket?: unknown }).WebSocket = undefined;
   const kv = new MemoryKV();
-  // No WebSocket in node → #connect is a no-op; maxReconnectMs:0 → no timers.
   const make = () => new Orbit({ server: 'ws://x', schema, persist: kv, maxReconnectMs: 0 });
+  try {
+    const a = make();
+    await settle(); // #init hydrates + persists a fresh identity
+    a.mutate.todo.insert({ id: 't1', text: 'a', done: false });
+    a.mutate.todo.insert({ id: 't2', text: 'b', done: false });
+    await settle();
+    const id = a.clientID;
+    assert.equal(await kv.get('nextMutationID'), 3, 'sent ids 1,2 → next is 3');
 
-  const a = make();
-  await settle(); // #init hydrates + persists a fresh identity
-  a.mutate.todo.insert({ id: 't1', text: 'a', done: false });
-  a.mutate.todo.insert({ id: 't2', text: 'b', done: false });
-  await settle();
-  const id = a.clientID;
-  assert.equal(await kv.get('nextMutationID'), 3, 'sent ids 1,2 → next is 3');
-
-  // Simulate a reload: a brand-new client over the SAME persisted KV.
-  const b = make();
-  await settle();
-  assert.equal(b.clientID, id, 'clientID restored → resumes the same server CVR');
-  b.mutate.todo.insert({ id: 't3', text: 'c', done: false });
-  await settle();
-  assert.equal(await kv.get('nextMutationID'), 4, 'mutation ids continue past reload (not reset to 1)');
+    // Simulate a reload: a brand-new client over the SAME persisted KV.
+    const b = make();
+    await settle();
+    assert.equal(b.clientID, id, 'clientID restored → resumes the same server CVR');
+    b.mutate.todo.insert({ id: 't3', text: 'c', done: false });
+    await settle();
+    assert.equal(await kv.get('nextMutationID'), 4, 'mutation ids continue past reload (not reset to 1)');
+  } finally {
+    (globalThis as { WebSocket?: unknown }).WebSocket = prevWS;
+  }
 });
 
 test('persist: an explicit clientID is never overridden by the KV', async () => {
+  const prevWS = (globalThis as { WebSocket?: unknown }).WebSocket;
+  (globalThis as { WebSocket?: unknown }).WebSocket = undefined;
   const kv = new MemoryKV();
   await kv.set('clientID', 'persisted-other');
-  const a = new Orbit({ server: 'ws://x', schema, persist: kv, clientID: 'explicit', maxReconnectMs: 0 });
-  await settle();
-  assert.equal(a.clientID, 'explicit');
+  try {
+    const a = new Orbit({ server: 'ws://x', schema, persist: kv, clientID: 'explicit', maxReconnectMs: 0 });
+    await settle();
+    assert.equal(a.clientID, 'explicit');
+  } finally {
+    (globalThis as { WebSocket?: unknown }).WebSocket = prevWS;
+  }
 });
 const todoIds = (v: { data: readonly { id: string }[] }) => v.data.map((r) => r.id);
 

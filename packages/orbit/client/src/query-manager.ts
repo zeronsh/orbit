@@ -34,7 +34,13 @@ export type Scheduler = {
 };
 
 const defaultScheduler: Scheduler = {
-  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  setTimeout: (fn, ms) => {
+    const h = setTimeout(fn, ms);
+    // A query-GC timer is pure cleanup; it must never be the sole reason a Node
+    // process stays alive (in the browser `h` is a number and has no `unref`).
+    (h as { unref?: () => void }).unref?.();
+    return h;
+  },
   clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
 };
 
