@@ -48,3 +48,23 @@ for (const name of CRATES) {
 writeFileSync(cargoLockPath, cargoLock);
 
 console.log(`✓ synced Rust workspace (Cargo.toml + Cargo.lock) to ${version}`);
+
+// 3. Keep apps/demo pinned to the LAST-PUBLISHED @zeronsh/orbit. It consumes the
+// package from the npm registry (not the workspace link) so Railway can build it
+// without compiling from source. `changeset version` bumps this dependent to the
+// NEW, not-yet-published version — which would make `pnpm install --frozen-lockfile`
+// (CI, the release job, and the Railway demo build) fail with NO_MATCHING_VERSION
+// until the release publishes: a deadlock. The lockfile still resolves the last
+// published version, so pin the manifest back to match it. Bump the demo
+// deliberately (a normal commit + lockfile refresh) once a release is live.
+const lock = readFileSync(join(root, 'pnpm-lock.yaml'), 'utf8');
+const lockedSpec = lock.match(/\n {2}apps\/demo:[\s\S]*?'@zeronsh\/orbit':\s*\n\s*specifier:\s*(\S+)/)?.[1];
+const demoPkgPath = join(root, 'apps/demo/package.json');
+const demoPkg = readFileSync(demoPkgPath, 'utf8');
+const fixedDemo = lockedSpec
+  ? demoPkg.replace(/("@zeronsh\/orbit":\s*")[^"]+(")/, `$1${lockedSpec}$2`)
+  : demoPkg;
+if (fixedDemo !== demoPkg) {
+  writeFileSync(demoPkgPath, fixedDemo);
+  console.log(`✓ kept apps/demo on @zeronsh/orbit ${lockedSpec} (last published; avoids the release deadlock)`);
+}
