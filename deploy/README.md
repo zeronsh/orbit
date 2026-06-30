@@ -36,8 +36,10 @@ Run the cluster node role instead by overriding the command with `orbit-node`.
 | --- | --- | --- |
 | `ORBIT_PG_HOST` | `127.0.0.1` | Postgres host |
 | `ORBIT_PG_PORT` | `5433` | Postgres port |
-| `ORBIT_PG_USER` | `orbit` | Postgres user (no password; use trust/network policy) |
+| `ORBIT_PG_USER` | `orbit` | Postgres user |
 | `ORBIT_PG_DB` | `orbit` | Postgres database |
+| `ORBIT_PG_PASSWORD` | _(none)_ | Postgres password (or `PGPASSWORD`); omit for trust auth |
+| `ORBIT_PG_SSLMODE` | `disable` | TLS mode (or `PGSSLMODE`): `disable` \| `require` \| `verify-full` |
 | `ORBIT_LISTEN` | `127.0.0.1:4848` | WebSocket bind address — **set `0.0.0.0:4848` in a container** |
 | `ORBIT_TABLES` | _(required)_ | Comma-separated `table:pkColumn` specs to replicate + serve |
 | `ORBIT_REPLICA` | `memory` | `memory` or `sqlite` (durable) |

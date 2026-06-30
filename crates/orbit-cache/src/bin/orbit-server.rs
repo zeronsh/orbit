@@ -3,6 +3,8 @@
 //! Configuration via env vars:
 //!   ORBIT_PG_HOST (default 127.0.0.1), ORBIT_PG_PORT (5433),
 //!   ORBIT_PG_USER (orbit), ORBIT_PG_DB (orbit),
+//!   ORBIT_PG_PASSWORD (or PGPASSWORD) — for password-authed (managed) Postgres,
+//!   ORBIT_PG_SSLMODE (or PGSSLMODE) — disable (default) | require | verify-full,
 //!   ORBIT_LISTEN (127.0.0.1:4848),
 //!   ORBIT_TABLES — comma-separated `table:pkcol` specs (columns are discovered
 //!     as text; e.g. `issue:id,comment:id`).
@@ -25,17 +27,22 @@ async fn main() -> anyhow::Result<()> {
     let database = env("ORBIT_PG_DB", "orbit");
     let listen_addr = env("ORBIT_LISTEN", "127.0.0.1:4848");
     let tables_spec = env("ORBIT_TABLES", "");
+    // ORBIT_PG_PASSWORD/PGPASSWORD (managed PG) + ORBIT_PG_SSLMODE/PGSSLMODE
+    // (disable | require | verify-full) secure the connection.
+    let password = std::env::var("ORBIT_PG_PASSWORD")
+        .or_else(|_| std::env::var("PGPASSWORD"))
+        .ok()
+        .filter(|s| !s.is_empty());
+    let tls = orbit_cache::PgTlsMode::from_env();
 
     // Discover columns at runtime from information_schema for each configured
     // table (typed String/Number/Boolean/Json) before starting.
-    let (probe, probe_conn) = tokio_postgres::connect(
-        &format!("host={host} port={port} user={user} dbname={database}"),
-        tokio_postgres::NoTls,
-    )
-    .await?;
-    tokio::spawn(async move {
-        let _ = probe_conn.await;
-    });
+    let mut probe_conn_str = format!("host={host} port={port} user={user} dbname={database}");
+    if let Some(pw) = &password {
+        probe_conn_str.push_str(&format!(" password={pw}"));
+    }
+    let (probe, probe_driver) = orbit_cache::pg::tls::connect(&probe_conn_str, tls).await?;
+    tokio::spawn(probe_driver);
 
     let mut tables = Vec::new();
     for spec in tables_spec.split(',').filter(|s| !s.trim().is_empty()) {
@@ -67,6 +74,8 @@ async fn main() -> anyhow::Result<()> {
         port,
         user,
         database,
+        password,
+        tls,
         tables,
         publication: "orbit_pub".to_string(),
         slot: "orbit_slot".to_string(),

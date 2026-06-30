@@ -2,10 +2,12 @@
 
 pub mod pgoutput;
 pub mod proto;
+pub mod tls;
 
 use anyhow::{bail, Result};
 use pgoutput::{Decoder, LogicalEvent};
 use proto::RawConn;
+pub use tls::PgTlsMode;
 use tokio_postgres::Client;
 
 /// A live logical-replication stream that yields decoded [`LogicalEvent`]s.
@@ -18,7 +20,8 @@ pub struct ReplicationStream {
 
 impl ReplicationStream {
     /// Open a replication connection and begin streaming `slot`/`publication`
-    /// from `start_lsn`.
+    /// from `start_lsn` (plaintext; password from the environment). For TLS or an
+    /// explicit password use [`start_with_tls`](Self::start_with_tls).
     pub async fn start(
         host: &str,
         port: u16,
@@ -28,7 +31,25 @@ impl ReplicationStream {
         publication: &str,
         start_lsn: u64,
     ) -> Result<ReplicationStream> {
-        let mut conn = RawConn::connect_replication(host, port, user, database).await?;
+        Self::start_with_tls(host, port, user, database, slot, publication, start_lsn, None, PgTlsMode::Disable)
+            .await
+    }
+
+    /// Like [`start`](Self::start) but with an explicit `password` and TLS `mode`
+    /// (for managed Postgres that requires a password and/or `sslmode`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_tls(
+        host: &str,
+        port: u16,
+        user: &str,
+        database: &str,
+        slot: &str,
+        publication: &str,
+        start_lsn: u64,
+        password: Option<&str>,
+        mode: PgTlsMode,
+    ) -> Result<ReplicationStream> {
+        let mut conn = RawConn::connect_replication(host, port, user, database, password, mode).await?;
         conn.start_replication(slot, publication, start_lsn).await?;
         Ok(ReplicationStream {
             conn,

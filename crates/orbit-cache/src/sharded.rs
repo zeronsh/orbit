@@ -24,6 +24,7 @@
 use crate::handshake::accept_zero_ws;
 use crate::mutators::MutatorRegistry;
 use crate::pg::pgoutput::LogicalEvent;
+use crate::pg::tls::PgTlsMode;
 use crate::queries::QueryRegistry;
 use crate::replica::{Replica, ReplicaBackend};
 use crate::server::serve_client;
@@ -56,7 +57,7 @@ impl ShardedServer {
     /// Spawn `num_shards` worker threads, each building its own replica from
     /// `tables` (seeded identically). No client mutation write-through.
     pub fn start(num_shards: usize, tables: Vec<ShardTable>) -> ShardedServer {
-        ShardedServer::start_with_pg(num_shards, tables, None)
+        ShardedServer::start_with_pg(num_shards, tables, None, PgTlsMode::Disable)
     }
 
     /// Like [`start`](Self::start) but each shard opens its own Postgres client
@@ -66,6 +67,7 @@ impl ShardedServer {
         num_shards: usize,
         tables: Vec<ShardTable>,
         pg_conn: Option<String>,
+        tls: PgTlsMode,
     ) -> ShardedServer {
         assert!(num_shards >= 1, "need at least one shard");
         let mut job_txs = Vec::with_capacity(num_shards);
@@ -80,7 +82,7 @@ impl ShardedServer {
             let pg_conn = pg_conn.clone();
             let h = std::thread::Builder::new()
                 .name(format!("orbit-shard-{id}"))
-                .spawn(move || shard_main(tables, pg_conn, jrx, erx))
+                .spawn(move || shard_main(tables, pg_conn, tls, jrx, erx))
                 .expect("spawn shard thread");
             handles.push(h);
         }
@@ -125,6 +127,7 @@ impl ShardedServer {
 fn shard_main(
     tables: Vec<ShardTable>,
     pg_conn: Option<String>,
+    tls: PgTlsMode,
     mut jobs: mpsc::UnboundedReceiver<std::net::TcpStream>,
     mut events: mpsc::UnboundedReceiver<LogicalEvent>,
 ) {
@@ -149,13 +152,9 @@ fn shard_main(
 
         // Optional per-shard Postgres client for client mutation write-through.
         let pg: Option<Rc<tokio_postgres::Client>> = match pg_conn {
-            Some(conn) => match tokio_postgres::connect(&conn, tokio_postgres::NoTls).await {
-                Ok((client, connection)) => {
-                    spawn_local(async move {
-                        if let Err(e) = connection.await {
-                            eprintln!("shard postgres connection error: {e}");
-                        }
-                    });
+            Some(conn) => match crate::pg::tls::connect(&conn, tls).await {
+                Ok((client, driver)) => {
+                    spawn_local(driver);
                     Some(Rc::new(client))
                 }
                 Err(e) => {

@@ -24,6 +24,12 @@ base64 = { workspace = true }
 percent-encoding = { workspace = true }
 rusqlite = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# TLS for Postgres connections (managed PG: Railway/Neon/Supabase). rustls with the
+# `ring` provider (matches reqwest's stack — no aws-lc-rs / C toolchain needed).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-postgres-rustls = "0.13"
+webpki-roots = "1"
 # SCRAM-SHA-256 auth for the raw logical-replication connection (managed Postgres).
 sha2 = "0.10"
 hmac = "0.12"

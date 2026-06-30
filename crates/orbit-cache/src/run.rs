@@ -25,7 +25,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::{spawn_local, LocalSet};
-use tokio_postgres::NoTls;
+use crate::pg::tls::{self, PgTlsMode};
 
 /// How many recent changes the replicator keeps IN MEMORY (the ring) for fast
 /// view-syncer resume. Kept small so the footprint stays bounded — the `VecDeque`
@@ -51,6 +51,10 @@ pub struct ServerConfig {
     pub port: u16,
     pub user: String,
     pub database: String,
+    /// Postgres password (`None` for trust auth). Sent on every PG connection.
+    pub password: Option<String>,
+    /// TLS mode for every Postgres connection (SQL + replication). Default off.
+    pub tls: PgTlsMode,
     pub tables: Vec<TableConfig>,
     pub publication: String,
     pub slot: String,
@@ -78,15 +82,14 @@ impl ServerConfig {
 }
 
 impl ServerConfig {
-    fn conn_str(&self) -> String {
+    /// The `tokio-postgres` connection string, including `password` and `sslmode`
+    /// when set. Trust-auth local PG needs neither.
+    pub fn conn_str(&self) -> String {
         let mut s = format!(
             "host={} port={} user={} dbname={}",
             self.host, self.port, self.user, self.database
         );
-        // Managed Postgres (e.g. Railway) requires a password; pick it up from the
-        // environment so the config struct stays unchanged. Local trust-auth PG
-        // needs nothing here.
-        if let Ok(pw) = std::env::var("ORBIT_PG_PASSWORD").or_else(|_| std::env::var("PGPASSWORD")) {
+        if let Some(pw) = self.password.as_deref() {
             if !pw.is_empty() {
                 s.push_str(&format!(" password={pw}"));
             }
@@ -136,12 +139,8 @@ pub async fn run_server_sharded(cfg: ServerConfig, num_shards: usize) -> Result<
 }
 
 async fn run_sharded_inner(cfg: ServerConfig, num_shards: usize) -> Result<()> {
-    let (pg, connection) = tokio_postgres::connect(&cfg.conn_str(), NoTls).await?;
-    spawn_local(async move {
-        if let Err(e) = connection.await {
-            eprintln!("postgres connection error: {e}");
-        }
-    });
+    let (pg, driver) = tls::connect(&cfg.conn_str(), cfg.tls).await?;
+    spawn_local(driver);
     // Shared-CVR tables (per-client view + version), shared across shards.
     crate::cvr::PgCvrStore::ensure_schema(&pg).await?;
 
@@ -170,6 +169,7 @@ async fn run_sharded_inner(cfg: ServerConfig, num_shards: usize) -> Result<()> {
         num_shards,
         shard_tables,
         Some(cfg.conn_str()),
+        cfg.tls,
     ));
 
     // Replication pump: decode each event once, fan it out to every shard.
@@ -177,8 +177,9 @@ async fn run_sharded_inner(cfg: ServerConfig, num_shards: usize) -> Result<()> {
         let server = server.clone();
         let (host, port, user, db) = (cfg.host.clone(), cfg.port, cfg.user.clone(), cfg.database.clone());
         let (slot, publication) = (cfg.slot.clone(), cfg.publication.clone());
+        let (password, tls_mode) = (cfg.password.clone(), cfg.tls);
         spawn_local(async move {
-            let mut stream = match ReplicationStream::start(&host, port, &user, &db, &slot, &publication, start_lsn).await {
+            let mut stream = match ReplicationStream::start_with_tls(&host, port, &user, &db, &slot, &publication, start_lsn, password.as_deref(), tls_mode).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("replication start failed: {e}");
@@ -240,12 +241,8 @@ async fn run_inner<B: ReplicaBackend + 'static>(
     queries: QueryRegistry,
     backend: B,
 ) -> Result<()> {
-    let (pg, connection) = tokio_postgres::connect(&cfg.conn_str(), NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("postgres connection error: {e}");
-        }
-    });
+    let (pg, driver) = tls::connect(&cfg.conn_str(), cfg.tls).await?;
+    tokio::spawn(driver);
     // Shared-CVR tables (per-client view + version) so identifying clients can
     // resume as a delta; without this the serving path errors on first checkpoint.
     crate::cvr::PgCvrStore::ensure_schema(&pg).await?;
@@ -278,8 +275,9 @@ async fn run_inner<B: ReplicaBackend + 'static>(
         let ticks_tx = ticks_tx.clone();
         let (host, port, user, db) = (cfg.host.clone(), cfg.port, cfg.user.clone(), cfg.database.clone());
         let (slot, publication) = (cfg.slot.clone(), cfg.publication.clone());
+        let (password, tls_mode) = (cfg.password.clone(), cfg.tls);
         spawn_local(async move {
-            let mut stream = match ReplicationStream::start(&host, port, &user, &db, &slot, &publication, start_lsn).await {
+            let mut stream = match ReplicationStream::start_with_tls(&host, port, &user, &db, &slot, &publication, start_lsn, password.as_deref(), tls_mode).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("replication start failed: {e}");
@@ -427,12 +425,8 @@ async fn run_replicator_inner<O: ObjectStore + 'static>(
     change_stream_addr: String,
     snapshot_interval: Duration,
 ) -> Result<()> {
-    let (pg, connection) = tokio_postgres::connect(&cfg.conn_str(), NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("postgres connection error: {e}");
-        }
-    });
+    let (pg, driver) = tls::connect(&cfg.conn_str(), cfg.tls).await?;
+    tokio::spawn(driver);
 
     let table_names: Vec<&str> = cfg.tables.iter().map(|t| t.name.as_str()).collect();
     create_publication(&pg, &cfg.publication, &table_names).await?;
@@ -470,6 +464,7 @@ async fn run_replicator_inner<O: ObjectStore + 'static>(
                 crate::changelog::PgChangeLog::open(
                     cfg.conn_str(),
                     format!("orbit_change_log_{}", cfg.slot),
+                    cfg.tls,
                 )
                 .await?,
             ))
@@ -544,12 +539,13 @@ async fn run_replicator_inner<O: ObjectStore + 'static>(
     // from its confirmed LSN; re-delivered changes apply idempotently).
     let (host, port, user, db) = (cfg.host.clone(), cfg.port, cfg.user.clone(), cfg.database.clone());
     let (slot, publication) = (cfg.slot.clone(), cfg.publication.clone());
+    let (password, tls_mode) = (cfg.password.clone(), cfg.tls);
     let mut txn_buf: Vec<(u64, LogicalEvent)> = Vec::new();
     loop {
         // Retry START_REPLICATION while the slot is held by a departing instance
         // (redeploy overlap). The loser waits instead of fighting — see create_slot.
-        let mut stream = match ReplicationStream::start(
-            &host, port, &user, &db, &slot, &publication, start_lsn,
+        let mut stream = match ReplicationStream::start_with_tls(
+            &host, port, &user, &db, &slot, &publication, start_lsn, password.as_deref(), tls_mode,
         )
         .await
         {
@@ -626,12 +622,8 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
 
     // Postgres connection only for client mutation write-through (no slot here);
     // those writes flow back through the replicator's change-stream.
-    let (pg, connection) = tokio_postgres::connect(&cfg.conn_str(), NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("postgres connection error: {e}");
-        }
-    });
+    let (pg, driver) = tls::connect(&cfg.conn_str(), cfg.tls).await?;
+    tokio::spawn(driver);
     // Shared CVR tables (per-client view) so a client reconnecting to this node —
     // having last been on another — resumes as a delta.
     crate::cvr::PgCvrStore::ensure_schema(&pg).await?;

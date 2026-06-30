@@ -26,6 +26,8 @@ async fn main() -> anyhow::Result<()> {
         port: env("ORBIT_PG_PORT", "5433").parse().unwrap_or(5433),
         user: env("ORBIT_PG_USER", "orbit"),
         database: env("ORBIT_PG_DB", "orbit"),
+        password: None,
+        tls: orbit_cache::PgTlsMode::Disable,
         tables: vec![TableConfig {
             name: "todo".into(),
             columns: vec![

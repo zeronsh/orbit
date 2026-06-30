@@ -17,8 +17,8 @@
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_postgres::types::ToSql;
-use tokio_postgres::NoTls;
 
+use crate::pg::tls::{self, PgTlsMode};
 use crate::LogicalEvent;
 
 /// One logged change: `(pos, lsn, event)`.
@@ -30,13 +30,14 @@ pub struct PgChangeLog {
     /// Table name, namespaced per replication slot (one log per replicator).
     table: String,
     tx: mpsc::UnboundedSender<LoggedChange>,
+    tls: PgTlsMode,
 }
 
 impl PgChangeLog {
     /// Ensure the schema and spawn the batched writer (it owns its own connection).
     /// `table` must be a trusted identifier (it's derived from the slot name).
-    pub async fn open(conn_str: String, table: String) -> Result<PgChangeLog> {
-        let client = connect(&conn_str).await?;
+    pub async fn open(conn_str: String, table: String, tls: PgTlsMode) -> Result<PgChangeLog> {
+        let client = connect(&conn_str, tls).await?;
         client
             .batch_execute(&format!(
                 "CREATE TABLE IF NOT EXISTS {table} (
@@ -52,9 +53,9 @@ impl PgChangeLog {
         let writer_conn = conn_str.clone();
         let writer_table = table.clone();
         tokio::spawn(async move {
-            run_writer(writer_conn, writer_table, rx).await;
+            run_writer(writer_conn, writer_table, rx, tls).await;
         });
-        Ok(PgChangeLog { conn_str, table, tx })
+        Ok(PgChangeLog { conn_str, table, tx, tls })
     }
 
     /// Append a change from the hot path. Non-blocking; never awaits PG.
@@ -65,7 +66,7 @@ impl PgChangeLog {
     /// The highest durably-recorded `(pos, lsn)`, if any — the replicator's resume
     /// point after a restart.
     pub async fn checkpoint(&self) -> Result<Option<(u64, u64)>> {
-        let client = connect(&self.conn_str).await?;
+        let client = connect(&self.conn_str, self.tls).await?;
         let row = client
             .query_opt(
                 &format!("SELECT pos, lsn FROM {} ORDER BY pos DESC LIMIT 1", self.table),
@@ -78,7 +79,7 @@ impl PgChangeLog {
     /// Up to `limit` changes with `pos > after`, in order, plus the smallest `pos`
     /// still present (so the caller can detect that `after` was pruned away).
     pub async fn read_after(&self, after: u64, limit: i64) -> Result<(Option<u64>, Vec<(u64, LogicalEvent)>)> {
-        let client = connect(&self.conn_str).await?;
+        let client = connect(&self.conn_str, self.tls).await?;
         let min: Option<i64> = client
             .query_one(&format!("SELECT min(pos) FROM {}", self.table), &[])
             .await?
@@ -103,7 +104,7 @@ impl PgChangeLog {
 
     /// Delete entries with `pos < before` (retention; called periodically).
     pub async fn prune_before(&self, before: u64) -> Result<()> {
-        let client = connect(&self.conn_str).await?;
+        let client = connect(&self.conn_str, self.tls).await?;
         client
             .execute(
                 &format!("DELETE FROM {} WHERE pos < $1", self.table),
@@ -114,11 +115,9 @@ impl PgChangeLog {
     }
 }
 
-async fn connect(conn_str: &str) -> Result<tokio_postgres::Client> {
-    let (client, connection) = tokio_postgres::connect(conn_str, NoTls).await?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+async fn connect(conn_str: &str, mode: PgTlsMode) -> Result<tokio_postgres::Client> {
+    let (client, driver) = tls::connect(conn_str, mode).await?;
+    tokio::spawn(driver);
     Ok(client)
 }
 
@@ -126,10 +125,10 @@ async fn connect(conn_str: &str) -> Result<tokio_postgres::Client> {
 /// Reconnects on error; a dropped batch just means those changes aren't available
 /// for delta-resume (a view-syncer needing them falls back to a full re-restore —
 /// correct, only non-minimal), so we never block the hot path to guarantee it.
-async fn run_writer(conn_str: String, table: String, mut rx: mpsc::UnboundedReceiver<LoggedChange>) {
+async fn run_writer(conn_str: String, table: String, mut rx: mpsc::UnboundedReceiver<LoggedChange>, tls: PgTlsMode) {
     const MAX_BATCH: usize = 1024;
     loop {
-        let client = match connect(&conn_str).await {
+        let client = match connect(&conn_str, tls).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("change-log writer: connect failed ({e}); retrying in 2s");

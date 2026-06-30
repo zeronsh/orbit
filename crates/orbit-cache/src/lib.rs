@@ -38,7 +38,7 @@ pub use cvr::{Cvr, CvrStore, PgCvrStore};
 pub use mutators::MutatorRegistry;
 pub use queries::QueryRegistry;
 pub use pg::pgoutput::LogicalEvent;
-pub use pg::{initial_sync, ReplicationStream};
+pub use pg::{initial_sync, PgTlsMode, ReplicationStream};
 pub use replica::Replica;
 pub use replica::ReplicaBackend;
 pub use run::{

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use orbit_cache::changelog::PgChangeLog;
-use orbit_cache::{ChangeMsg, ChangeStreamClient, ChangeStreamServer, LogicalEvent};
+use orbit_cache::{ChangeMsg, ChangeStreamClient, ChangeStreamServer, LogicalEvent, PgTlsMode};
 use tokio_postgres::NoTls;
 
 #[tokio::test]
@@ -20,7 +20,7 @@ async fn resume_from_durable_log_after_ring_eviction() {
     client.batch_execute("DROP TABLE IF EXISTS orbit_change_log_test").await.unwrap();
 
     let log = Arc::new(
-        PgChangeLog::open(conn_str.to_string(), "orbit_change_log_test".to_string())
+        PgChangeLog::open(conn_str.to_string(), "orbit_change_log_test".to_string(), PgTlsMode::Disable)
             .await
             .unwrap(),
     );

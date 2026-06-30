@@ -35,28 +35,33 @@ async fn main() -> anyhow::Result<()> {
     let user = env("ORBIT_PG_USER", "postgres");
     let database = env("ORBIT_PG_DB", "railway");
     let tables_spec = env("ORBIT_TABLES", "");
+    let password = std::env::var("ORBIT_PG_PASSWORD")
+        .or_else(|_| std::env::var("PGPASSWORD"))
+        .ok()
+        .filter(|s| !s.is_empty());
+    let tls = orbit_cache::PgTlsMode::from_env();
 
     // Log immediately so a stuck boot is observable (otherwise the first output is
     // only after Postgres connects — a silent hang looks like a dead container).
-    eprintln!("orbit-node: starting role={role} pg={host}:{port}/{database} tables=[{tables_spec}]");
+    eprintln!("orbit-node: starting role={role} pg={host}:{port}/{database} tls={tls:?} tables=[{tables_spec}]");
 
     // Discover column types from information_schema for each configured table.
     // Railway's private network takes a few seconds to initialize after a container
     // starts; connecting immediately can hang forever. Retry with a per-attempt
     // timeout until Postgres is reachable.
-    let conn_str = format!(
-        "host={host} port={port} user={user} dbname={database} password={}",
-        env("ORBIT_PG_PASSWORD", "")
-    );
+    let mut conn_str = format!("host={host} port={port} user={user} dbname={database}");
+    if let Some(pw) = &password {
+        conn_str.push_str(&format!(" password={pw}"));
+    }
     let probe = loop {
         match tokio::time::timeout(
             Duration::from_secs(5),
-            tokio_postgres::connect(&conn_str, tokio_postgres::NoTls),
+            orbit_cache::pg::tls::connect(&conn_str, tls),
         )
         .await
         {
-            Ok(Ok((client, conn))) => {
-                tokio::spawn(async move { let _ = conn.await; });
+            Ok(Ok((client, driver))) => {
+                tokio::spawn(driver);
                 eprintln!("orbit-node: connected to Postgres");
                 break client;
             }
@@ -82,6 +87,8 @@ async fn main() -> anyhow::Result<()> {
         port,
         user,
         database,
+        password,
+        tls,
         tables,
         publication: env("ORBIT_PUBLICATION", "orbit_pub"),
         slot: env("ORBIT_SLOT", "orbit_slot"),

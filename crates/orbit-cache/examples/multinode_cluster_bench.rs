@@ -50,6 +50,8 @@ fn cfg(listen: &str) -> ServerConfig {
         port: 5433,
         user: "orbit".into(),
         database: "orbit".into(),
+        password: None,
+        tls: orbit_cache::PgTlsMode::Disable,
         tables: vec![TableConfig {
             name: "mncb_item".into(),
             columns: vec![("id".into(), ColumnType::String), ("n".into(), ColumnType::Number)],

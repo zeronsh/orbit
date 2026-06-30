@@ -10,16 +10,25 @@
 //! Reference: PostgreSQL "Frontend/Backend Protocol" and "Logical Streaming
 //! Replication Protocol".
 
+use std::pin::Pin;
+use std::task::{Context as TaskCtx, Poll};
+
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
+
+use crate::pg::tls::{self, PgTlsMode};
 
 type HmacSha256 = Hmac<Sha256>;
 
 const PROTOCOL_VERSION: i32 = 196608; // 3.0
+/// The magic SSLRequest code (see the PostgreSQL protocol): asks the server to
+/// negotiate TLS before startup.
+const SSL_REQUEST_CODE: i32 = 80877103;
 
 /// A backend protocol message: a type byte plus its payload.
 pub struct BackendMessage {
@@ -27,26 +36,94 @@ pub struct BackendMessage {
     pub body: Vec<u8>,
 }
 
+/// A TCP stream, optionally wrapped in TLS after the SSLRequest handshake. The
+/// rest of the protocol code is identical either way (it just sees a stream).
+enum MaybeTlsStream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for MaybeTlsStream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut TaskCtx<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for MaybeTlsStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut TaskCtx<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskCtx<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskCtx<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 /// A raw replication connection.
 pub struct RawConn {
-    stream: BufReader<TcpStream>,
+    stream: BufReader<MaybeTlsStream>,
 }
 
 impl RawConn {
     /// Connect and perform startup as a logical-replication connection
     /// (`replication=database`). Supports `trust`, cleartext, and SCRAM-SHA-256
-    /// auth — the password comes from `ORBIT_PG_PASSWORD` / `PGPASSWORD` (needed
-    /// by managed Postgres like Railway; local trust auth ignores it).
+    /// auth. When `tls_mode` is enabled the connection negotiates TLS via the
+    /// PostgreSQL SSLRequest handshake before startup. `password` falls back to
+    /// `ORBIT_PG_PASSWORD` / `PGPASSWORD` when `None` (local trust auth ignores it).
     pub async fn connect_replication(
         host: &str,
         port: u16,
         user: &str,
         database: &str,
+        password: Option<&str>,
+        tls_mode: PgTlsMode,
     ) -> Result<RawConn> {
-        let tcp = TcpStream::connect((host, port)).await?;
+        let mut tcp = TcpStream::connect((host, port)).await?;
         tcp.set_nodelay(true).ok();
+
+        let stream = if tls_mode.is_enabled() {
+            // SSLRequest: a startup-shaped packet (length=8, code=80877103). The
+            // server replies with a single byte: 'S' = proceed with TLS, 'N' = no.
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&8i32.to_be_bytes());
+            req.extend_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+            tcp.write_all(&req).await?;
+            tcp.flush().await?;
+            let mut resp = [0u8; 1];
+            tcp.read_exact(&mut resp).await?;
+            match resp[0] {
+                b'S' => {
+                    let connector = tls::connector(tls_mode)?;
+                    let name = tls::server_name(host)?;
+                    let tls_stream = connector
+                        .connect(name, tcp)
+                        .await
+                        .context("postgres replication TLS handshake")?;
+                    MaybeTlsStream::Tls(Box::new(tls_stream))
+                }
+                b'N' => bail!("postgres server refused SSL but sslmode requires TLS"),
+                other => bail!("unexpected response to SSLRequest: {other:#x}"),
+            }
+        } else {
+            MaybeTlsStream::Plain(tcp)
+        };
+
         let mut conn = RawConn {
-            stream: BufReader::new(tcp),
+            stream: BufReader::new(stream),
         };
         conn.send_startup(&[
             ("user", user),
@@ -55,8 +132,13 @@ impl RawConn {
             ("client_encoding", "UTF8"),
         ])
         .await?;
-        let password = std::env::var("ORBIT_PG_PASSWORD")
-            .or_else(|_| std::env::var("PGPASSWORD"))
+        let password = password
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var("ORBIT_PG_PASSWORD")
+                    .or_else(|_| std::env::var("PGPASSWORD"))
+                    .ok()
+            })
             .unwrap_or_default();
         conn.finish_startup(&password).await?;
         Ok(conn)
