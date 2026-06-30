@@ -2,7 +2,7 @@
 # `docker compose up -d` and you have everything the Orbit server needs.
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18
     container_name: orbit-todo-pg
     environment:
       POSTGRES_USER: orbit
