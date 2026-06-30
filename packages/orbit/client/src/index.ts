@@ -2,17 +2,22 @@ export { Orbit, View } from './client.ts';
 export type { OrbitOptions, TableMutator, QueryAccess, MutateAccess } from './client.ts';
 export { Query, TypedQuery, SchemaQuery, createBuilder, buildSchemaQueries } from './query.ts';
 export type { QueryHost, Subscribable, QueryBuilder, ViewLike, SchemaQueries } from './query.ts';
-export { defineMutator, defineQuery, collectOps } from './custom.ts';
+export { createOrbitApi, defineMutation, defineQuery, collectOps, validateArgs } from './custom.ts';
 export type {
   Transaction,
   SchemaCRUD,
   TableCRUD,
-  MutatorDef,
-  MutatorDefs,
+  Validator,
+  InferArgs,
+  MutationConfig,
+  QueryConfig,
+  MutationDef,
+  MutationDefs,
   MutateAPI,
   QueryDef,
   QueryDefs,
   QueriesAPI,
+  CtxOf,
 } from './custom.ts';
 export { Store } from './store.ts';
 export { MemoryKV, IDBKV } from './persist.ts';

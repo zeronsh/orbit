@@ -44,8 +44,10 @@ const schema = createSchema({
 });
 
 const mutators = {
-  createTodo: ({ tx, args }: { tx: any; args: { id: string; text: string } }) => {
-    tx.mutate.todo.insert({ id: args.id, text: args.text });
+  createTodo: {
+    handler: ({ tx, args }: { tx: any; args: { id: string; text: string } }) => {
+      tx.mutate.todo.insert({ id: args.id, text: args.text });
+    },
   },
 };
 

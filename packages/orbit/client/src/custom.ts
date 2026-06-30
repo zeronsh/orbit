@@ -1,26 +1,41 @@
-// Custom mutators + custom queries, matching Zero's authoring API:
+// Custom mutators + custom queries. Each is defined with an object:
+//
+//   const { defineQuery, defineMutation, builder } = createOrbitApi<typeof schema, Ctx>({ schema });
 //
 //   const mutators = {
-//     createTodo: defineMutator(({tx, args}: {tx: Transaction<typeof schema>; args: {text: string}}) =>
-//       tx.mutate.todo.insert({ id: crypto.randomUUID(), text: args.text, completed: false, created: Date.now() })),
+//     createTodo: defineMutation({
+//       args: z.object({ text: z.string() }),            // any Standard Schema validator
+//       handler: ({ tx, args, ctx }) =>                   // tx, args, ctx all typed — no annotations
+//         tx.mutate.todo.insert({ id: crypto.randomUUID(), text: args.text, completed: false }),
+//     }),
 //   };
-//   const builder = createBuilder(schema);
 //   const queries = {
-//     allTodos: defineQuery(() => builder.todo.orderBy('created', 'asc')),
-//     todoById: defineQuery(({args}: {args: {id: string}}) => builder.todo.where('id', '=', args.id).one()),
+//     allTodos: defineQuery({ handler: () => builder.todo.orderBy('created', 'asc') }),
+//     todoById: defineQuery({
+//       args: z.object({ id: z.string() }),
+//       handler: ({ args }) => builder.todo.where('id', '=', args.id).one(),
+//     }),
 //   };
-//   const orbit = new Orbit({ server, schema, mutators, queries });
-//   orbit.mutate.createTodo({ text });        // fully typed
-//   useQuery(orbit.query.allTodos());          // fully typed result
+//   const orbit = new Orbit({ server, schema, mutators, queries, context: () => myCtx });
 //
-// A mutator's `tx.mutate.*` calls are recorded into CRUD ops and sent to the
-// server (which persists them to Postgres — the source of truth). A query def
-// produces a typed AST the client subscribes to. Both are checked end-to-end
-// against the schema.
+// `args` is a Standard Schema validator (Zod/Valibot/ArkType/…): its output type is
+// inferred for `args`, and the server validates client input against it at runtime.
+// `ctx` is the authenticated context — server-derived from the request (authoritative),
+// and also supplied to the client (via the `context` option) so optimistic mutations
+// and local query derivation run with the same ctx. The client never sends ctx over
+// the wire. A def that doesn't need `args`/`ctx` simply omits them.
 
+import type { StandardSchemaV1 } from '@standard-schema/spec';
 import type { CrudOp, Row } from './protocol.ts';
-import type { PkOf, RowOf, SchemaDef } from './schema.ts';
-import type { QueryBuilder, Subscribable } from './query.ts';
+import type { AnySchema, PkOf, RowOf, SchemaDef } from './schema.ts';
+import { createBuilder } from './query.ts';
+import type { QueryBuilder, SchemaQueries, Subscribable } from './query.ts';
+
+/** A Standard Schema validator (e.g. a Zod/Valibot/ArkType schema). */
+export type Validator<Output = unknown> = StandardSchemaV1<unknown, Output>;
+
+/** The parsed (output) args type of a validator, or `void` when there's none. */
+export type InferArgs<A> = A extends StandardSchemaV1 ? StandardSchemaV1.InferOutput<A> : void;
 
 /** Typed CRUD surface for one table inside a mutator transaction. */
 export type TableCRUD<T extends Row, PK extends keyof T> = {
@@ -41,63 +56,104 @@ export type Transaction<S extends SchemaDef> = {
   readonly mutate: SchemaCRUD<S>;
 };
 
-// --- mutators ---------------------------------------------------------------
+// --- definitions ------------------------------------------------------------
 
-/**
- * A mutator's body. Receives a transaction, the client-supplied `args`, and
- * server-supplied `ctx` (the authenticated context — see the push endpoint). A
- * def that doesn't need `ctx` can simply omit it from its destructure.
- */
-export type MutatorFn<S extends SchemaDef, Args, Ctx = unknown> = (c: {
-  tx: Transaction<S>;
-  args: Args;
-  ctx: Ctx;
-}) => void | Promise<void>;
+/** A mutator definition: an optional `args` validator + a `handler`. */
+export type MutationConfig<S extends SchemaDef, Ctx, A extends StandardSchemaV1 | undefined> = {
+  args?: A;
+  handler: (c: { tx: Transaction<S>; args: InferArgs<A>; ctx: Ctx }) => void | Promise<void>;
+};
 
-/**
- * A mutator definition. Modeled as the function itself; its args type is inferred
- * from the signature. (`any` in the `tx`/args positions keeps specific defs
- * assignable to the `MutatorDefs` record.)
- */
+/** A query definition: an optional `args` validator + a `handler` returning a query. */
+export type QueryConfig<S extends SchemaDef, Ctx, A extends StandardSchemaV1 | undefined, T extends Row> = {
+  args?: A;
+  handler: (c: { args: InferArgs<A>; ctx: Ctx }) => QueryBuilder<T>;
+};
+
+/** A stored mutator definition. (`any` in the type positions keeps specific defs
+ * assignable to the `MutationDefs` record while preserving Args/Ctx for inference.) */
 // oxlint-disable-next-line no-explicit-any
-export type MutatorDef<Args = any> = (c: { tx: Transaction<any>; args: Args; ctx: any }) => void | Promise<void>;
+export type MutationDef<Args = any, Ctx = any> = {
+  args?: StandardSchemaV1;
+  // oxlint-disable-next-line no-explicit-any
+  handler: (c: { tx: Transaction<any>; args: Args; ctx: Ctx }) => void | Promise<void>;
+};
 
-/** Define a custom mutator (mirrors Zero's `defineMutator`). */
-export function defineMutator<S extends SchemaDef, Args, Ctx = unknown>(
-  fn: MutatorFn<S, Args, Ctx>,
-): MutatorDef<Args> {
-  return fn as MutatorDef<Args>;
+/** A stored query definition (its args + result row + ctx types are inferred). */
+// oxlint-disable-next-line no-explicit-any
+export type QueryDef<Args = any, T extends Row = Row, Ctx = any> = {
+  args?: StandardSchemaV1;
+  handler: (c: { args: Args; ctx: Ctx }) => QueryBuilder<T>;
+};
+
+/**
+ * The schema- and context-bound authoring API returned by {@link createOrbitApi}:
+ * `defineQuery`/`defineMutation` whose handlers are fully typed (`tx`, `args`, `ctx`)
+ * with no per-def annotations, plus a `builder` for the bound schema.
+ */
+export interface OrbitApi<S extends SchemaDef, Ctx> {
+  builder: SchemaQueries<S>;
+  defineMutation<A extends StandardSchemaV1 | undefined = undefined>(
+    config: MutationConfig<S, Ctx, A>,
+  ): MutationDef<InferArgs<A>, Ctx>;
+  defineQuery<A extends StandardSchemaV1 | undefined = undefined, T extends Row = Row>(
+    config: QueryConfig<S, Ctx, A, T>,
+  ): QueryDef<InferArgs<A>, T, Ctx>;
 }
 
-export type MutatorDefs = Record<string, MutatorDef>;
-export type ArgsOf<M> = M extends (c: { tx: never; args: infer A; ctx: never }) => unknown ? A : never;
+/**
+ * Bind the schema + context types once and get `defineQuery`/`defineMutation`/`builder`
+ * whose handlers are fully typed (`tx`, `args`, `ctx`) with no per-def annotations.
+ */
+export function createOrbitApi<S extends SchemaDef, Ctx = unknown>(opts: { schema: S }): OrbitApi<S, Ctx> {
+  return {
+    builder: createBuilder(opts.schema),
+    defineMutation: ((config: unknown) => config) as OrbitApi<S, Ctx>['defineMutation'],
+    defineQuery: ((config: unknown) => config) as OrbitApi<S, Ctx>['defineQuery'],
+  };
+}
+
+/** Define a custom mutator without a factory (`tx` loosely typed, `ctx` is `unknown`).
+ * Prefer {@link createOrbitApi} for fully-typed `tx`/`ctx`. */
+export function defineMutation<A extends StandardSchemaV1 | undefined = undefined>(config: {
+  args?: A;
+  handler: (c: { tx: Transaction<AnySchema>; args: InferArgs<A>; ctx: unknown }) => void | Promise<void>;
+}): MutationDef<InferArgs<A>, unknown> {
+  return config as unknown as MutationDef<InferArgs<A>, unknown>;
+}
+
+/** Define a custom (named) query without a factory (`ctx` is `unknown`).
+ * Prefer {@link createOrbitApi} for a fully-typed `ctx`. */
+export function defineQuery<A extends StandardSchemaV1 | undefined = undefined, T extends Row = Row>(config: {
+  args?: A;
+  handler: (c: { args: InferArgs<A>; ctx: unknown }) => QueryBuilder<T>;
+}): QueryDef<InferArgs<A>, T, unknown> {
+  return config as unknown as QueryDef<InferArgs<A>, T, unknown>;
+}
+
+// --- derived API types ------------------------------------------------------
+
+export type MutationDefs = Record<string, MutationDef>;
+export type QueryDefs = Record<string, QueryDef>;
+
+/** The handler's parameter object (`{ tx?, args, ctx }`). Captured whole so that
+ * `args`/`ctx` can be picked without tripping over function-param contravariance. */
+type ParamOf<D> = D extends { handler: (c: infer C) => unknown } ? C : never;
+
+export type ArgsOf<M> = ParamOf<M> extends { args: infer A } ? A : never;
+export type QArgsOf<Q> = ArgsOf<Q>;
+// oxlint-disable-next-line no-explicit-any
+export type QRowOf<Q> = Q extends { handler: (...a: any[]) => QueryBuilder<infer T> } ? T : never;
+
+/** The Ctx type shared by a record of defs (used to type the client's `context`). */
+export type CtxOf<D> = ParamOf<D[keyof D]> extends { ctx: infer C } ? C : unknown;
 
 /** `orbit.mutate` derived from mutator defs — `tx` stripped, args kept. */
-export type MutateAPI<MD extends MutatorDefs> = {
+export type MutateAPI<MD extends MutationDefs> = {
   [K in keyof MD]: ArgsOf<MD[K]> extends void | undefined
     ? () => void
     : (args: ArgsOf<MD[K]>) => void;
 };
-
-// --- queries ----------------------------------------------------------------
-
-export type QueryFn<Args, Ctx, T extends Row> = (c: { args: Args; ctx: Ctx }) => QueryBuilder<T>;
-
-/** A custom query definition (its args + result row types are inferred). */
-// oxlint-disable-next-line no-explicit-any
-export type QueryDef<Args = any, T extends Row = Row> = (c: { args: Args; ctx: any }) => QueryBuilder<T>;
-
-/** Define a custom (named) query (mirrors Zero's `defineQuery`). */
-export function defineQuery<T extends Row>(fn: () => QueryBuilder<T>): QueryDef<void, T>;
-export function defineQuery<Args, Ctx, T extends Row>(fn: QueryFn<Args, Ctx, T>): QueryDef<Args, T>;
-// oxlint-disable-next-line no-explicit-any
-export function defineQuery(fn: any): any {
-  return fn;
-}
-
-export type QueryDefs = Record<string, QueryDef>;
-export type QArgsOf<Q> = Q extends (c: { args: infer A; ctx: never }) => unknown ? A : never;
-export type QRowOf<Q> = Q extends (c: never) => Subscribable<infer T> ? T : never;
 
 /** `orbit.queries` derived from query defs — call with args, get a `Subscribable`. */
 export type QueriesAPI<QD extends QueryDefs> = {
@@ -106,7 +162,22 @@ export type QueriesAPI<QD extends QueryDefs> = {
     : (args: QArgsOf<QD[K]>) => Subscribable<QRowOf<QD[K]>>;
 };
 
-// --- server-side: run a mutator def into CRUD ops -------------------------
+// --- runtime helpers --------------------------------------------------------
+
+/**
+ * Validate (and parse) `args` against a Standard Schema validator. Returns the
+ * parsed value; throws on invalid input. With no validator, returns args as-is.
+ * Used by the server processors on untrusted client input.
+ */
+export async function validateArgs(validator: StandardSchemaV1 | undefined, args: unknown): Promise<unknown> {
+  if (!validator) return args;
+  let result = validator['~standard'].validate(args);
+  if (result instanceof Promise) result = await result;
+  if (result.issues) {
+    throw new Error(`invalid arguments: ${JSON.stringify(result.issues)}`);
+  }
+  return result.value;
+}
 
 /**
  * Run a mutator definition against a recording transaction and return the CRUD
@@ -115,7 +186,7 @@ export type QueriesAPI<QD extends QueryDefs> = {
  */
 export function collectOps<S extends SchemaDef>(
   schema: S,
-  def: MutatorDef,
+  def: MutationDef,
   args: unknown,
   ctx?: unknown,
 ): CrudOp[] {
@@ -134,6 +205,6 @@ export function collectOps<S extends SchemaDef>(
     },
   );
   const tx = { location: 'client', mutate } as unknown as Transaction<S>;
-  void def({ tx: tx as never, args, ctx });
+  void def.handler({ tx: tx as never, args, ctx });
   return ops;
 }

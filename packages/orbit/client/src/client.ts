@@ -25,9 +25,10 @@ import { Query, SchemaQuery, type SchemaQueries, type QueryHost } from './query.
 import { type AnySchema, type PkOf, type RowOf, type SchemaDef } from './schema.ts';
 import {
   collectOps,
+  type CtxOf,
   type MutateAPI,
-  type MutatorDef,
-  type MutatorDefs,
+  type MutationDef,
+  type MutationDefs,
   type QueriesAPI,
   type QueryDef,
   type QueryDefs,
@@ -156,9 +157,18 @@ export class View<T extends Row = Row> {
   }
 }
 
+/** A context value or a (sync) getter for it. */
+type CtxInput<C> = C | (() => C);
+/** The Ctx the handlers expect, inferred from the mutator/query defs. */
+type ResolveCtx<MD, QD> = MD extends MutationDefs
+  ? CtxOf<MD>
+  : QD extends QueryDefs
+    ? CtxOf<QD>
+    : unknown;
+
 export class Orbit<
   S extends SchemaDef = AnySchema,
-  MD extends MutatorDefs | undefined = undefined,
+  MD extends MutationDefs | undefined = undefined,
   QD extends QueryDefs | undefined = undefined,
 > implements QueryHost {
   // Not `readonly`: when `persist` is enabled and no explicit id was given, these
@@ -175,14 +185,17 @@ export class Orbit<
    * (`orbit.mutate.createTodo(args)`); otherwise per-table CRUD
    * (`orbit.mutate.todo.insert(...)`).
    */
-  readonly mutate: MD extends MutatorDefs ? MutateAPI<MD> : MutateAccess<S>;
+  readonly mutate: MD extends MutationDefs ? MutateAPI<MD> : MutateAccess<S>;
 
   #ws: WebSocket | undefined;
   #store: Store;
   #opts: OrbitOptions<S>;
   #pkByTable: Record<string, string[]>;
   #schema?: S;
-  #mutatorDefs?: Record<string, MutatorDef>;
+  #mutatorDefs?: Record<string, MutationDef>;
+  /** Context for optimistic mutators + local query derivation (a value or getter).
+   * The server independently derives the authoritative ctx from the auth token. */
+  #context?: unknown | (() => unknown);
   #nextMutationID = 1;
   #closed = false;
   #connecting = false;
@@ -207,9 +220,12 @@ export class Orbit<
   /** Whether the id was supplied explicitly (then we never override it from the KV). */
   #idFromOpts: boolean;
 
-  constructor(opts: OrbitOptions<S> & { mutators?: MD; queries?: QD }) {
+  constructor(
+    opts: OrbitOptions<S> & { mutators?: MD; queries?: QD; context?: CtxInput<ResolveCtx<MD, QD>> },
+  ) {
     this.#opts = opts;
     this.#schema = opts.schema;
+    this.#context = (opts as { context?: unknown | (() => unknown) }).context;
     this.#maxReconnectMs = opts.maxReconnectMs ?? 30_000;
     this.#queryTTL = opts.queryTTL ?? '5m';
     this.#kv = opts.persist;
@@ -244,7 +260,7 @@ export class Orbit<
       ? new Proxy({}, {
           get: (_t, name: string) => (args?: unknown) => ({
             materialize: () => {
-              const ast = queryDefs[name]({ args, ctx: {} } as never).ast();
+              const ast = queryDefs[name].handler({ args, ctx: this.#resolveContext() } as never).ast();
               const argList = args === undefined ? [] : [args];
               return this.materializeNamed(name, argList, ast);
             },
@@ -254,7 +270,7 @@ export class Orbit<
 
     // Mutators: custom (sent to the server by NAME — the server forwards them to
     // the app's push endpoint, which runs them with context) or per-table CRUD.
-    this.#mutatorDefs = opts.mutators as Record<string, MutatorDef> | undefined;
+    this.#mutatorDefs = opts.mutators as Record<string, MutationDef> | undefined;
     this.mutate = (this.#mutatorDefs
       ? new Proxy({}, {
           get: (_t, name: string) => (args?: unknown) => this.mutateCustom(name, args),
@@ -333,14 +349,14 @@ export class Orbit<
       args: args === undefined ? [] : [args],
       timestamp: Date.now(),
     };
-    // Optimistic: run the mutator locally to overlay its effect immediately.
-    // (`ctx` is server-supplied; a stub is fine — the server-confirmed rows
-    // replace the overlay on rebase.)
+    // Optimistic: run the mutator locally (with the client `context`) to overlay
+    // its effect immediately. The server re-runs it with the authoritative ctx and
+    // the confirmed rows replace this overlay on rebase.
     const def = this.#mutatorDefs?.[name];
     let ops: CrudOp[] = [];
     if (def && this.#schema) {
       try {
-        ops = collectOps(this.#schema, def, args, {});
+        ops = collectOps(this.#schema, def, args, this.#resolveContext());
       } catch {
         /* a mutator that needs real ctx locally just skips the optimistic step */
       }
@@ -355,6 +371,12 @@ export class Orbit<
   }
 
   // --- internals ----------------------------------------------------------
+
+  /** Resolve the client context (a value or sync getter); `{}` when unset. */
+  #resolveContext(): unknown {
+    const c = this.#context;
+    return typeof c === 'function' ? (c as () => unknown)() : (c ?? {});
+  }
 
   /** Hydrate persisted state (if any), restore unconfirmed mutations, then connect. */
   async #init(): Promise<void> {

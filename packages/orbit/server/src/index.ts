@@ -6,7 +6,14 @@
 // `@orbit/server/pg`; a Drizzle/Kysely/etc. adapter just implements the same
 // interface).
 
-import { collectOps, type CrudOp, type MutatorDef, type QueryDef, type SchemaDef } from '../../client/src/index.ts';
+import {
+  collectOps,
+  validateArgs,
+  type CrudOp,
+  type MutationDef,
+  type QueryDef,
+  type SchemaDef,
+} from '../../client/src/index.ts';
 
 /** A transaction handle: run a parameterized SQL statement. */
 export interface DBTransaction {
@@ -66,7 +73,7 @@ export class PushProcessor<Ctx = unknown> {
     this.#context = opts.context;
   }
 
-  async process(mutators: Record<string, MutatorDef>, request: Request): Promise<Response> {
+  async process(mutators: Record<string, MutationDef>, request: Request): Promise<Response> {
     const ctx = await this.#context(request);
     if (ctx == null) return new Response('unauthorized', { status: 401 });
     const body = await request.json();
@@ -93,7 +100,9 @@ export class PushProcessor<Ctx = unknown> {
           [m.clientID, m.id],
         );
         if (advanced.length === 0) continue; // already applied — skip
-        for (const op of collectOps(this.#schema, def, m.args?.[0], ctx)) {
+        // Validate the client-supplied args against the def's schema (untrusted input).
+        const args = await validateArgs(def.args, m.args?.[0]);
+        for (const op of collectOps(this.#schema, def, args, ctx)) {
           await applyCrudOp(tx, op);
         }
       }
@@ -117,7 +126,8 @@ export class QueryProcessor<Ctx = unknown> {
     const body = await request.json();
     const def = queries[body.name];
     if (!def) return new Response('unknown query', { status: 404 });
-    const ast = def({ args: (body.args ?? [])[0], ctx }).ast();
+    const args = await validateArgs(def.args, (body.args ?? [])[0]);
+    const ast = def.handler({ args, ctx }).ast();
     return Response.json({ ast });
   }
 }
