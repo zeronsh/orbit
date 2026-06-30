@@ -987,7 +987,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "oql"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -997,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-cache"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "oql",
  "serde",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-schema"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "oql",
  "serde",
