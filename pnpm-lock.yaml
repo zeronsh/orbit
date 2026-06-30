@@ -30,8 +30,8 @@ importers:
         specifier: ^0.5.0
         version: 0.5.0(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(yjs@13.6.31)
       '@zeronsh/orbit':
-        specifier: ^0.2.0
-        version: 0.2.0(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(prettier@3.8.4)(react@19.2.7)(ts-morph@27.0.2)
+        specifier: ^0.3.0
+        version: 0.3.0(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(prettier@3.8.4)(react@19.2.7)(ts-morph@27.0.2)
       better-auth:
         specifier: ^1.2.8
         version: 1.6.20(@tanstack/react-start@1.168.26(esbuild@0.27.7)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(rolldown@1.1.3)(rollup@4.62.2)(vite@8.1.0(@types/node@26.0.0)(esbuild@0.27.7)(jiti@2.7.0)))(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
@@ -47,6 +47,9 @@ importers:
       yjs:
         specifier: ^13.6.31
         version: 13.6.31
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
     devDependencies:
       '@types/node':
         specifier: ^26.0.0
@@ -1036,8 +1039,8 @@ packages:
       react-dom: ^18 || ^19
       yjs: ^13.6.0
 
-  '@zeronsh/orbit@0.2.0':
-    resolution: {integrity: sha512-4ULB8EveQIVCPTdl9sRnT/K4yIo0PO8mvdJ6pBqCuUySQJSZVCdhvka6pQFRjMtgvVrzAsYLBjIjSNtqZyEv6Q==}
+  '@zeronsh/orbit@0.3.0':
+    resolution: {integrity: sha512-qKxnn6jHSul2Q2Nmm2kerorvasfpqr1BFTZJ5Uxgds9fpRmSVynWF2nxSyFDVwKrfotCqNrt8SeyikaMgws1qA==}
     hasBin: true
     peerDependencies:
       drizzle-orm: '>=0.36.0'
@@ -3103,8 +3106,9 @@ snapshots:
       react-dom: 19.2.7(react@19.2.7)
       yjs: 13.6.31
 
-  '@zeronsh/orbit@0.2.0(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(prettier@3.8.4)(react@19.2.7)(ts-morph@27.0.2)':
+  '@zeronsh/orbit@0.3.0(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(prettier@3.8.4)(react@19.2.7)(ts-morph@27.0.2)':
     dependencies:
+      '@standard-schema/spec': 1.1.0
       commander: 14.0.3
     optionalDependencies:
       drizzle-orm: 1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3)

@@ -8,15 +8,18 @@ const IDB_NAME = 'orbit-pixels';
 
 // Lazily create the client on the browser only (it opens a WebSocket). `auth`
 // reads the current better-auth bearer token, which Orbit forwards to the app's
-// /api/push and /api/query endpoints as `Authorization: Bearer …`.
+// /api/push and /api/query endpoints as `Authorization: Bearer …`. `userID` is the
+// signed-in user; it becomes the client `context` so optimistic writes use the same
+// id the server derives from the session (the server stays authoritative).
 let client: Orbit<typeof schema, typeof mutators, typeof queries> | null = null;
-export function getOrbit() {
+export function getOrbit(userID: string) {
   if (!client) {
     client = new Orbit({
       server: import.meta.env.VITE_ORBIT_SERVER ?? 'ws://127.0.0.1:4848',
       schema,
       mutators,
       queries,
+      context: () => ({ userID }),
       auth: () => bearerToken(),
       // Persist synced rows + pending mutations in IndexedDB so a reload hydrates
       // the canvas instantly from the local cache before the socket reconnects and

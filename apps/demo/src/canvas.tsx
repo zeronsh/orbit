@@ -31,7 +31,7 @@ const identityOf = (id: string) => IDENTITY[hashId(id) % IDENTITY.length];
 type Tool = 'paint' | 'erase' | 'pan';
 
 export function Canvas({ me }: { me: { id: string } }) {
-  const orbit = getOrbit();
+  const orbit = getOrbit(me.id);
 
   // The camera center, in world coords (cells). Lives in a ref for the rAF loop; the
   // center CHUNK is mirrored into state so the query re-subscribes when it changes.
@@ -86,14 +86,13 @@ export function Canvas({ me }: { me: { id: string } }) {
   };
   const sendCursor = (wx: number, wy: number) =>
     orbit.mutate.moveCursor({
-      uid: me.id,
       x: wx,
       y: wy,
       color: colorRef.current,
       size: sizeRef.current,
       erasing: toolRef.current === 'erase' ? 1 : 0,
     });
-  const clearCursor = () => orbit.mutate.clearCursor({ uid: me.id });
+  const clearCursor = () => orbit.mutate.clearCursor();
 
   const footprint = (cx: number, cy: number, s: number) => {
     const out: { x: number; y: number }[] = [];

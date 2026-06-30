@@ -3,7 +3,8 @@
 // which runs the mutators/queries with an authenticated `ctx` (the better-auth
 // anonymous user id).
 
-import { createBuilder, defineMutator, defineQuery, type Transaction } from '@zeronsh/orbit/client';
+import { createOrbitApi } from '@zeronsh/orbit/client';
+import { z } from 'zod';
 // The Orbit schema + row types are GENERATED from the Drizzle schema in
 // db/schema.ts by `pnpm generate:schema` (the @orbit/drizzle CLI). Edit
 // db/schema.ts (and ../postgres/01-init.sql), then regenerate — not this file.
@@ -12,8 +13,12 @@ import { schema, type Pixel, type Cursor } from './schema.gen.ts';
 export { schema };
 export type { Pixel, Cursor };
 
-/** The authenticated context the app server derives from the better-auth session. */
+/** The authenticated context — server-derived from the better-auth session, and
+ * supplied to the client (see src/orbit.ts) so optimistic writes use the same id. */
 export type Ctx = { userID: string };
+
+// Bind the schema + context types once; every handler gets a typed tx/args/ctx.
+const { defineQuery, defineMutation, builder } = createOrbitApi<typeof schema, Ctx>({ schema });
 
 // The world is infinite. Pixels live at integer cell coords (any sign); the client
 // renders a camera-panned window and only ever subscribes to the chunks near it.
@@ -21,36 +26,45 @@ export const CELL = 24; // px per cell on screen
 export const CHUNK = 16; // cells per chunk
 export const VIEW_RADIUS = 3; // chunks of pixels the query returns around the center
 
-const b = createBuilder(schema);
+// --- arg validators ----------------------------------------------------------
+
+const hexColor = z.custom<`#${string}`>((v) => typeof v === 'string' && v.startsWith('#'));
+const cell = z.object({ x: z.number(), y: z.number() });
+const paintedCell = z.object({ x: z.number(), y: z.number(), color: hexColor });
+const center = z.object({ cx: z.number(), cy: z.number() });
 
 // --- mutators ----------------------------------------------------------------
 
 export const mutators = {
-  paint: defineMutator(
-    ({ tx, args }: { tx: Transaction<typeof schema>; args: { cells: { x: number; y: number; color: `#${string}` }[] } }) => {
+  paint: defineMutation({
+    args: z.object({ cells: z.array(paintedCell) }),
+    handler: ({ tx, args }) => {
       const now = Date.now();
       for (const c of args.cells) {
         tx.mutate.pixel.upsert({ id: `${c.x}:${c.y}`, x: c.x, y: c.y, color: c.color, updated: now });
       }
     },
-  ),
-  erase: defineMutator(
-    ({ tx, args }: { tx: Transaction<typeof schema>; args: { cells: { x: number; y: number }[] } }) => {
+  }),
+
+  erase: defineMutation({
+    args: z.object({ cells: z.array(cell) }),
+    handler: ({ tx, args }) => {
       for (const c of args.cells) tx.mutate.pixel.delete({ id: `${c.x}:${c.y}` });
     },
-  ),
-  moveCursor: defineMutator(
-    ({
-      tx,
-      args,
-      ctx,
-    }: {
-      tx: Transaction<typeof schema>;
-      args: { uid: string; x: number; y: number; color: `#${string}`; size: number; erasing: 0 | 1 };
-      ctx: Ctx;
-    }) => {
+  }),
+
+  // The cursor id is the authenticated user — taken from `ctx`, never the client.
+  moveCursor: defineMutation({
+    args: z.object({
+      x: z.number(),
+      y: z.number(),
+      color: hexColor,
+      size: z.number(),
+      erasing: z.union([z.literal(0), z.literal(1)]),
+    }),
+    handler: ({ tx, args, ctx }) => {
       tx.mutate.cursor.upsert({
-        id: ctx?.userID ?? args.uid,
+        id: ctx.userID,
         x: args.x,
         y: args.y,
         color: args.color,
@@ -59,12 +73,13 @@ export const mutators = {
         updated: Date.now(),
       });
     },
-  ),
-  clearCursor: defineMutator(
-    ({ tx, args, ctx }: { tx: Transaction<typeof schema>; args: { uid: string }; ctx: Ctx }) => {
-      tx.mutate.cursor.delete({ id: ctx?.userID ?? args.uid });
+  }),
+
+  clearCursor: defineMutation({
+    handler: ({ tx, ctx }) => {
+      tx.mutate.cursor.delete({ id: ctx.userID });
     },
-  ),
+  }),
 };
 
 // --- queries -----------------------------------------------------------------
@@ -86,23 +101,21 @@ const windowBounds = (cx: number, cy: number) => {
 
 export const queries = {
   // Pixels in the window of chunks around the requested center.
-  pixelsInView: defineQuery(({ args }: { args: { cx: number; cy: number }; ctx: Ctx }) => {
-    const { loX, hiX, loY, hiY } = windowBounds(args.cx, args.cy);
-    return b.pixel
-      .where('x', '>=', loX)
-      .where('x', '<', hiX)
-      .where('y', '>=', loY)
-      .where('y', '<', hiY);
+  pixelsInView: defineQuery({
+    args: center,
+    handler: ({ args }) => {
+      const { loX, hiX, loY, hiY } = windowBounds(args.cx, args.cy);
+      return builder.pixel.where('x', '>=', loX).where('x', '<', hiX).where('y', '>=', loY).where('y', '<', hiY);
+    },
   }),
 
   // Presence in the same window — bounded identically so a client only subscribes to
   // cursors near its camera (x/y are float world coords; the range filter is the same).
-  cursorsInView: defineQuery(({ args }: { args: { cx: number; cy: number }; ctx: Ctx }) => {
-    const { loX, hiX, loY, hiY } = windowBounds(args.cx, args.cy);
-    return b.cursor
-      .where('x', '>=', loX)
-      .where('x', '<', hiX)
-      .where('y', '>=', loY)
-      .where('y', '<', hiY);
+  cursorsInView: defineQuery({
+    args: center,
+    handler: ({ args }) => {
+      const { loX, hiX, loY, hiY } = windowBounds(args.cx, args.cy);
+      return builder.cursor.where('x', '>=', loX).where('x', '<', hiX).where('y', '>=', loY).where('y', '<', hiY);
+    },
   }),
 };
