@@ -82,19 +82,10 @@ impl ServerConfig {
 }
 
 impl ServerConfig {
-    /// The `tokio-postgres` connection string, including `password` and `sslmode`
-    /// when set. Trust-auth local PG needs neither.
+    /// The `tokio-postgres` connection string, including the `password` when set
+    /// (properly quoted). Trust-auth local PG needs none.
     pub fn conn_str(&self) -> String {
-        let mut s = format!(
-            "host={} port={} user={} dbname={}",
-            self.host, self.port, self.user, self.database
-        );
-        if let Some(pw) = self.password.as_deref() {
-            if !pw.is_empty() {
-                s.push_str(&format!(" password={pw}"));
-            }
-        }
-        s
+        tls::conn_str(&self.host, self.port, &self.user, &self.database, self.password.as_deref())
     }
 }
 

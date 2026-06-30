@@ -22,6 +22,7 @@ bytes = "1"
 tokio-tungstenite = "0.24"
 base64 = { workspace = true }
 percent-encoding = { workspace = true }
+url = "2"
 rusqlite = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # TLS for Postgres connections (managed PG: Railway/Neon/Supabase). rustls with the

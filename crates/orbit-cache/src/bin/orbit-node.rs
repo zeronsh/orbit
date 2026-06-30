@@ -6,7 +6,8 @@
 //!
 //! Built with `--features s3` (uses `S3ObjectStore::from_env`). Env:
 //!   ORBIT_ROLE                  replicator | view-syncer   (default view-syncer)
-//!   ORBIT_PG_HOST/PORT/USER/DB / DATABASE_URL parts
+//!   DATABASE_URL                postgres://user:pass@host:port/db?sslmode=… (managed PG),
+//!                               else ORBIT_PG_HOST/PORT/USER/DB + ORBIT_PG_PASSWORD/SSLMODE
 //!   ORBIT_TABLES                e.g. user:id,issue:id,comment:id (columns discovered)
 //!   ORBIT_CHANGE_STREAM_ADDR    replicator: bind addr (e.g. [::]:4000);
 //!                               view-syncer: connect addr (e.g. replicator.railway.internal:4000)
@@ -30,16 +31,10 @@ fn env(key: &str, default: &str) -> String {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let role = env("ORBIT_ROLE", "view-syncer");
-    let host = env("ORBIT_PG_HOST", "127.0.0.1");
-    let port: u16 = env("ORBIT_PG_PORT", "5432").parse().unwrap_or(5432);
-    let user = env("ORBIT_PG_USER", "postgres");
-    let database = env("ORBIT_PG_DB", "railway");
+    // DATABASE_URL (managed PG) if set, else ORBIT_PG_* + password + sslmode.
+    let orbit_cache::pg::tls::PgConnInfo { host, port, user, database, password, tls } =
+        orbit_cache::pg::tls::PgConnInfo::from_env(5432, "postgres", "railway")?;
     let tables_spec = env("ORBIT_TABLES", "");
-    let password = std::env::var("ORBIT_PG_PASSWORD")
-        .or_else(|_| std::env::var("PGPASSWORD"))
-        .ok()
-        .filter(|s| !s.is_empty());
-    let tls = orbit_cache::PgTlsMode::from_env();
 
     // Log immediately so a stuck boot is observable (otherwise the first output is
     // only after Postgres connects — a silent hang looks like a dead container).
@@ -49,10 +44,7 @@ async fn main() -> anyhow::Result<()> {
     // Railway's private network takes a few seconds to initialize after a container
     // starts; connecting immediately can hang forever. Retry with a per-attempt
     // timeout until Postgres is reachable.
-    let mut conn_str = format!("host={host} port={port} user={user} dbname={database}");
-    if let Some(pw) = &password {
-        conn_str.push_str(&format!(" password={pw}"));
-    }
+    let conn_str = orbit_cache::pg::tls::conn_str(&host, port, &user, &database, password.as_deref());
     let probe = loop {
         match tokio::time::timeout(
             Duration::from_secs(5),

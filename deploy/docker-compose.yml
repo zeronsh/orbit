@@ -34,7 +34,9 @@ services:
       ORBIT_PG_PORT: "5432"
       ORBIT_PG_USER: orbit
       ORBIT_PG_DB: orbit
-      # Managed Postgres (Railway/Neon/Supabase): set a password + TLS mode.
+      # Managed Postgres (Railway/Neon/Supabase): either a full DATABASE_URL…
+      # DATABASE_URL: ${DATABASE_URL}   # postgres://user:pass@host:port/db?sslmode=require
+      # …or the discrete password + TLS mode:
       # ORBIT_PG_PASSWORD: ${ORBIT_PG_PASSWORD}
       # ORBIT_PG_SSLMODE: require   # disable (default) | require | verify-full
       ORBIT_LISTEN: 0.0.0.0:4848

@@ -24,7 +24,7 @@
 use std::time::Duration;
 
 use orbit_cache::pg::pgoutput::LogicalEvent;
-use orbit_cache::pg::tls;
+use orbit_cache::pg::tls::{self, PgConnInfo};
 use orbit_cache::pg::{create_publication, create_slot};
 use orbit_cache::{PgTlsMode, ReplicationStream};
 
@@ -51,6 +51,22 @@ async fn tls_password_sql_and_replication() {
         .expect("query pg_stat_ssl")
         .get(0);
     assert!(encrypted, "the SQL connection should be TLS-encrypted");
+
+    // --- DATABASE_URL path: parse a postgres:// URL, connect, prove encryption. ---
+    let url = format!("postgres://orbit:{password}@{host}:{port}/orbit?sslmode=require");
+    let info = PgConnInfo::parse_url(&url).expect("parse DATABASE_URL");
+    assert_eq!(info.tls, PgTlsMode::Require);
+    assert_eq!(info.password.as_deref(), Some(password.as_str()));
+    let (url_client, url_driver) = tls::connect(&info.conn_str(), info.tls)
+        .await
+        .expect("connect via DATABASE_URL");
+    tokio::spawn(url_driver);
+    let url_encrypted: bool = url_client
+        .query_one("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()", &[])
+        .await
+        .expect("query pg_stat_ssl")
+        .get(0);
+    assert!(url_encrypted, "the DATABASE_URL connection should be TLS-encrypted");
 
     client
         .batch_execute(

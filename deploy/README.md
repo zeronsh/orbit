@@ -34,6 +34,7 @@ Run the cluster node role instead by overriding the command with `orbit-node`.
 
 | Var | Default | Purpose |
 | --- | --- | --- |
+| `DATABASE_URL` | _(none)_ | Full `postgres://user:pass@host:port/db?sslmode=…` URL (managed PG). Overrides the `ORBIT_PG_*` vars below. |
 | `ORBIT_PG_HOST` | `127.0.0.1` | Postgres host |
 | `ORBIT_PG_PORT` | `5433` | Postgres port |
 | `ORBIT_PG_USER` | `orbit` | Postgres user |

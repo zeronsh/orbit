@@ -1,6 +1,8 @@
 //! The `orbit-server` binary: runs the integrated Orbit sync server.
 //!
 //! Configuration via env vars:
+//!   DATABASE_URL — a full `postgres://user:pass@host:port/db?sslmode=…` URL
+//!     (managed PG); takes precedence over the discrete vars below,
 //!   ORBIT_PG_HOST (default 127.0.0.1), ORBIT_PG_PORT (5433),
 //!   ORBIT_PG_USER (orbit), ORBIT_PG_DB (orbit),
 //!   ORBIT_PG_PASSWORD (or PGPASSWORD) — for password-authed (managed) Postgres,
@@ -21,26 +23,16 @@ async fn main() -> anyhow::Result<()> {
     // `ghcr.io/zeronsh/orbit-server` image (see scripts/sync-versions.mjs).
     eprintln!("orbit-server v{}", env!("CARGO_PKG_VERSION"));
 
-    let host = env("ORBIT_PG_HOST", "127.0.0.1");
-    let port: u16 = env("ORBIT_PG_PORT", "5433").parse().unwrap_or(5433);
-    let user = env("ORBIT_PG_USER", "orbit");
-    let database = env("ORBIT_PG_DB", "orbit");
+    // Connection params: DATABASE_URL (managed PG) if set, else ORBIT_PG_* +
+    // ORBIT_PG_PASSWORD/PGPASSWORD + ORBIT_PG_SSLMODE/PGSSLMODE.
+    let orbit_cache::pg::tls::PgConnInfo { host, port, user, database, password, tls } =
+        orbit_cache::pg::tls::PgConnInfo::from_env(5433, "orbit", "orbit")?;
     let listen_addr = env("ORBIT_LISTEN", "127.0.0.1:4848");
     let tables_spec = env("ORBIT_TABLES", "");
-    // ORBIT_PG_PASSWORD/PGPASSWORD (managed PG) + ORBIT_PG_SSLMODE/PGSSLMODE
-    // (disable | require | verify-full) secure the connection.
-    let password = std::env::var("ORBIT_PG_PASSWORD")
-        .or_else(|_| std::env::var("PGPASSWORD"))
-        .ok()
-        .filter(|s| !s.is_empty());
-    let tls = orbit_cache::PgTlsMode::from_env();
 
     // Discover columns at runtime from information_schema for each configured
     // table (typed String/Number/Boolean/Json) before starting.
-    let mut probe_conn_str = format!("host={host} port={port} user={user} dbname={database}");
-    if let Some(pw) = &password {
-        probe_conn_str.push_str(&format!(" password={pw}"));
-    }
+    let probe_conn_str = orbit_cache::pg::tls::conn_str(&host, port, &user, &database, password.as_deref());
     let (probe, probe_driver) = orbit_cache::pg::tls::connect(&probe_conn_str, tls).await?;
     tokio::spawn(probe_driver);
 
