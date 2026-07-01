@@ -167,11 +167,17 @@ fn shard_main(
 
         let (tick_tx, _) = broadcast::channel::<()>(1024);
 
+        // Per-client lastMutationIDs for this shard, advanced from replicated
+        // `orbit_client_mutations` events in the fan-out.
+        let lmids: crate::server::LmidMap =
+            Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+
         // Apply fanned-out replication events; poke this shard's clients at the
         // commit boundary so a transaction is delivered atomically.
         {
             let replica = replica.clone();
             let tick_tx = tick_tx.clone();
+            let lmids = lmids.clone();
             spawn_local(async move {
                 let mut dirty = false;
                 while let Some(ev) = events.recv().await {
@@ -180,6 +186,7 @@ fn shard_main(
                         LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
                     );
                     let is_commit = matches!(ev, LogicalEvent::Commit);
+                    crate::server::capture_lmid(&ev, &lmids);
                     replica.apply(ev);
                     if is_data {
                         dirty = true;
@@ -200,6 +207,7 @@ fn shard_main(
             let forwarder = forwarder.clone();
             let pg = pg.clone();
             let ticks = tick_tx.subscribe();
+            let lmids = lmids.clone();
             spawn_local(async move {
                 // Re-register the socket on this shard's reactor.
                 let _ = std_sock.set_nonblocking(true);
@@ -222,6 +230,7 @@ fn shard_main(
                             info.client_id,
                             info.base_cookie,
                             ticks,
+                            &lmids,
                         )
                         .await;
                     }

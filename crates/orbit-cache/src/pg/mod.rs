@@ -125,11 +125,28 @@ impl ReplicationStream {
 }
 
 /// Create a publication for the given tables (idempotent).
+/// The per-client `lastMutationID` table, written by the app's `PushProcessor`
+/// (or the direct-write path) in the same transaction as a mutation's data. It's
+/// replicated so the view-syncer can ack a mutation atomically with its rows.
+pub const LMID_TABLE: &str = "orbit_client_mutations";
+
 pub async fn create_publication(client: &Client, name: &str, tables: &[&str]) -> Result<()> {
+    // Ensure the lastMutationID table exists (the app creates it lazily on first
+    // push; it must exist to be added to the publication) and replicate it too.
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE IF NOT EXISTS {LMID_TABLE} \
+             (client_id text PRIMARY KEY, last_mutation_id bigint NOT NULL)"
+        ))
+        .await?;
     client
         .batch_execute(&format!("DROP PUBLICATION IF EXISTS {name}"))
         .await?;
-    let table_list = tables
+    let mut all: Vec<&str> = tables.to_vec();
+    if !all.contains(&LMID_TABLE) {
+        all.push(LMID_TABLE);
+    }
+    let table_list = all
         .iter()
         .map(|t| format!("\"{t}\""))
         .collect::<Vec<_>>()

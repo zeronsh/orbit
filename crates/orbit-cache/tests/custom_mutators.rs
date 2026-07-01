@@ -123,8 +123,8 @@ async fn custom_mutator_writes_through() {
             traceparent: None,
         });
         ws.send(Message::Text(serde_json::to_string(&push).unwrap())).await.unwrap();
-        // First poke acks the mutation (empty rows); second carries w5.
-        assert_eq!(read_poke_put_ids(&mut ws).await, Vec::<String>::new());
+        // One atomic poke carries w5 *and* the lastMutationID ack together (the
+        // ack never precedes the row, so the client's optimistic overlay can't revert).
         assert_eq!(read_poke_put_ids(&mut ws).await, vec!["w5"]);
 
         ws.close(None).await.unwrap();

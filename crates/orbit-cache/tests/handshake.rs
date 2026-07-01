@@ -47,7 +47,7 @@ async fn zero_client_handshake_via_sec_protocol_header() {
                     let (sock, _) = listener.accept().await.unwrap();
                     let (ws, info) = accept_zero_ws(sock).await.unwrap();
                     let queries = orbit_cache::QueryRegistry::new();
-                    let _ = serve_client(ws, &*replica, None, &mutators, &queries, &orbit_cache::Forwarder::new(Default::default()), &orbit_cache::AuthContext::default(), info.desired_queries, info.client_id, info.base_cookie, tick_tx.subscribe()).await;
+                    let _ = serve_client(ws, &*replica, None, &mutators, &queries, &orbit_cache::Forwarder::new(Default::default()), &orbit_cache::AuthContext::default(), info.desired_queries, info.client_id, info.base_cookie, tick_tx.subscribe(), &orbit_cache::LmidMap::default()).await;
                 });
             }
 

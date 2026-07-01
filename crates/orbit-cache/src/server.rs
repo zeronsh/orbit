@@ -30,11 +30,48 @@ use orbit_protocol::{
     QueriesPatchOp, RowPatchOp, RowsPatch, Upstream,
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+
+/// Shared per-client `lastMutationID` map. The replication apply loop records
+/// each client's latest id from replicated [`orbit_client_mutations`](crate::pg::LMID_TABLE)
+/// rows; each connection reads its own id to ack mutations **atomically with the
+/// rows they produced** (same Postgres commit → same tick → same poke), so a
+/// client's optimistic overlay is never dropped before its authoritative row
+/// arrives — even while another client is writing.
+pub type LmidMap = Rc<RefCell<HashMap<String, u64>>>;
+
+/// If `ev` is an `orbit_client_mutations` Insert/Update, record its
+/// `client_id -> last_mutation_id` into `lmids`. Returns true if it advanced.
+pub fn capture_lmid(ev: &crate::LogicalEvent, lmids: &LmidMap) -> bool {
+    use crate::LogicalEvent;
+    use oql::value::Value;
+    let row = match ev {
+        LogicalEvent::Insert { table, row } if table == crate::pg::LMID_TABLE => row,
+        LogicalEvent::Update { table, row, .. } if table == crate::pg::LMID_TABLE => row,
+        _ => return false,
+    };
+    let cid = match row.get("client_id") {
+        Some(Value::String(s)) => s.clone(),
+        _ => return false,
+    };
+    let id = match row.get("last_mutation_id") {
+        Some(Value::Number(n)) => *n as u64,
+        _ => return false,
+    };
+    let mut map = lmids.borrow_mut();
+    let slot = map.entry(cid).or_insert(0);
+    if id > *slot {
+        *slot = id;
+        true
+    } else {
+        false
+    }
+}
 
 impl oql::SourceProvider for Replica {
     fn get_source(&self, table: &str) -> Option<Rc<RefCell<oql::ivm::MemorySource>>> {
@@ -125,7 +162,7 @@ where
                 if let Some(src) = replica.source(&table) {
                     source_push(&src, change);
                 }
-                flush_active(&active, &mut tx, &mut version, &mut base_cookie, &mut row_refs, &mut std::collections::HashMap::new()).await?;
+                flush_active(&active, &mut tx, &mut version, &mut base_cookie, &mut row_refs, HashMap::new()).await?;
             }
         }
     }
@@ -183,11 +220,11 @@ where
                 let e = lmids.entry(m.client_id().to_string()).or_insert(0);
                 *e = (*e).max(m.id());
             }
-            // Acknowledge processed mutations, then send the resulting rows.
-            if !lmids.is_empty() {
-                poke(tx, version, base_cookie, None, Some(lmids), vec![]).await?;
-            }
-            flush_active(active, tx, version, base_cookie, row_refs, &mut std::collections::HashMap::new()).await?;
+            // Ack the mutations together with the rows they just produced (one
+            // atomic poke) — the writes above are applied synchronously here, so
+            // the rows are already in the replica. Acking separately would drop
+            // the client's optimistic overlay a beat before its row lands.
+            flush_active(active, tx, version, base_cookie, row_refs, lmids).await?;
             return Ok(());
         }
         Upstream::InitConnection(b) => b.desired_queries_patch,
@@ -198,15 +235,17 @@ where
     subscribe(patch, replica, queries, forwarder, auth, tx, active, version, base_cookie, row_refs, None).await
 }
 
-/// Advance every active query and poke any resulting row patches, riding any
-/// deferred `lastMutationID` acks along with them.
+/// Advance every active query and poke any resulting row patches, riding the
+/// given `lastMutationID` acks along with them (one atomic poke). Acking with the
+/// rows a mutation produced is what keeps the client's optimistic overlay from
+/// being dropped before its authoritative row is present.
 async fn flush_active<S>(
     active: &[ActiveQuery],
     tx: &mut SplitSink<WebSocketStream<S>, Message>,
     version: &mut u64,
     base_cookie: &mut Option<String>,
     row_refs: &mut RowRefs,
-    pending_lmids: &mut std::collections::HashMap<String, u64>,
+    lmids: HashMap<String, u64>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -219,13 +258,24 @@ where
         }
         patches.extend(changes_to_patches_dedup(&changes, &q.schema, row_refs));
     }
-    // Acknowledge mutations together with the rows they produced (one atomic poke),
-    // so the client drops its optimistic overlay only once the authoritative row is
-    // present — otherwise the early ack reverts the row until replication catches up.
-    if !patches.is_empty() || !pending_lmids.is_empty() {
-        let lmids = if pending_lmids.is_empty() { None } else { Some(std::mem::take(pending_lmids)) };
+    if !patches.is_empty() || !lmids.is_empty() {
+        let lmids = if lmids.is_empty() { None } else { Some(lmids) };
         poke(tx, version, base_cookie, None, lmids, patches).await?;
     }
+    Ok(())
+}
+
+/// Advance a client's `lastMutationID` in `orbit_client_mutations` (the same table
+/// the app's PushProcessor writes), so it replicates back and the client's ack rides
+/// with its rows. Used by the direct-write path (no app push endpoint configured).
+async fn advance_lmid(pg: &tokio_postgres::Client, client_id: &str, id: u64) -> anyhow::Result<()> {
+    let t = crate::pg::LMID_TABLE;
+    let sql = format!(
+        "INSERT INTO {t} (client_id, last_mutation_id) VALUES ($1, $2) \
+         ON CONFLICT (client_id) DO UPDATE SET last_mutation_id = EXCLUDED.last_mutation_id \
+         WHERE {t}.last_mutation_id < EXCLUDED.last_mutation_id",
+    );
+    pg.execute(&sql, &[&client_id, &(id as i64)]).await?;
     Ok(())
 }
 
@@ -334,6 +384,9 @@ pub async fn serve_client<S, P>(
     // to prove it's safe to resume as a delta. `None` (or a mismatch) → full resync.
     client_base_cookie: Option<u64>,
     mut ticks: tokio::sync::broadcast::Receiver<()>,
+    // Per-client lastMutationIDs, advanced by the replication apply loop from
+    // replicated `orbit_client_mutations` rows (see [`capture_lmid`]).
+    lmids: &LmidMap,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -365,9 +418,11 @@ where
         resume_prior = Some(if fast { view } else { ClientView::new() });
     }
     let mut last_ckpt = std::time::Instant::now();
-    // Deferred lastMutationID acks — sent with the rows they produced (flush_active),
-    // so the client's optimistic overlay isn't dropped before its row arrives.
-    let mut pending_lmids: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // Highest lastMutationID already acked to THIS client. On each tick we ack up
+    // to the client's current id in `lmids` (advanced by replication from the same
+    // commit as the rows), so the ack rides atomically with the rows — and a tick
+    // caused by ANOTHER client's write never carries this client's ack.
+    let mut last_sent_lmid: u64 = 0;
 
     // Queries supplied during the handshake (Zero client `initConnection`).
     if !initial_queries.is_empty() {
@@ -388,21 +443,21 @@ where
                         match up {
                             Upstream::Ping => send(&mut tx, &Downstream::Pong).await?,
                             Upstream::Push(push) => {
-                                // Defer the lastMutationID ack: record it, but only send it once the
-                                // mutation's rows return via replication (in flush_active). Acking now
-                                // would drop the client's optimistic overlay ~30ms before its
-                                // authoritative row arrives — the revert flicker.
-                                for m in &push.mutations {
-                                    let e = pending_lmids.entry(m.client_id().to_string()).or_insert(0);
-                                    *e = (*e).max(m.id());
-                                }
+                                // The lastMutationID is NOT acked here. It's advanced by the app's
+                                // PushProcessor (or the direct-write path below) in `orbit_client_mutations`
+                                // — in the same Postgres transaction as the data — and returns via
+                                // replication, so flush_active can ack it atomically with the rows it
+                                // produced. Acking on receipt would drop the client's optimistic overlay
+                                // a round-trip before its authoritative row arrives (the revert flicker).
                                 if forwarder.forwards_mutations() {
                                     // Forward to the app's push endpoint (auth attached). It runs
                                     // the mutators with context and writes to Postgres; the change
                                     // returns via replication.
                                     forwarder.push(auth, &push.mutations).await?;
                                 } else if let Some(pg) = pg {
-                                    // No endpoint configured: write through to Postgres directly.
+                                    // No endpoint configured: write through to Postgres directly, then
+                                    // advance the client's lastMutationID (after the rows, so its ack
+                                    // never replicates ahead of them).
                                     for m in &push.mutations {
                                         match m {
                                             orbit_protocol::Mutation::Crud { .. } => {
@@ -416,10 +471,9 @@ where
                                                 }
                                             }
                                         }
+                                        advance_lmid(pg, m.client_id(), m.id()).await?;
                                     }
                                 }
-                                // No immediate ack — flush_active acks these on the next replication
-                                // tick, atomically with the mutation's rows.
                             }
                             Upstream::InitConnection(b) => {
                                 let resume = resume_prior.take();
@@ -439,7 +493,22 @@ where
             tick = ticks.recv() => {
                 // Lagged or closed: still attempt a flush.
                 let _ = tick;
-                flush_active(&active, &mut tx, &mut version, &mut base_cookie, &mut row_refs, &mut pending_lmids).await?;
+                // Ack this client's mutations up to the id replication has confirmed
+                // (advanced from the same commit as this tick's rows). A tick from
+                // another client's write leaves our id unchanged → no ack for us.
+                let ack = match client_id.as_deref() {
+                    Some(cid) => {
+                        let cur = lmids.borrow().get(cid).copied().unwrap_or(0);
+                        if cur > last_sent_lmid {
+                            last_sent_lmid = cur;
+                            HashMap::from([(cid.to_string(), cur)])
+                        } else {
+                            HashMap::new()
+                        }
+                    }
+                    None => HashMap::new(),
+                };
+                flush_active(&active, &mut tx, &mut version, &mut base_cookie, &mut row_refs, ack).await?;
                 // Throttled CVR checkpoint (off the per-mutation hot path) so a
                 // reconnect to another node resumes from a recent view.
                 if cvr_on && last_ckpt.elapsed() >= std::time::Duration::from_secs(1) {

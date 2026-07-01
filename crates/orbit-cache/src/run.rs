@@ -261,9 +261,12 @@ async fn run_inner<B: ReplicaBackend + 'static>(
     let (ticks_tx, _) = broadcast::channel::<()>(1024);
 
     // Replication pump: apply each change once, then notify all clients.
+    // Per-client lastMutationIDs, advanced from replicated `orbit_client_mutations`.
+    let lmids: crate::server::LmidMap = Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
     {
         let replica = replica.clone();
         let ticks_tx = ticks_tx.clone();
+        let lmids = lmids.clone();
         let (host, port, user, db) = (cfg.host.clone(), cfg.port, cfg.user.clone(), cfg.database.clone());
         let (slot, publication) = (cfg.slot.clone(), cfg.publication.clone());
         let (password, tls_mode) = (cfg.password.clone(), cfg.tls);
@@ -286,6 +289,7 @@ async fn run_inner<B: ReplicaBackend + 'static>(
                             LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
                         );
                         let is_commit = matches!(ev, LogicalEvent::Commit);
+                        crate::server::capture_lmid(&ev, &lmids);
                         replica.apply(ev);
                         if is_data {
                             dirty = true;
@@ -307,11 +311,12 @@ async fn run_inner<B: ReplicaBackend + 'static>(
     // Accept loop.
     let listener = TcpListener::bind(&cfg.listen_addr).await?;
     eprintln!("orbit-server listening on {}", cfg.listen_addr);
-    accept_ws_clients(listener, replica, pg, mutators, queries, forwarder, ticks_tx).await
+    accept_ws_clients(listener, replica, pg, mutators, queries, forwarder, ticks_tx, lmids).await
 }
 
 /// Accept WebSocket clients and serve each over the shared `replica`, flushing on
 /// `ticks`. Shared by the single-process server and the view-syncer.
+#[allow(clippy::too_many_arguments)]
 async fn accept_ws_clients<B: ReplicaBackend + 'static>(
     listener: TcpListener,
     replica: Rc<B>,
@@ -320,6 +325,7 @@ async fn accept_ws_clients<B: ReplicaBackend + 'static>(
     queries: Rc<QueryRegistry>,
     forwarder: Rc<crate::forward::Forwarder>,
     ticks_tx: broadcast::Sender<()>,
+    lmids: crate::server::LmidMap,
 ) -> Result<()> {
     loop {
         let (sock, _) = listener.accept().await?;
@@ -329,6 +335,7 @@ async fn accept_ws_clients<B: ReplicaBackend + 'static>(
         let queries = queries.clone();
         let forwarder = forwarder.clone();
         let ticks = ticks_tx.subscribe();
+        let lmids = lmids.clone();
         spawn_local(async move {
             match crate::handshake::accept_zero_ws(sock).await {
                 Ok((ws, info)) => {
@@ -345,6 +352,7 @@ async fn accept_ws_clients<B: ReplicaBackend + 'static>(
                         info.client_id,
                         info.base_cookie,
                         ticks,
+                        &lmids,
                     )
                     .await
                     {
@@ -623,11 +631,15 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
     let queries = Rc::new(queries);
     let forwarder = Rc::new(crate::forward::Forwarder::new(cfg.forward_config()));
     let (ticks_tx, _) = broadcast::channel::<()>(1024);
+    // Per-client lastMutationIDs, advanced from replicated `orbit_client_mutations`
+    // events forwarded through the change-stream.
+    let lmids: crate::server::LmidMap = Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
 
     // Change-stream pump: apply remote changes to the local replica + tick.
     {
         let replica = replica.clone();
         let ticks_tx = ticks_tx.clone();
+        let lmids = lmids.clone();
         let addr = change_stream_addr.clone();
         spawn_local(async move {
             let mut watermark = watermark;
@@ -649,6 +661,7 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
                                 LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
                             );
                             let is_commit = matches!(event, LogicalEvent::Commit);
+                            crate::server::capture_lmid(&event, &lmids);
                             replica.apply(event);
                             watermark = pos;
                             if is_data {
@@ -683,5 +696,5 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
 
     let listener = TcpListener::bind(&cfg.listen_addr).await?;
     eprintln!("view-syncer listening on {}", cfg.listen_addr);
-    accept_ws_clients(listener, replica, pg, mutators, queries, forwarder, ticks_tx).await
+    accept_ws_clients(listener, replica, pg, mutators, queries, forwarder, ticks_tx, lmids).await
 }

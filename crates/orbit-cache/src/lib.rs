@@ -46,6 +46,6 @@ pub use run::{
     run_server_with, run_view_syncer, ServerConfig, TableConfig,
 };
 pub use sqlite_source::{SqliteProvider, SqliteReplica, SqliteSource};
-pub use server::{serve_client, serve_connection, serve_connection_with_mutators};
+pub use server::{serve_client, serve_connection, serve_connection_with_mutators, LmidMap};
 pub use sharded::{ShardTable, ShardedServer};
 pub use view_sync::{changes_to_patches, initial_patches};
