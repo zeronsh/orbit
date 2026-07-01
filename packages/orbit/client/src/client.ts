@@ -219,6 +219,8 @@ export class Orbit<
   #onError?: (e: { kind: string; message: string }) => void;
   /** Whether the id was supplied explicitly (then we never override it from the KV). */
   #idFromOpts: boolean;
+  /** Releases the Web-Locks persistence leadership (held by the first tab). */
+  #releasePersistLock?: () => void;
 
   constructor(
     opts: OrbitOptions<S> & { mutators?: MD; queries?: QD; context?: CtxInput<ResolveCtx<MD, QD>> },
@@ -368,6 +370,7 @@ export class Orbit<
   close(): void {
     this.#closed = true;
     this.#ws?.close();
+    this.#releasePersistLock?.();
   }
 
   // --- internals ----------------------------------------------------------
@@ -378,8 +381,54 @@ export class Orbit<
     return typeof c === 'function' ? (c as () => unknown)() : (c ?? {});
   }
 
+  /**
+   * Web-Locks single-writer election for the persisted cache. Two tabs sharing one
+   * IndexedDB (and the restored clientID) would each flush their own dirty rows,
+   * pending mutations, and cookie into the same flat keyspace with no coordination —
+   * last-writer-wins can persist a cookie covering rows only the *other* tab wrote,
+   * and both tabs would drive the same server-side CVR. Only the first tab (the
+   * lock holder) gets persistence; later tabs run memory-only with their own fresh
+   * clientID (a full server sync — correct, just uncached). The lock auto-releases
+   * when the tab dies, so the next reload elects a new leader. Environments without
+   * Web Locks (Node, tests, old browsers) keep today's behavior.
+   */
+  async #acquirePersistLock(): Promise<boolean> {
+    const locks = (
+      globalThis as {
+        navigator?: {
+          locks?: {
+            request(
+              name: string,
+              opts: { ifAvailable: boolean },
+              cb: (lock: unknown) => unknown,
+            ): Promise<unknown>;
+          };
+        };
+      }
+    ).navigator?.locks;
+    if (!locks) return true;
+    return new Promise((resolve) => {
+      const req = locks.request('zeronsh-orbit-persist', { ifAvailable: true }, (lock) => {
+        if (lock === null) {
+          resolve(false); // another tab holds the cache
+          return;
+        }
+        resolve(true);
+        // Hold the lock until close() (or tab death, which releases it implicitly).
+        return new Promise<void>((release) => {
+          this.#releasePersistLock = release;
+        });
+      });
+      // A LockManager error (e.g. permissions) must not block startup.
+      void Promise.resolve(req).catch(() => resolve(true));
+    });
+  }
+
   /** Hydrate persisted state (if any), restore unconfirmed mutations, then connect. */
   async #init(): Promise<void> {
+    if (this.#kv && !(await this.#acquirePersistLock())) {
+      this.#kv = undefined; // follower tab: memory-only, fresh identity
+    }
     if (this.#kv) {
       try {
         await this.#store.hydrate(this.#kv);
@@ -438,10 +487,22 @@ export class Orbit<
       requestID: Math.random().toString(36).slice(2),
     }];
     this.#unconfirmedPushes.set(id, msg);
-    // Persist the high-water mark so ids keep climbing across reloads (the store
-    // already persists the pending mutation itself).
-    void this.#kv?.set('nextMutationID', this.#nextMutationID);
-    this.#send(msg);
+    // Persist the id high-water mark and send only once it's DURABLE. The server
+    // records the id on receipt — if the send won the race and the tab died before
+    // this write committed, a reload would reuse the id for a *different* mutation,
+    // which the server silently drops as already-processed (divergence). KV writes
+    // to one key commit in issue order, so rapid mutations still send in order.
+    // (The store persists the pending mutation itself, debounced; that pairing is
+    // safe either way: if `p/id` is lost too, the mutation is retried wholesale.)
+    const kv = this.#kv;
+    if (kv) {
+      void kv
+        .set('nextMutationID', this.#nextMutationID)
+        .catch(() => {}) // a persistence failure must not block mutating
+        .then(() => this.#send(msg));
+    } else {
+      this.#send(msg);
+    }
   }
 
   async #connect(): Promise<void> {
