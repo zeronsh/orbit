@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createBuilder, createSchema, table, string, number, boolean } from '../src/index.ts';
-import { evaluate } from '../src/eval.ts';
+import { evaluate, compareValues } from '../src/eval.ts';
 import type { AST, Row } from '../src/protocol.ts';
 
 const schema = createSchema({
@@ -147,4 +147,34 @@ test('range-window filter works on fractional (cursor) coords too', () => {
   const q = cb.cursor.where('x', '>=', 0).where('x', '<', 32).where('y', '>=', 0).where('y', '<', 32);
   const r = evaluate(store({ cursor: rows }), q.ast()).map((x) => x.id).sort();
   assert.deepEqual(r, ['a', 'b']);
+});
+
+// --- Client string ordering must match the server's UTF-8 (code-point) order ---
+// The Rust server compares strings via compare_utf8 (byte order == code-point
+// order). JS `<` compares UTF-16 code units, which mis-orders non-BMP characters.
+// compareValues must use code-point order so orderBy/range filters agree.
+test('compareValues orders non-BMP strings by code point (matches server UTF-8)', () => {
+  const emoji = '\u{1F600}'; // U+1F600, a supplementary char (surrogate pair in UTF-16)
+  const bmpMax = '￿'; // highest BMP code unit
+  // Code point 0x1F600 > 0xFFFF, so emoji sorts AFTER bmpMax (as UTF-8 bytes do).
+  // JS `<` would (wrongly) put emoji first because its lead surrogate 0xD83D < 0xFFFF.
+  assert.ok(compareValues(emoji, bmpMax) > 0, 'emoji sorts after U+FFFF by code point');
+  assert.ok(compareValues(bmpMax, emoji) < 0, 'symmetric');
+  assert.equal(compareValues(emoji, emoji), 0);
+
+  // A full sort should land supplementary chars last, matching the server.
+  const xs = ['￿', 'a', '\u{1F600}', 'Z'];
+  const sorted = [...xs].sort(compareValues);
+  assert.deepEqual(sorted, ['Z', 'a', '￿', '\u{1F600}']);
+});
+
+test('orderBy on a non-BMP string column matches code-point order', () => {
+  const rows: Row[] = [
+    { id: 'x', s: '\u{1F600}' },
+    { id: 'y', s: '￿' },
+    { id: 'z', s: 'm' },
+  ];
+  const ast: AST = { table: 't', orderBy: [['s', 'asc'], ['id', 'asc']] };
+  const out = evaluate((t) => (t === 't' ? rows : []), ast);
+  assert.deepEqual(out.map((r) => r.id), ['z', 'y', 'x']);
 });

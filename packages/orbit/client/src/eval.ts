@@ -29,6 +29,37 @@ function typeRank(v: Value): number {
   }
 }
 
+/**
+ * Compare two strings by Unicode **code point**, matching the Rust server's
+ * `compare_utf8` (`a.as_bytes().cmp(b.as_bytes())`) and SQLite/Postgres ordering.
+ *
+ * JS `<`/`>` on strings compares UTF-16 **code units**, which mis-orders non-BMP
+ * characters: a supplementary character (e.g. an emoji, U+10000+) is stored as a
+ * surrogate pair (0xD800–0xDFFF) that sorts *below* BMP characters in U+E000–
+ * U+FFFF. So the client (JS) and server (UTF-8) would disagree on `ORDER BY` and
+ * range filters (`<`,`<=`,`>`,`>=`) for such strings, showing a different row
+ * order / boundary membership until the next poke reconciles. Iterating code
+ * points fixes it — and because UTF-8 preserves code-point order, this equals a
+ * byte comparison. (Mirrors Zero's `compareUTF8`, PR #6088.)
+ */
+function compareStringsUtf8(a: string, b: string): number {
+  if (a === b) return 0;
+  const ia = a[Symbol.iterator]();
+  const ib = b[Symbol.iterator]();
+  for (;;) {
+    const na = ia.next();
+    const nb = ib.next();
+    if (na.done) return nb.done ? 0 : -1;
+    if (nb.done) return 1;
+    if (na.value !== nb.value) {
+      // Code points, not code units — `codePointAt(0)` reads the full point.
+      const ca = na.value.codePointAt(0)!;
+      const cb = nb.value.codePointAt(0)!;
+      if (ca !== cb) return ca < cb ? -1 : 1;
+    }
+  }
+}
+
 /** Total order with `null == null` (sorting semantics; mirrors `compare_values`). */
 export function compareValues(a: Value, b: Value): number {
   if (isNull(a) && isNull(b)) return 0;
@@ -37,7 +68,7 @@ export function compareValues(a: Value, b: Value): number {
   if (typeof a === typeof b) {
     if (typeof a === 'number') return a < (b as number) ? -1 : a > (b as number) ? 1 : 0;
     if (typeof a === 'boolean') return a === b ? 0 : a ? 1 : -1;
-    if (typeof a === 'string') return a < (b as string) ? -1 : a > (b as string) ? 1 : 0;
+    if (typeof a === 'string') return compareStringsUtf8(a, b as string);
     return 0;
   }
   return typeRank(a) - typeRank(b);

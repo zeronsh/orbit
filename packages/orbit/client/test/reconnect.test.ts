@@ -33,6 +33,10 @@ class MockWS {
     this.readyState = 3;
     this.#emit('close', {});
   }
+  closeWith(code: number) {
+    this.readyState = 3;
+    this.#emit('close', { code });
+  }
   open() {
     this.readyState = MockWS.OPEN;
     this.#emit('open', {});
@@ -238,6 +242,50 @@ test('a terminal server `error` is surfaced to onError (not silently dropped)', 
     assert.deepEqual(errors, [{ kind: 'Unauthorized', message: 'bad token' }]);
     orbit.close();
   } finally {
+    (globalThis as { WebSocket?: unknown }).WebSocket = prevWS;
+  }
+});
+
+test('an oversized (poison) mutation is dropped on WS 1009, not looped forever', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const prevWS = (globalThis as { WebSocket?: unknown }).WebSocket;
+  (globalThis as { WebSocket?: unknown }).WebSocket = MockWS as unknown;
+  MockWS.instances.length = 0;
+  const errors: { kind: string; message: string }[] = [];
+  try {
+    const orbit = new Orbit({
+      server: 'ws://x',
+      schema,
+      clientID: 'c1',
+      maxReconnectMs: 1000,
+      onError: (e) => errors.push(e),
+    });
+    await Promise.resolve();
+    const ws1 = MockWS.instances[0]!;
+    ws1.open();
+
+    // A small mutation (id 1) and an oversized "poison" mutation (id 2).
+    orbit.mutate.todo.insert({ id: 't1', text: 'hi', done: false });
+    orbit.mutate.todo.insert({ id: 't2', text: 'x'.repeat(5000), done: false });
+
+    // The server rejects the oversized frame by closing with WS code 1009.
+    ws1.closeWith(1009);
+    mock.timers.tick(1000);
+    await Promise.resolve();
+
+    const ws2 = MockWS.instances[1]!;
+    assert.ok(ws2, 'reconnected');
+    ws2.open();
+
+    // Only the small mutation is resent; the poison one was dropped (loop broken).
+    const pushIds = parsed(ws2)
+      .filter((m) => m[0] === 'push')
+      .flatMap((p) => (p[1].mutations as { id: number }[]).map((m) => m.id));
+    assert.deepEqual(pushIds, [1], 'only mutation 1 resent; oversized mutation 2 dropped');
+    assert.equal(errors.length, 1, 'onError fired once');
+    assert.equal(errors[0]!.kind, 'mutation-too-large');
+  } finally {
+    mock.timers.reset();
     (globalThis as { WebSocket?: unknown }).WebSocket = prevWS;
   }
 });

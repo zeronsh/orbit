@@ -16,6 +16,13 @@ pub struct ReplicationStream {
     decoder: Decoder,
     /// Highest WAL position seen; reported back in Standby Status Updates.
     last_lsn: u64,
+    /// Max time to wait for ANY inbound frame (data OR keepalive) before treating
+    /// the stream as dead. A healthy Postgres sends keepalives at least every
+    /// `wal_sender_timeout/2` (default 30s), so a stall well beyond that means a
+    /// half-open connection — where our acks flow into the void and `read` would
+    /// otherwise block forever. Erroring out lets the caller reconnect + resume
+    /// from `last_lsn`. (Mirrors Zero's `lastReceivedTime` liveness check, #6047.)
+    idle_timeout: std::time::Duration,
 }
 
 impl ReplicationStream {
@@ -55,6 +62,7 @@ impl ReplicationStream {
             conn,
             decoder: Decoder::new(),
             last_lsn: start_lsn,
+            idle_timeout: std::time::Duration::from_secs(180),
         })
     }
 
@@ -71,7 +79,17 @@ impl ReplicationStream {
     /// handles keepalives and skips ignored messages.
     pub async fn next_event(&mut self) -> Result<(u64, LogicalEvent)> {
         loop {
-            let msg = self.conn.read_message().await?;
+            // Bound the wait on inbound frames: a healthy stream sends data or a
+            // keepalive well within `idle_timeout`, so exceeding it means a dead /
+            // half-open connection. Error out so the caller reconnects from `last_lsn`
+            // rather than blocking here forever.
+            let msg = match tokio::time::timeout(self.idle_timeout, self.conn.read_message()).await {
+                Ok(res) => res?,
+                Err(_) => bail!(
+                    "replication stream idle for {:?} (no data or keepalive); treating as dead",
+                    self.idle_timeout
+                ),
+            };
             match msg.tag {
                 b'd' => {
                     // CopyData. First byte selects the sub-message.

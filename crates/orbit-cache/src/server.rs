@@ -265,6 +265,18 @@ where
     Ok(())
 }
 
+/// A client's currently-recorded `lastMutationID` (0 if none), for deduplicating
+/// re-delivered mutations on the direct-write path.
+async fn current_lmid(pg: &tokio_postgres::Client, client_id: &str) -> anyhow::Result<u64> {
+    let t = crate::pg::LMID_TABLE;
+    let sql = format!("SELECT last_mutation_id FROM {t} WHERE client_id = $1");
+    Ok(pg
+        .query_opt(&sql, &[&client_id])
+        .await?
+        .map(|r| r.get::<_, i64>(0) as u64)
+        .unwrap_or(0))
+}
+
 /// Advance a client's `lastMutationID` in `orbit_client_mutations` (the same table
 /// the app's PushProcessor writes), so it replicates back and the client's ack rides
 /// with its rows. Used by the direct-write path (no app push endpoint configured).
@@ -458,7 +470,19 @@ where
                                     // No endpoint configured: write through to Postgres directly, then
                                     // advance the client's lastMutationID (after the rows, so its ack
                                     // never replicates ahead of them).
+                                    //
+                                    // NOTE: the per-mutation ops and `advance_lmid` are separate
+                                    // statements (not one transaction) because every connection shares
+                                    // one pooled `pg` client, so an explicit BEGIN/COMMIT would capture
+                                    // other tasks' pipelined queries; full atomicity here needs a
+                                    // dedicated connection. Dedup, however, we can and must do: a
+                                    // reconnect resends unconfirmed pushes, so skip any mutation whose id
+                                    // is already recorded (its ops were already applied) — otherwise the
+                                    // replay double-applies non-idempotent ops.
                                     for m in &push.mutations {
+                                        if m.id() <= current_lmid(pg, m.client_id()).await? {
+                                            continue; // already processed (re-delivered on reconnect)
+                                        }
                                         match m {
                                             orbit_protocol::Mutation::Crud { .. } => {
                                                 crate::mutagen::apply_mutation(pg, m).await?;

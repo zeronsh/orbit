@@ -475,10 +475,34 @@ export class Orbit<
     ws.addEventListener('message', (ev: MessageEvent) => {
       this.#onMessage(JSON.parse(ev.data as string) as Downstream);
     });
-    ws.addEventListener('close', () => {
+    ws.addEventListener('close', (ev: CloseEvent) => {
       this.#connecting = false;
       if (this.#ws === ws) this.#ws = undefined;
       this.#poke = null; // discard any partially-received poke (no torn state)
+      // WS 1009 (Message Too Big): a frame we sent exceeded the server's limit — an
+      // oversized mutation the server can never accept. It's persisted and re-sent on
+      // every reconnect, so it would loop forever and block the whole mutation queue.
+      // Drop the offending (largest pending) mutation and surface an error instead of
+      // storming. Mirrors Zero's poison-mutation handling (#5982).
+      if (ev.code === 1009 && this.#unconfirmedPushes.size > 0) {
+        let poisonId: number | undefined;
+        let maxSize = -1;
+        for (const [id, msg] of this.#unconfirmedPushes) {
+          const size = JSON.stringify(msg).length;
+          if (size > maxSize) {
+            maxSize = size;
+            poisonId = id;
+          }
+        }
+        if (poisonId !== undefined) {
+          this.#unconfirmedPushes.delete(poisonId);
+          this.#store.dropPending(poisonId);
+          this.#onError?.({
+            kind: 'mutation-too-large',
+            message: `dropped mutation ${poisonId} (~${maxSize} bytes): server closed with code 1009 (message too big)`,
+          });
+        }
+      }
       this.#scheduleReconnect();
     });
     ws.addEventListener('error', () => ws.close());
