@@ -419,9 +419,9 @@ export class Orbit<
         if (typeof savedNextID === 'number' && savedNextID > this.#nextMutationID) {
           this.#nextMutationID = savedNextID;
         }
-        // Restore the last applied cookie so a reload resumes as a delta.
-        const c = await this.#kv.get('cookie');
-        if (typeof c === 'string') this.#cookie = c;
+        // Restore the last applied cookie (persisted by the store, after its rows, so
+        // it's never ahead of them) so a reload resumes as a delta safely.
+        this.#cookie = this.#store.cookie();
       } catch {
         /* a persistence failure must not block connecting */
       }
@@ -539,8 +539,11 @@ export class Orbit<
           }
           this.#store.confirmThrough(confirmed);
         }
-        this.#cookie = body.cookie;
-        void this.#kv?.set('cookie', body.cookie);
+        this.#cookie = body.cookie; // in-memory: the live reconnect baseCookie this session
+        // Persist the cookie through the store so it lands AFTER the rows it covers
+        // (never ahead of them) — otherwise a reload resumes with a cookie that makes
+        // the server suppress rows this client never durably stored.
+        this.#store.setCookie(body.cookie);
         this.#reconnectMs = 500; // a completed poke proves the connection is healthy
         return;
       }
