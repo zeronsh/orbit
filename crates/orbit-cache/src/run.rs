@@ -181,8 +181,15 @@ async fn run_sharded_inner(cfg: ServerConfig, num_shards: usize) -> Result<()> {
                 match stream.next_event().await {
                     Ok((_lsn, ev)) => server.broadcast_event(ev),
                     Err(e) => {
-                        eprintln!("replication error: {e}");
-                        break;
+                        // Crash-only (same policy as the view-syncer's Reset): an
+                        // in-process reconnect could double-apply re-delivered WAL
+                        // into the in-memory replica, and merely breaking the loop
+                        // would leave the server serving silently-stale data forever.
+                        // Exiting lets the orchestrator restart us; the fresh
+                        // initial sync guarantees convergence.
+                        eprintln!("replication error: {e:#}; exiting to re-sync (restart me)");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        std::process::exit(1);
                     }
                 }
             }
@@ -300,8 +307,13 @@ async fn run_inner<B: ReplicaBackend + 'static>(
                         }
                     }
                     Err(e) => {
-                        eprintln!("replication error: {e}");
-                        break;
+                        // Crash-only (same policy as the view-syncer's Reset): see
+                        // run_sharded_inner — reconnecting in-process risks
+                        // double-applying re-delivered WAL, and breaking the loop
+                        // would serve silently-stale data forever.
+                        eprintln!("replication error: {e:#}; exiting to re-sync (restart me)");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        std::process::exit(1);
                     }
                 }
             }

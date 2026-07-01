@@ -92,3 +92,68 @@ test('after a full flush the cookie and its rows survive a reload together', asy
     ['a', 'b'],
   );
 });
+
+// --- Atomic batched flush (KV with `batch`) ---
+// With a batch-capable KV the whole flush (rows + pending + cookie) commits as ONE
+// atomic unit: the cookie can never be ahead of the rows at any crash point, the
+// row set can't tear mid-flush, and a large poke costs one IndexedDB transaction
+// instead of one per key.
+class BatchRecordingKV extends MemoryKV {
+  batches: import('../src/persist.ts').BatchOp[][] = [];
+  singleSets: string[] = [];
+  override set(key: string, value: unknown): Promise<void> {
+    this.singleSets.push(key);
+    return super.set(key, value);
+  }
+  override async batch(ops: import('../src/persist.ts').BatchOp[]): Promise<void> {
+    this.batches.push(ops);
+    return super.batch(ops);
+  }
+}
+
+test('flush commits rows + cookie as ONE atomic batch (no per-key transactions)', async () => {
+  const kv = new BatchRecordingKV();
+  const store = new Store({ todo: ['id'] });
+  await store.hydrate(kv);
+
+  store.applyAll([put('a'), put('b'), put('c')]);
+  store.setCookie('00000009');
+  await store.flush();
+
+  assert.equal(kv.batches.length, 1, 'exactly one batch for the whole flush');
+  const ops = kv.batches[0]!;
+  const rowKeys = ops.filter((o) => o.key.startsWith('e/')).map((o) => o.key);
+  assert.equal(rowKeys.length, 3, 'all three rows in the batch');
+  const cookieIdx = ops.findIndex((o) => o.key === 'cookie');
+  assert.ok(cookieIdx === ops.length - 1, 'cookie is the final op of the atomic batch');
+  assert.equal(kv.singleSets.filter((k) => k.startsWith('e/') || k === 'cookie').length, 0,
+    'no per-key writes on the batch path');
+
+  // And it round-trips: a reload sees the rows AND the cookie together.
+  const b = new Store({ todo: ['id'] });
+  await b.hydrate(kv);
+  assert.equal(b.cookie(), '00000009');
+  assert.deepEqual(b.effectiveRows('todo').map((r) => r.id).sort(), ['a', 'b', 'c']);
+});
+
+test('a resync clear + rewrite is atomic on the batch path (no phantom, no loss)', async () => {
+  const kv = new BatchRecordingKV();
+  const a = new Store({ todo: ['id'] });
+  await a.hydrate(kv);
+  a.applyAll([put('old'), put('keep')]);
+  a.setCookie('00000001');
+  await a.flush();
+
+  // Full resync: Clear, then only `keep` + `new` survive at a later cookie.
+  kv.batches.length = 0;
+  a.applyAll([{ op: 'clear' }, put('keep'), put('new')]);
+  a.setCookie('00000002');
+  await a.flush();
+  assert.equal(kv.batches.length, 1, 'clear-dels + rewrites + cookie in one atomic batch');
+
+  const b = new Store({ todo: ['id'] });
+  await b.hydrate(kv);
+  assert.deepEqual(b.effectiveRows('todo').map((r) => r.id).sort(), ['keep', 'new'],
+    'dropped row gone (no phantom), survivor + new row present (no loss)');
+  assert.equal(b.cookie(), '00000002');
+});

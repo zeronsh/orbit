@@ -146,13 +146,19 @@ test('persist: clientID + mutation-id survive a reload (fast resume, ids keep cl
     const id = a.clientID;
     assert.equal(await kv.get('nextMutationID'), 3, 'sent ids 1,2 → next is 3');
 
-    // Simulate a reload: a brand-new client over the SAME persisted KV.
+    // Simulate a reload: the old tab dies (releasing its Web-Locks persistence
+    // leadership — a real unload does this implicitly), then a brand-new client
+    // starts over the SAME persisted KV.
+    a.close();
+    await settle();
     const b = make();
     await settle();
     assert.equal(b.clientID, id, 'clientID restored → resumes the same server CVR');
     b.mutate.todo.insert({ id: 't3', text: 'c', done: false });
     await settle();
     assert.equal(await kv.get('nextMutationID'), 4, 'mutation ids continue past reload (not reset to 1)');
+    b.close(); // release the persistence lock for later tests
+    await settle();
   } finally {
     (globalThis as { WebSocket?: unknown }).WebSocket = prevWS;
   }
@@ -167,6 +173,87 @@ test('persist: an explicit clientID is never overridden by the KV', async () => 
     const a = new Orbit({ server: 'ws://x', schema, persist: kv, clientID: 'explicit', maxReconnectMs: 0 });
     await settle();
     assert.equal(a.clientID, 'explicit');
+    a.close();
+    await settle();
+  } finally {
+    (globalThis as { WebSocket?: unknown }).WebSocket = prevWS;
+  }
+});
+
+// Node ≥ 24 ships real Web Locks (navigator.locks), so this exercises the actual
+// leader-election path, not a mock.
+test('persist: a second tab (same KV) becomes a memory-only follower — no shared-cache writes', async () => {
+  const prevWS = (globalThis as { WebSocket?: unknown }).WebSocket;
+  (globalThis as { WebSocket?: unknown }).WebSocket = undefined;
+  const kv = new MemoryKV();
+  const make = () => new Orbit({ server: 'ws://x', schema, persist: kv, maxReconnectMs: 0 });
+  try {
+    const leader = make();
+    await settle();
+    const leaderID = leader.clientID;
+    assert.equal(await kv.get('clientID'), leaderID, 'leader persisted its identity');
+
+    // "Second tab": same KV while the leader is still alive → follower.
+    const follower = make();
+    await settle();
+    assert.notEqual(follower.clientID, leaderID, 'follower gets its own fresh clientID');
+    assert.equal(await kv.get('clientID'), leaderID, 'follower must not overwrite the shared identity');
+
+    // Follower mutations stay in memory: no pending entries or id marks in the KV
+    // beyond what the leader wrote (nextMutationID would be from the leader only).
+    follower.mutate.todo.insert({ id: 'f1', text: 'x', done: false });
+    await settle();
+    assert.equal(await kv.get('nextMutationID'), undefined, 'follower writes nothing to the shared KV');
+    assert.deepEqual(await kv.entries('p/'), [], 'follower pending mutations are not persisted');
+
+    // Leader death (tab closed) releases the lock; the NEXT instance leads again.
+    leader.close();
+    follower.close();
+    await settle();
+    const c = make();
+    await settle();
+    assert.equal(c.clientID, leaderID, 'a new instance after leader death restores the identity');
+    c.close();
+    await settle();
+  } finally {
+    (globalThis as { WebSocket?: unknown }).WebSocket = prevWS;
+  }
+});
+
+test('a mutation push is sent only after the id high-water mark is durable', async () => {
+  const prevWS = (globalThis as { WebSocket?: unknown }).WebSocket;
+  (globalThis as { WebSocket?: unknown }).WebSocket = MockWS as unknown;
+  MockWS.instances.length = 0;
+  // A KV whose nextMutationID write is held until we release it.
+  let releaseSet: (() => void) | undefined;
+  class SlowKV extends MemoryKV {
+    override set(key: string, value: unknown): Promise<void> {
+      if (key === 'nextMutationID') {
+        return new Promise<void>((resolve) => {
+          releaseSet = () => {
+            void super.set(key, value).then(resolve);
+          };
+        });
+      }
+      return super.set(key, value);
+    }
+  }
+  const kv = new SlowKV();
+  try {
+    const orbit = new Orbit({ server: 'ws://x', schema, persist: kv, maxReconnectMs: 0 });
+    await settle();
+    const ws = MockWS.instances[0]!;
+    ws.open();
+
+    orbit.mutate.todo.insert({ id: 't1', text: 'hi', done: false });
+    await settle();
+    assert.ok(!tags(ws).includes('push'), 'push NOT sent while the id write is pending');
+
+    releaseSet!();
+    await settle();
+    assert.ok(tags(ws).includes('push'), 'push sent once the id high-water mark is durable');
+    orbit.close();
+    await settle();
   } finally {
     (globalThis as { WebSocket?: unknown }).WebSocket = prevWS;
   }
