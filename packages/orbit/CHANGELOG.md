@@ -1,5 +1,46 @@
 # @zeronsh/orbit
 
+## 0.3.3
+
+### Patch Changes
+
+- a191a00: Fix permanent, asymmetric sync divergence across reloads (two devices showing
+  different state, one device's writes never reaching the other even after refresh).
+
+  The client persisted its resume **cookie** immediately on every `pokeEnd`, but the
+  **rows** that cookie covers only flushed to IndexedDB on a 50 ms debounce. A reload
+  in that window (common while another user was actively drawing) restored a cookie
+  that was _ahead_ of the durable rows. On reconnect the client sent that cookie as
+  `baseCookie`; the server's delta-resume matched it exactly and suppressed the rows
+  the client had never actually stored — so those rows were lost forever, and only a
+  CVR reset could recover the device.
+
+  The cookie is now owned and persisted by the row store, written in `flush()`
+  **after** the row writes it covers (and loaded back in `hydrate()`). This enforces
+  Zero's invariant that the persisted cookie is never ahead of the persisted rows: a
+  crash/reload can only ever restore a cookie at or behind the durable rows, so the
+  server re-sends anything missing (idempotently) instead of suppressing it.
+
+- a191a00: Server: commit the per-client CVR (rows + version) atomically, and make schema
+  init concurrency-safe.
+
+  `commit_client_view` previously issued the row upserts, row deletes, and the
+  version write as three separate autocommit statements. A crash or a concurrent
+  checkpoint between them could leave `orbit_cvr_clients.version` inconsistent with
+  `orbit_cvr_client_rows` — the server-side mirror of the "cookie ahead of rows"
+  divergence: a reconnect reporting that version takes the fast delta path, which
+  trusts the stored rows to match. It is now a single CTE (one implicit, all-or-
+  nothing Postgres transaction), so the stored `(rows, version)` can never tear. An
+  explicit transaction is unusable here because all client connections share one
+  pooled `tokio_postgres::Client`; a single statement keeps atomicity without
+  capturing other tasks' pipelined queries.
+
+  `ensure_schema` now serializes its `CREATE TABLE IF NOT EXISTS` block behind a
+  database-wide advisory lock. `CREATE TABLE IF NOT EXISTS` is not concurrency-safe
+  (two nodes booting together against a fresh database race on `pg_type` and one
+  fails with a duplicate-key error); the lock lets exactly one connection create the
+  schema while the rest wait and then find it present.
+
 ## 0.3.2
 
 ### Patch Changes
