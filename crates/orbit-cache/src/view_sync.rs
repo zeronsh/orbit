@@ -14,6 +14,7 @@ use oql::ivm::{Change, Node, RowRef, Schema};
 use oql::value::{Row, Value};
 use orbit_protocol::{RowPatchOp, RowsPatch};
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 /// A row's identity in a persisted client view: `(table, json(primary-key))`.
 pub type RowKey = (String, String);
@@ -31,7 +32,10 @@ pub type ClientView = HashMap<RowKey, String>;
 /// or diffed on reconnect — both off the per-mutation path.
 #[derive(Default)]
 pub struct RowRefs {
-    rows: BTreeMap<(String, Vec<Value>), RowEntry>,
+    /// table → (pk values → entry). Nested (rather than a flat
+    /// `(String, Vec<Value>)` key) so the hot path looks the table up by `&str` —
+    /// no per-event table-name `String` clone.
+    tables: BTreeMap<String, BTreeMap<Vec<Value>, RowEntry>>,
     /// Primary-key column names per table, to rebuild named ids at checkpoint time.
     pks: HashMap<String, Vec<String>>,
 }
@@ -51,46 +55,55 @@ impl RowRefs {
         }
     }
     /// Increment a key's refcount, recording the current row; true if first (0 → 1).
-    fn incr(&mut self, key: (String, Vec<Value>), row: RowRef) -> bool {
-        match self.rows.get_mut(&key) {
+    fn incr(&mut self, table: &str, vals: Vec<Value>, row: RowRef) -> bool {
+        // Table lookup by &str: allocates the table key only on first sight.
+        let rows = match self.tables.get_mut(table) {
+            Some(r) => r,
+            None => self.tables.entry(table.to_string()).or_default(),
+        };
+        match rows.get_mut(&vals) {
             Some(e) => {
                 e.count += 1;
                 e.row = row;
                 false
             }
             None => {
-                self.rows.insert(key, RowEntry { count: 1, row });
+                rows.insert(vals, RowEntry { count: 1, row });
                 true
             }
         }
     }
     /// Decrement; returns true if the last reference was dropped (1 → 0).
-    fn decr(&mut self, key: &(String, Vec<Value>)) -> bool {
-        if let Some(e) = self.rows.get_mut(key) {
-            e.count -= 1;
-            if e.count == 0 {
-                self.rows.remove(key);
-                return true;
+    fn decr(&mut self, table: &str, vals: &[Value]) -> bool {
+        if let Some(rows) = self.tables.get_mut(table) {
+            if let Some(e) = rows.get_mut(vals) {
+                e.count -= 1;
+                if e.count == 0 {
+                    rows.remove(vals);
+                    return true;
+                }
             }
         }
         false
     }
     /// Update the stored value for an existing key (edit-in-place).
-    fn touch(&mut self, key: &(String, Vec<Value>), row: RowRef) {
-        if let Some(e) = self.rows.get_mut(key) {
+    fn touch(&mut self, table: &str, vals: &[Value], row: RowRef) {
+        if let Some(e) = self.tables.get_mut(table).and_then(|rows| rows.get_mut(vals)) {
             e.row = row;
         }
     }
     /// The client's current view (row identity → value JSON) for CVR checkpointing.
     /// Serializes here — never on the per-mutation hot path.
     pub fn view(&self) -> ClientView {
-        let mut out = HashMap::with_capacity(self.rows.len());
-        for ((table, vals), e) in &self.rows {
+        let mut out = HashMap::new();
+        for (table, rows) in &self.tables {
             let Some(pk) = self.pks.get(table) else { continue };
-            let id: Row = pk.iter().cloned().zip(vals.iter().cloned()).collect();
-            let id_json = serde_json::to_string(&id).unwrap_or_default();
-            let val_json = serde_json::to_string(&*e.row).unwrap_or_default();
-            out.insert((table.clone(), id_json), val_json);
+            for (vals, e) in rows {
+                let id: Row = pk.iter().cloned().zip(vals.iter().cloned()).collect();
+                let id_json = serde_json::to_string(&id).unwrap_or_default();
+                let val_json = serde_json::to_string(&*e.row).unwrap_or_default();
+                out.insert((table.clone(), id_json), val_json);
+            }
         }
         out
     }
@@ -151,9 +164,8 @@ fn change_to_patches_dedup(change: &Change, schema: &Schema, refs: &mut RowRefs,
         Change::Remove(node) => node_dels_dedup(node, schema, refs, out),
         Change::Edit { node, .. } => {
             if !schema.is_hidden {
-                let key = (schema.table_name.clone(), pk_values(&node.row, &schema.primary_key));
-                refs.touch(&key, node.row.clone());
-                out.push(RowPatchOp::Put { table_name: schema.table_name.clone(), value: node.row.to_row() });
+                refs.touch(&schema.table_name, &pk_values(&node.row, &schema.primary_key), node.row.clone());
+                out.push(RowPatchOp::Put { table_name: schema.table_name.clone(), value: Rc::clone(&node.row.0) });
             }
         }
         Change::Child { relationship_name, change, .. } => {
@@ -175,7 +187,7 @@ fn node_puts_dedup(
         let table = &schema.table_name;
         let pk = &schema.primary_key;
         refs.register_pk(table, pk);
-        refs.incr((table.clone(), pk_values(&node.row, pk)), node.row.clone());
+        refs.incr(table, pk_values(&node.row, pk), node.row.clone());
         // On resume only (prior present), suppress the put if the client already
         // holds this exact value. The JSON here is off the hot path.
         let suppress = match prior {
@@ -187,7 +199,7 @@ fn node_puts_dedup(
             None => false,
         };
         if !suppress {
-            out.push(RowPatchOp::Put { table_name: table.clone(), value: node.row.to_row() });
+            out.push(RowPatchOp::Put { table_name: table.clone(), value: Rc::clone(&node.row.0) });
         }
     }
     for (rel_name, children) in &node.relationships {
@@ -200,14 +212,13 @@ fn node_puts_dedup(
 }
 
 fn node_dels_dedup(node: &Node, schema: &Schema, refs: &mut RowRefs, out: &mut RowsPatch) {
-    if !schema.is_hidden {
-        let key = (schema.table_name.clone(), pk_values(&node.row, &schema.primary_key));
-        if refs.decr(&key) {
-            out.push(RowPatchOp::Del {
-                table_name: schema.table_name.clone(),
-                id: pk_id(&node.row, &schema.primary_key),
-            });
-        }
+    if !schema.is_hidden
+        && refs.decr(&schema.table_name, &pk_values(&node.row, &schema.primary_key))
+    {
+        out.push(RowPatchOp::Del {
+            table_name: schema.table_name.clone(),
+            id: pk_id(&node.row, &schema.primary_key),
+        });
     }
     for (rel_name, children) in &node.relationships {
         if let Some(child_schema) = schema.relationships.get(rel_name) {
@@ -252,7 +263,7 @@ pub fn change_to_patches(change: &Change, schema: &Schema, out: &mut RowsPatch) 
             if !schema.is_hidden {
                 out.push(RowPatchOp::Put {
                     table_name: schema.table_name.clone(),
-                    value: node.row.to_row(),
+                    value: Rc::clone(&node.row.0),
                 });
             }
         }
@@ -273,7 +284,7 @@ fn node_puts(node: &Node, schema: &Schema, out: &mut RowsPatch) {
     if !schema.is_hidden {
         out.push(RowPatchOp::Put {
             table_name: schema.table_name.clone(),
-            value: node.row.to_row(),
+            value: Rc::clone(&node.row.0),
         });
     }
     for (rel_name, children) in &node.relationships {

@@ -11,6 +11,7 @@
 use oql::ast::Ast;
 use oql::value::Row;
 use serde::{Deserialize, Serialize};
+use std::rc::Rc;
 
 /// A patch to a client's query set (desired or "got").
 ///
@@ -46,7 +47,11 @@ pub enum RowPatchOp {
     Put {
         #[serde(rename = "tableName")]
         table_name: String,
-        value: Row,
+        /// `Rc<Row>` (serializes exactly like `Row`): a put's row is shared
+        /// straight from the IVM node — a refcount bump per client instead of a
+        /// deep `BTreeMap`+`String` clone per client per change, which the wire
+        /// profile showed dominating the patch-build stage.
+        value: Rc<Row>,
     },
     Update {
         #[serde(rename = "tableName")]
@@ -76,9 +81,11 @@ mod tests {
     fn row_put_wire_shape() {
         let op = RowPatchOp::Put {
             table_name: "issue".into(),
-            value: [("id".to_string(), oql::value::Value::from("i1"))]
-                .into_iter()
-                .collect(),
+            value: Rc::new(
+                [("id".to_string(), oql::value::Value::from("i1"))]
+                    .into_iter()
+                    .collect(),
+            ),
         };
         assert_eq!(
             serde_json::to_value(&op).unwrap(),
