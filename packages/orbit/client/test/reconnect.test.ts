@@ -180,11 +180,26 @@ test('persist: an explicit clientID is never overridden by the KV', async () => 
   }
 });
 
-// Node ≥ 24 ships real Web Locks (navigator.locks), so this exercises the actual
-// leader-election path, not a mock.
 test('persist: a second tab (same KV) becomes a memory-only follower — no shared-cache writes', async () => {
   const prevWS = (globalThis as { WebSocket?: unknown }).WebSocket;
   (globalThis as { WebSocket?: unknown }).WebSocket = undefined;
+  // Deterministic Web-Locks mock: CI Node (22) has no navigator.locks, and the
+  // client's graceful no-locks fallback would make BOTH instances leaders. The mock
+  // implements the same contract the client relies on: ifAvailable grants the first
+  // requester, returns null while held, and releases when the holder's callback
+  // promise settles (our release fn / tab death).
+  const prevNavDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const held = new Set<string>();
+  const locks = {
+    request(name: string, _opts: { ifAvailable: boolean }, cb: (lock: unknown) => unknown): Promise<unknown> {
+      if (held.has(name)) return Promise.resolve(cb(null));
+      held.add(name);
+      const done = Promise.resolve(cb({ name }));
+      void done.finally(() => held.delete(name));
+      return done;
+    },
+  };
+  Object.defineProperty(globalThis, 'navigator', { value: { locks }, configurable: true });
   const kv = new MemoryKV();
   const make = () => new Orbit({ server: 'ws://x', schema, persist: kv, maxReconnectMs: 0 });
   try {
@@ -216,6 +231,8 @@ test('persist: a second tab (same KV) becomes a memory-only follower — no shar
     c.close();
     await settle();
   } finally {
+    if (prevNavDesc) Object.defineProperty(globalThis, 'navigator', prevNavDesc);
+    else delete (globalThis as { navigator?: unknown }).navigator;
     (globalThis as { WebSocket?: unknown }).WebSocket = prevWS;
   }
 });
