@@ -41,8 +41,20 @@ use std::rc::Rc;
 /// order, so a fetch ordered by the PK (the common case) sorts in ~O(n).
 type KeyVec = SmallVec<[Value; 1]>;
 
-/// A constraint-column-set secondary index: constraint values → matching rows.
-type SecondaryIndex = BTreeMap<KeyVec, Vec<Rc<Row>>>;
+/// A secondary index for one (constraint columns, connection ordering) pair:
+/// constraint values → matching rows, with **each bucket kept sorted** by the
+/// ordering's comparator. Maintained incrementally on every write (an
+/// upper-bound binary insert — equal sort keys keep arrival order, exactly like
+/// the stable sort it replaces), so a constrained fetch returns the bucket
+/// as-is instead of re-sorting it: O(k log k) comparator calls per fetch become
+/// O(log k) per write. This is what keeps join `push_child` flat as a join
+/// key's fan-in grows (the previous per-fetch sort made it quadratic overall).
+struct SortedIndex {
+    cols: Vec<String>,
+    order: Ordering2,
+    cmp: Comparator,
+    map: BTreeMap<KeyVec, Vec<Rc<Row>>>,
+}
 
 /// An in-flight change held during a push, with rows already shared via `Rc` so
 /// the overlay, the delivered node, and storage all reference one allocation.
@@ -97,8 +109,9 @@ pub struct MemorySource {
     /// Rows keyed by primary-key tuple, in PK order. `Rc<Row>` so the same row
     /// is shared with secondary indexes without duplication.
     data: BTreeMap<KeyVec, Rc<Row>>,
-    /// Lazily-built secondary indexes, keyed by the constraint column set.
-    indexes: RefCell<BTreeMap<Vec<String>, SecondaryIndex>>,
+    /// Lazily-built secondary indexes, one per (constraint columns, ordering)
+    /// pair in use. A handful per source, so identity lookup is a linear scan.
+    indexes: RefCell<Vec<SortedIndex>>,
     connections: Vec<Connection>,
     overlay: Option<(u64, OverlayChange)>,
     push_epoch: u64,
@@ -115,7 +128,7 @@ impl MemorySource {
             columns,
             primary_key,
             data: BTreeMap::new(),
-            indexes: RefCell::new(BTreeMap::new()),
+            indexes: RefCell::new(Vec::new()),
             connections: Vec::new(),
             overlay: None,
             push_epoch: 0,
@@ -194,36 +207,52 @@ impl MemorySource {
             .collect()
     }
 
-    /// Base rows matching `constraint` via a secondary index (built lazily and
-    /// maintained incrementally). Returns shared row references.
-    fn bucket(&self, constraint: &Constraint) -> Vec<Rc<Row>> {
+    /// Base rows matching `constraint` in `order`, via a secondary index that is
+    /// built lazily and maintained incrementally **pre-sorted** — the returned
+    /// bucket needs no per-fetch sort. Returns shared row references.
+    fn bucket(&self, constraint: &Constraint, order: &Ordering2, cmp: &Comparator) -> Vec<Rc<Row>> {
         let cols: Vec<String> = constraint.keys().cloned().collect();
         let vals: KeyVec = cols.iter().map(|k| constraint.get(k).cloned().unwrap_or(Value::Null)).collect();
         let mut indexes = self.indexes.borrow_mut();
-        let index = indexes.entry(cols.clone()).or_insert_with(|| {
-            let mut m = SecondaryIndex::default();
-            for rc in self.data.values() {
-                m.entry(key_for(&cols, rc)).or_default().push(Rc::clone(rc));
+        let index = match indexes.iter().position(|i| i.cols == cols && &i.order == order) {
+            Some(i) => &indexes[i],
+            None => {
+                let mut map: BTreeMap<KeyVec, Vec<Rc<Row>>> = BTreeMap::new();
+                for rc in self.data.values() {
+                    map.entry(key_for(&cols, rc)).or_default().push(Rc::clone(rc));
+                }
+                // Stable sort of insertion-ordered buckets: equal sort keys keep
+                // arrival order — the invariant incremental inserts preserve.
+                for bucket in map.values_mut() {
+                    bucket.sort_by(|a, b| cmp.compare(a, b));
+                }
+                indexes.push(SortedIndex {
+                    cols,
+                    order: order.clone(),
+                    cmp: cmp.clone(),
+                    map,
+                });
+                indexes.last().unwrap()
             }
-            m
-        });
-        index.get(&vals).cloned().unwrap_or_default()
+        };
+        index.map.get(&vals).cloned().unwrap_or_default()
     }
 
     fn index_insert(&mut self, rc: &Rc<Row>) {
-        for (cols, index) in self.indexes.get_mut().iter_mut() {
-            index.entry(key_for(cols, rc)).or_default().push(Rc::clone(rc));
+        for index in self.indexes.get_mut().iter_mut() {
+            let bucket = index.map.entry(key_for(&index.cols, rc)).or_default();
+            insert_sorted(bucket, rc, &index.cmp);
         }
     }
 
     fn index_remove(&mut self, row: &Row) {
         let pk = self.primary_key.clone();
-        for (cols, index) in self.indexes.get_mut().iter_mut() {
-            let k = key_for(cols, row);
-            if let Some(v) = index.get_mut(&k) {
+        for index in self.indexes.get_mut().iter_mut() {
+            let k = key_for(&index.cols, row);
+            if let Some(v) = index.map.get_mut(&k) {
                 v.retain(|x| !pk_eq(&pk, x, row));
                 if v.is_empty() {
-                    index.remove(&k);
+                    index.map.remove(&k);
                 }
             }
         }
@@ -233,44 +262,72 @@ impl MemorySource {
     /// start cursor.
     fn fetch_conn(&self, req: &FetchRequest, conn_idx: usize) -> Vec<Node> {
         let conn = &self.connections[conn_idx];
+        let overlay = self
+            .overlay
+            .as_ref()
+            .filter(|(epoch, _)| conn.last_pushed_epoch >= *epoch)
+            .map(|(_, change)| change);
 
-        // Base rows: an index bucket if constrained, else all rows.
-        let mut rows: Vec<Rc<Row>> = match &req.constraint {
-            Some(c) => self.bucket(c),
-            None => self.data.values().map(Rc::clone).collect(),
-        };
-
-        // Overlay (only if this connection is at the current push epoch). Rows
-        // from the bucket already satisfy the constraint; overlay additions are
-        // re-checked against it.
-        if let Some((epoch, change)) = &self.overlay {
-            if conn.last_pushed_epoch >= *epoch {
-                let matches = |r: &Row| req.constraint.as_ref().is_none_or(|c| constraint_matches_row(c, r));
+        let mut rows: Vec<Rc<Row>>;
+        if let Some(c) = &req.constraint {
+            // Constrained: the index bucket is ALREADY sorted by this connection's
+            // order (maintained incrementally), so no per-fetch sort. The overlay
+            // is spliced in sort position: an upper-bound insert lands equal sort
+            // keys after existing ones — exactly where the stable sort used to put
+            // a row appended at the end. Overlay additions are re-checked against
+            // the constraint; bucket rows satisfy it by construction.
+            rows = self.bucket(c, &conn.order, &conn.cmp);
+            if let Some(change) = overlay {
                 match change {
                     OverlayChange::Add(rc) => {
-                        if matches(rc) {
-                            rows.push(Rc::clone(rc));
+                        if constraint_matches_row(c, rc) {
+                            insert_sorted(&mut rows, rc, &conn.cmp);
                         }
                     }
                     OverlayChange::Remove(rc) => rows.retain(|x| !pk_eq(&self.primary_key, x, rc)),
                     OverlayChange::Edit { row, old } => {
                         rows.retain(|x| !pk_eq(&self.primary_key, x, old));
-                        if matches(row) {
-                            rows.push(Rc::clone(row));
+                        if constraint_matches_row(c, row) {
+                            insert_sorted(&mut rows, row, &conn.cmp);
                         }
                     }
                 }
             }
-        }
-
-        // Sort by the connection's order (reverse only when requested).
-        if req.reverse {
-            let cmp = Comparator::new(conn.order.clone(), true);
-            rows.sort_by(|a, b| cmp.compare(a, b));
-            sort_start(&mut rows, req, &cmp);
+            if req.reverse {
+                // Stable sort with the reversed comparator (as before): on the
+                // ascending input this is a cheap adaptive pass, and it keeps
+                // arrival order among equal sort keys (a plain `reverse()` would
+                // flip it).
+                let cmp = Comparator::new(conn.order.clone(), true);
+                rows.sort_by(|a, b| cmp.compare(a, b));
+                sort_start(&mut rows, req, &cmp);
+            } else {
+                sort_start(&mut rows, req, &conn.cmp);
+            }
         } else {
-            rows.sort_by(|a, b| conn.cmp.compare(a, b));
-            sort_start(&mut rows, req, &conn.cmp);
+            // Unconstrained: `data` iterates in PK order, so the common
+            // PK-ordered fetch is a near-O(n) adaptive sort. Deliberately not
+            // index-maintained: hydrates are one-shot, while maintaining a
+            // whole-table sorted copy would tax every push (see filter bench).
+            rows = self.data.values().map(Rc::clone).collect();
+            if let Some(change) = overlay {
+                match change {
+                    OverlayChange::Add(rc) => rows.push(Rc::clone(rc)),
+                    OverlayChange::Remove(rc) => rows.retain(|x| !pk_eq(&self.primary_key, x, rc)),
+                    OverlayChange::Edit { row, old } => {
+                        rows.retain(|x| !pk_eq(&self.primary_key, x, old));
+                        rows.push(Rc::clone(row));
+                    }
+                }
+            }
+            if req.reverse {
+                let cmp = Comparator::new(conn.order.clone(), true);
+                rows.sort_by(|a, b| cmp.compare(a, b));
+                sort_start(&mut rows, req, &cmp);
+            } else {
+                rows.sort_by(|a, b| conn.cmp.compare(a, b));
+                sort_start(&mut rows, req, &conn.cmp);
+            }
         }
 
         rows.into_iter().map(Node::from_rc).collect()
@@ -327,6 +384,15 @@ impl MemorySource {
 /// Build the key tuple for `cols` from `row`.
 fn key_for(cols: &[String], row: &Row) -> KeyVec {
     cols.iter().map(|c| row.get(c).cloned().unwrap_or(Value::Null)).collect()
+}
+
+/// Insert `rc` into `rows` (sorted ascending by `cmp`) at its **upper bound** —
+/// after any rows with an equal sort key. This matches the stable sort it
+/// replaces: a row appended and then stably sorted also lands after its equals,
+/// so incremental maintenance and full sorting produce identical bucket order.
+fn insert_sorted(rows: &mut Vec<Rc<Row>>, rc: &Rc<Row>, cmp: &Comparator) {
+    let pos = rows.partition_point(|x| cmp.compare(x, rc) != CmpOrdering::Greater);
+    rows.insert(pos, Rc::clone(rc));
 }
 
 /// Primary-key equality (PK values are never null; identity comparison).
