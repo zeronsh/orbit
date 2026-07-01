@@ -135,21 +135,32 @@ async fn websocket_subscribe_then_incremental_poke() {
             traceparent: None,
         });
         ws.send(Message::Text(serde_json::to_string(&push).unwrap())).await.unwrap();
-        // First poke acks the mutation (lastMutationIDChanges), then the row poke.
-        let ack = match next_downstream(&mut ws).await {
-            Downstream::PokeStart(_) => {
-                let part = match next_downstream(&mut ws).await {
-                    Downstream::PokePart(p) => p,
-                    o => panic!("expected pokePart, got {o:?}"),
-                };
-                assert!(matches!(next_downstream(&mut ws).await, Downstream::PokeEnd(_)));
-                part.last_mutation_id_changes
-            }
-            o => panic!("expected pokeStart, got {o:?}"),
+        // One atomic poke carries the row (w4) AND the lastMutationID ack together, so
+        // the client's optimistic overlay is never dropped before its row lands.
+        assert!(matches!(next_downstream(&mut ws).await, Downstream::PokeStart(_)));
+        let part = match next_downstream(&mut ws).await {
+            Downstream::PokePart(p) => p,
+            o => panic!("expected pokePart, got {o:?}"),
         };
-        assert_eq!(ack.unwrap().get("c1"), Some(&1u64), "mutation 1 from c1 acked");
-        // Then the row patch for w4.
-        assert_eq!(read_poke_put_ids(&mut ws).await, vec!["w4"]);
+        assert!(matches!(next_downstream(&mut ws).await, Downstream::PokeEnd(_)));
+        assert_eq!(
+            part.last_mutation_id_changes.as_ref().unwrap().get("c1"),
+            Some(&1u64),
+            "mutation 1 from c1 acked",
+        );
+        let ids: Vec<String> = part
+            .rows_patch
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| match p {
+                RowPatchOp::Put { value, .. } => match value.get("id") {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["w4"], "the same poke carries the w4 row");
 
         ws.close(None).await.unwrap();
     };
