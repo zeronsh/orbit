@@ -94,7 +94,23 @@ pub struct PgCvrStore;
 
 impl PgCvrStore {
     /// Create the CVR tables if absent.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` is NOT safe under concurrency: two connections
+    /// running it at once (e.g. the replicator and view-syncer booting together
+    /// against a fresh database) race on `pg_type` and one fails with a duplicate-key
+    /// error. Serialize the whole DDL block behind a database-wide advisory lock so
+    /// only one connection creates the schema; the rest wait, then find it present.
     pub async fn ensure_schema(client: &tokio_postgres::Client) -> anyhow::Result<()> {
+        // Fixed arbitrary key identifying the CVR-schema init critical section.
+        const SCHEMA_LOCK: i64 = 7_412_030_907;
+        client.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK]).await?;
+        let res = Self::create_tables(client).await;
+        // Release even if creation failed, so a retry (or another node) isn't blocked.
+        let _ = client.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]).await;
+        res
+    }
+
+    async fn create_tables(client: &tokio_postgres::Client) -> anyhow::Result<()> {
         client
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS orbit_cvr_mutations (
@@ -162,35 +178,63 @@ impl PgCvrStore {
         current: &ClientView,
         version: u64,
     ) -> anyhow::Result<()> {
+        // The row delta (changed/new rows to upsert, dropped rows to delete) and the
+        // version write must land atomically: a reconnect that reports `version` as
+        // its cookie takes the fast delta path, which trusts the stored rows to match
+        // that version exactly. If the version could be persisted without (or ahead of)
+        // its rows, the delta would suppress rows the client never received — permanent
+        // divergence. So this is ONE statement: a single SQL statement is an implicit,
+        // all-or-nothing Postgres transaction, so `(rows, version)` can never tear.
+        //
+        // An explicit BEGIN/COMMIT is deliberately avoided — every client connection
+        // shares one pooled `tokio_postgres::Client`, so wrapping statements in a
+        // transaction would capture other tasks' concurrently-pipelined queries. A CTE
+        // keeps the atomicity within a single statement, immune to that interleaving.
+        let mut up_tables: Vec<String> = Vec::new();
+        let mut up_ids: Vec<String> = Vec::new();
+        let mut up_vals: Vec<String> = Vec::new();
         for ((table, id), val) in current {
             if prior.get(&(table.clone(), id.clone())) != Some(val) {
-                client
-                    .execute(
-                        "INSERT INTO orbit_cvr_client_rows (client_id, table_name, row_id, row_val)
-                         VALUES ($1, $2, $3, $4)
-                         ON CONFLICT (client_id, table_name, row_id)
-                         DO UPDATE SET row_val = EXCLUDED.row_val",
-                        &[&client_id, table, id, val],
-                    )
-                    .await?;
+                up_tables.push(table.clone());
+                up_ids.push(id.clone());
+                up_vals.push(val.clone());
             }
         }
+        let mut del_tables: Vec<String> = Vec::new();
+        let mut del_ids: Vec<String> = Vec::new();
         for (table, id) in prior.keys() {
             if !current.contains_key(&(table.clone(), id.clone())) {
-                client
-                    .execute(
-                        "DELETE FROM orbit_cvr_client_rows
-                         WHERE client_id = $1 AND table_name = $2 AND row_id = $3",
-                        &[&client_id, table, id],
-                    )
-                    .await?;
+                del_tables.push(table.clone());
+                del_ids.push(id.clone());
             }
         }
+        // Data-modifying CTEs run to completion exactly once regardless of whether the
+        // primary query references them, and all share one snapshot — so the upserts,
+        // deletes, and version write commit together or not at all.
         client
             .execute(
-                "INSERT INTO orbit_cvr_clients (client_id, version) VALUES ($1, $2)
+                "WITH ups AS (
+                     INSERT INTO orbit_cvr_client_rows (client_id, table_name, row_id, row_val)
+                     SELECT $1, t, i, v FROM UNNEST($2::text[], $3::text[], $4::text[]) AS u(t, i, v)
+                     ON CONFLICT (client_id, table_name, row_id)
+                     DO UPDATE SET row_val = EXCLUDED.row_val
+                 ),
+                 dels AS (
+                     DELETE FROM orbit_cvr_client_rows r
+                     USING UNNEST($5::text[], $6::text[]) AS d(t, i)
+                     WHERE r.client_id = $1 AND r.table_name = d.t AND r.row_id = d.i
+                 )
+                 INSERT INTO orbit_cvr_clients (client_id, version) VALUES ($1, $7)
                  ON CONFLICT (client_id) DO UPDATE SET version = EXCLUDED.version",
-                &[&client_id, &(version as i64)],
+                &[
+                    &client_id,
+                    &up_tables,
+                    &up_ids,
+                    &up_vals,
+                    &del_tables,
+                    &del_ids,
+                    &(version as i64),
+                ],
             )
             .await?;
         Ok(())
