@@ -98,6 +98,14 @@ struct Connection {
     /// Precomputed ordering + forward comparator (avoids rebuilding per fetch).
     order: Ordering2,
     cmp: Comparator,
+    /// Whether `order` covers every primary-key column (a TOTAL order — no two
+    /// distinct rows compare equal). Gates the unstable partial-select fast path
+    /// for limited fetches, which is only deterministic without ties.
+    order_total: bool,
+    /// Whether `order` is exactly the primary key, ascending. Then `data`'s
+    /// iteration order already matches and the adaptive sort is ~O(n), so the
+    /// partial-select fast path would be a pessimization.
+    order_is_pk_asc: bool,
 }
 
 /// An in-memory table source.
@@ -304,6 +312,9 @@ impl MemorySource {
             } else {
                 sort_start(&mut rows, req, &conn.cmp);
             }
+            if let Some(k) = req.limit {
+                rows.truncate(k);
+            }
         } else {
             // Unconstrained: `data` iterates in PK order, so the common
             // PK-ordered fetch is a near-O(n) adaptive sort. Deliberately not
@@ -324,9 +335,25 @@ impl MemorySource {
                 let cmp = Comparator::new(conn.order.clone(), true);
                 rows.sort_by(|a, b| cmp.compare(a, b));
                 sort_start(&mut rows, req, &cmp);
+                if let Some(k) = req.limit {
+                    rows.truncate(k);
+                }
+            } else if let Some(k) = req.limit.filter(|k| {
+                conn.order_total && !conn.order_is_pk_asc && req.start.is_none() && *k < rows.len()
+            }) {
+                // Partial select: only the top `k` rows are returned, so don't
+                // sort the rest. Unstable selection is deterministic here because
+                // the order is TOTAL (no two distinct rows compare equal). Worth
+                // it only for non-PK orders — PK-ordered input is already sorted.
+                rows.select_nth_unstable_by(k, |a, b| conn.cmp.compare(a, b));
+                rows.truncate(k);
+                rows.sort_by(|a, b| conn.cmp.compare(a, b));
             } else {
                 rows.sort_by(|a, b| conn.cmp.compare(a, b));
                 sort_start(&mut rows, req, &conn.cmp);
+                if let Some(k) = req.limit {
+                    rows.truncate(k);
+                }
             }
         }
 
@@ -441,12 +468,20 @@ pub fn connect(
             cmp.clone(),
         ));
         conn_idx = s.connections.len();
+        let order_total = s.primary_key.iter().all(|k| order.iter().any(|(f, _)| f == k));
+        let order_is_pk_asc = order.len() == s.primary_key.len()
+            && order
+                .iter()
+                .zip(s.primary_key.iter())
+                .all(|((f, d), k)| f == k && *d == Direction::Asc);
         s.connections.push(Connection {
             output: None,
             last_pushed_epoch: 0,
             schema,
             order,
             cmp,
+            order_total,
+            order_is_pk_asc,
         });
     }
     Rc::new(RefCell::new(SourceConnection {

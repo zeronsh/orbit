@@ -29,6 +29,13 @@ pub struct Join {
     parent_key: Vec<String>,
     child_key: Vec<String>,
     relationship_name: String,
+    /// Skip re-materializing the parent's child list on `Change::Child` parents.
+    /// Sound only when set by the builder: nothing above this join reads a Child
+    /// change's parent relationships (the wire layer recurses into the inner
+    /// change only) — i.e. no `Take` (limit) and no `CondFilter` (EXISTS) above.
+    /// This is what keeps `push_child` O(log fan-in) instead of O(fan-in):
+    /// without it, one child add re-fetches every sibling just to be discarded.
+    shallow_child_parents: bool,
     output: Option<Link>,
     schema: Rc<Schema>,
 }
@@ -45,6 +52,23 @@ impl Join {
         child_key: Vec<String>,
         relationship_name: impl Into<String>,
         hidden: bool,
+    ) -> Rc<RefCell<Join>> {
+        Self::with_shallow_child_parents(
+            parent, child, parent_key, child_key, relationship_name, hidden, false,
+        )
+    }
+
+    /// Like [`new`](Self::new) with the `shallow_child_parents` fast path (see
+    /// the field docs). Only the builder should enable it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_shallow_child_parents(
+        parent: OpHandle,
+        child: OpHandle,
+        parent_key: Vec<String>,
+        child_key: Vec<String>,
+        relationship_name: impl Into<String>,
+        hidden: bool,
+        shallow_child_parents: bool,
     ) -> Rc<RefCell<Join>> {
         assert_eq!(
             parent_key.len(),
@@ -68,6 +92,7 @@ impl Join {
             parent_key,
             child_key,
             relationship_name,
+            shallow_child_parents,
             output: None,
             schema: Rc::new(schema),
         }));
@@ -100,6 +125,19 @@ impl Join {
         }
     }
 
+    /// Wrap a parent node for a `Change::Child` delivery. Shallow mode skips the
+    /// O(fan-in) re-fetch of this join's child list — the empty relationship is a
+    /// placeholder no permitted consumer reads (see `shallow_child_parents`).
+    fn wrap_child_parent(&self, parent_row: &RowRef, parent_rels: &BTreeMap<String, Vec<Node>>) -> Node {
+        if self.shallow_child_parents {
+            let mut relationships = parent_rels.clone();
+            relationships.insert(self.relationship_name.clone(), Vec::new());
+            Node { row: parent_row.clone(), relationships }
+        } else {
+            self.process_parent_node(parent_row, parent_rels)
+        }
+    }
+
     fn push_parent(&mut self, change: Change) -> Changes {
         match change {
             Change::Add(node) => smallvec![Change::Add(self.process_parent_node(&node.row, &node.relationships))],
@@ -111,7 +149,7 @@ impl Join {
                 relationship_name,
                 change,
             } => smallvec![Change::Child {
-                node: self.process_parent_node(&node.row, &node.relationships),
+                node: self.wrap_child_parent(&node.row, &node.relationships),
                 relationship_name,
                 change,
             }],
@@ -153,7 +191,7 @@ impl Join {
             };
             for parent_node in self.parent.borrow().fetch(&FetchRequest::constrained(constraint)) {
                 out.push(Change::Child {
-                    node: self.process_parent_node(&parent_node.row, &parent_node.relationships),
+                    node: self.wrap_child_parent(&parent_node.row, &parent_node.relationships),
                     relationship_name: self.relationship_name.clone(),
                     change: Box::new(change.clone()),
                 });

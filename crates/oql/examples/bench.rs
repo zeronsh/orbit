@@ -36,6 +36,8 @@ fn main() {
     match workload.as_str() {
         "filter" => filter_bench(n, m),
         "join" => join_bench(n, m),
+        "take" => take_bench(n, m),
+        "exists" => exists_bench(n, m),
         // mt <queries> <pushes-per-query> [threads]
         "mt" => mt_bench(n, m, args.get(4).and_then(|s| s.parse().ok())),
         other => eprintln!("unknown workload {other}"),
@@ -194,18 +196,26 @@ fn join_bench(n: usize, m: usize) {
     }
     let load = t.elapsed();
 
-    let join = Join::new(
-        OpHandle::new(connect(&issues, asc("id"))),
-        OpHandle::new(connect(&comments, asc("id"))),
-        vec!["id".into()],
-        vec!["issueID".into()],
-        "comments",
-        false,
-    );
-    let jh = OpHandle::new(join);
-    let catch = Catch::new(jh.input.clone());
+    // Build via the AST pipeline (as the server does, and as Zero's bench builds
+    // via its `buildPipeline`), so builder-level choices — e.g. shallow Child
+    // parents for limit-free related joins — are part of what's measured.
+    let mut map = std::collections::HashMap::new();
+    map.insert("issue".to_string(), issues.clone());
+    map.insert("comment".to_string(), comments.clone());
+    let provider = Provider(map);
+    let ast: oql::ast::Ast = serde_json::from_value(serde_json::json!({
+        "table": "issue",
+        "orderBy": [["id", "asc"]],
+        "related": [{
+            "correlation": {"parentField": ["id"], "childField": ["issueID"]},
+            "subquery": {"table": "comment", "alias": "comments", "orderBy": [["id", "asc"]]}
+        }]
+    }))
+    .unwrap();
+    let top = oql::build_pipeline(&ast, &provider);
+    let catch = Catch::new(top.input.clone());
     let link: Link = catch.clone();
-    jh.set_output(link);
+    top.set_output(link);
 
     let t = Instant::now();
     let count = catch.borrow().fetch().len();
@@ -237,4 +247,118 @@ fn report(
     println!("  load     {:>8.1} ms ({:>9.0} rows/s)", load.as_secs_f64() * 1e3, n as f64 / load.as_secs_f64());
     println!("  hydrate  {:>8.1} ms", hydrate.as_secs_f64() * 1e3);
     println!("  push     {:>8.1} ms ({:>9.0} pushes/s)", push.as_secs_f64() * 1e3, m as f64 / push.as_secs_f64());
+}
+
+// ---------------------------------------------------------------------------
+// AST-driven workloads (take / exists): built via `build_pipeline` so they
+// exercise the REAL operator graph the server runs (Take, CondFilter), exactly
+// like Zero's counterparts exercise its builder-inserted operators.
+// ---------------------------------------------------------------------------
+
+struct Provider(std::collections::HashMap<String, Rc<std::cell::RefCell<MemorySource>>>);
+impl oql::SourceProvider for Provider {
+    fn get_source(&self, t: &str) -> Option<Rc<std::cell::RefCell<MemorySource>>> {
+        self.0.get(t).cloned()
+    }
+}
+
+/// `t ORDER BY n LIMIT 100` over N rows; M pushes with random-ish sort keys, a
+/// fraction landing inside the window (the boundary churn a limit query causes).
+fn take_bench(n: usize, m: usize) {
+    let src = MemorySource::new(
+        "t",
+        cols(&[("id", ColumnType::Number), ("n", ColumnType::Number)]),
+        vec!["id".into()],
+    );
+    let t = Instant::now();
+    for i in 0..n {
+        src.borrow_mut().insert_initial(row(&[
+            ("id", (i as i64).into()),
+            ("n", (((i * 7919) % 1_000_000) as i64).into()),
+        ]));
+    }
+    let load = t.elapsed();
+
+    let mut map = std::collections::HashMap::new();
+    map.insert("t".to_string(), src.clone());
+    let provider = Provider(map);
+    let ast: oql::ast::Ast = serde_json::from_value(serde_json::json!({
+        "table": "t",
+        "orderBy": [["n", "asc"]],
+        "limit": 100,
+    }))
+    .unwrap();
+    let t = Instant::now();
+    let top = oql::build_pipeline(&ast, &provider);
+    let catch = Catch::new(top.input.clone());
+    let link: Link = catch.clone();
+    top.set_output(link);
+    let count = catch.borrow().fetch().len();
+    let hydrate = t.elapsed();
+
+    let t = Instant::now();
+    for j in 0..m {
+        source_push(&src, SourceChange::Add(row(&[
+            ("id", ((n + j) as i64).into()),
+            ("n", (((j * 104729) % 1_000_000) as i64).into()),
+        ])));
+        catch.borrow_mut().take_changes();
+    }
+    let push = t.elapsed();
+    report("take", n, m, count, load, hydrate, push);
+}
+
+/// `issue WHERE EXISTS(comment ON comment.issueID = issue.id)` — N issues, then
+/// M comment adds spread over the issues (existence flips 0→1 on first).
+fn exists_bench(n: usize, m: usize) {
+    let issues = MemorySource::new(
+        "issue",
+        cols(&[("id", ColumnType::Number)]),
+        vec!["id".into()],
+    );
+    let comments = MemorySource::new(
+        "comment",
+        cols(&[("id", ColumnType::Number), ("issueID", ColumnType::Number)]),
+        vec!["id".into()],
+    );
+    let t = Instant::now();
+    for i in 0..n {
+        issues.borrow_mut().insert_initial(row(&[("id", (i as i64).into())]));
+    }
+    let load = t.elapsed();
+
+    let mut map = std::collections::HashMap::new();
+    map.insert("issue".to_string(), issues.clone());
+    map.insert("comment".to_string(), comments.clone());
+    let provider = Provider(map);
+    let ast: oql::ast::Ast = serde_json::from_value(serde_json::json!({
+        "table": "issue",
+        "orderBy": [["id", "asc"]],
+        "where": {
+            "type": "correlatedSubquery", "op": "EXISTS",
+            "related": {
+                "correlation": {"parentField": ["id"], "childField": ["issueID"]},
+                "subquery": {"table": "comment", "alias": "zsubq_comment"}
+            }
+        }
+    }))
+    .unwrap();
+    let t = Instant::now();
+    let top = oql::build_pipeline(&ast, &provider);
+    let catch = Catch::new(top.input.clone());
+    let link: Link = catch.clone();
+    top.set_output(link);
+    let count = catch.borrow().fetch().len();
+    let hydrate = t.elapsed();
+
+    let t = Instant::now();
+    for j in 0..m {
+        source_push(&comments, SourceChange::Add(row(&[
+            ("id", (j as i64).into()),
+            ("issueID", ((j % n.max(1)) as i64).into()),
+        ])));
+        catch.borrow_mut().take_changes();
+    }
+    let push = t.elapsed();
+    report("exists", n, m, count, load, hydrate, push);
 }
