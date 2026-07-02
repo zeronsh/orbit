@@ -42,6 +42,12 @@ pub struct FetchRequest {
     pub constraint: Option<Constraint>,
     pub start: Option<Start>,
     pub reverse: bool,
+    /// Optional row-count bound: the caller needs at most this many rows (in the
+    /// connection's order, applied AFTER constraint/overlay/start/reverse). Only
+    /// set by callers whose input chain does not filter rows (e.g. a `Take`
+    /// directly over a source), so truncation cannot change results. Sources may
+    /// additionally use it to avoid fully sorting rows they won't return.
+    pub limit: Option<usize>,
 }
 
 impl FetchRequest {
@@ -50,6 +56,7 @@ impl FetchRequest {
             constraint: Some(constraint),
             start: None,
             reverse: false,
+            limit: None,
         }
     }
 }

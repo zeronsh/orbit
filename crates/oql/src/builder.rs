@@ -108,20 +108,34 @@ fn build_pipeline_partitioned(
                 Some(sub.correlation.child_field.clone()),
             );
             let rel_name = relationship_name(sub);
-            let join = Join::new(
+            // Shallow Child-change parents are sound only when nothing above this
+            // join reads them: a `limit` at this level puts a Take above (it
+            // stores Child parents for later window emission), so stay deep. The
+            // hidden EXISTS joins (built in the `where` branch below a
+            // CondFilter) are constructed with Join::new — always deep.
+            let shallow = ast.limit.is_none();
+            let join = Join::with_shallow_child_parents(
                 current,
                 child,
                 sub.correlation.parent_field.clone(),
                 sub.correlation.child_field.clone(),
                 rel_name,
                 sub.hidden.unwrap_or(false),
+                shallow,
             );
             current = OpHandle::new(join);
         }
     }
 
     if let Some(limit) = ast.limit {
-        current = OpHandle::new(Take::partitioned(current, limit as usize, partition_key));
+        // The `limit` fetch hint is sound only when nothing below the Take
+        // filters rows: no `start` cursor (Skip), no `where` (Filter/CondFilter),
+        // and no related joins in between (they're 1:1 on parents, but keep the
+        // gate conservative). Then a bounded fetch returns exactly the head the
+        // Take would have kept anyway.
+        let exact_input =
+            ast.start.is_none() && ast.where_.is_none() && ast.related.is_none();
+        current = OpHandle::new(Take::partitioned(current, limit as usize, partition_key, exact_input));
     }
 
     current
