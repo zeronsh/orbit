@@ -12,8 +12,11 @@ use tokio_postgres::NoTls;
 
 #[tokio::test]
 async fn resume_from_durable_log_after_ring_eviction() {
-    let conn_str = "host=127.0.0.1 port=5433 user=orbit dbname=orbit";
-    let (client, conn) = tokio_postgres::connect(conn_str, NoTls).await.expect("connect orbit-pg");
+    let host = std::env::var("ORBIT_PG_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let port: u16 =
+        std::env::var("ORBIT_PG_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5433);
+    let conn_str = format!("host={host} port={port} user=orbit dbname=orbit");
+    let (client, conn) = tokio_postgres::connect(&conn_str, NoTls).await.expect("connect orbit-pg");
     tokio::spawn(async move {
         let _ = conn.await;
     });

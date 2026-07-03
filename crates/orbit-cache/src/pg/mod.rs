@@ -255,6 +255,7 @@ pub async fn initial_sync_backend(
     backend: &dyn crate::replica::ReplicaBackend,
     table: &str,
 ) -> Result<usize> {
+    use futures_util::TryStreamExt;
     use oql::value::Value;
     let columns = backend.table_columns(table);
     let select_cols = columns
@@ -263,9 +264,16 @@ pub async fn initial_sync_backend(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!("SELECT {} FROM \"{}\"", select_cols, table.replace('"', "\"\""));
-    let pg_rows = client.query(&sql, &[]).await?;
+    // Stream instead of buffering the whole table (`query` would hold every
+    // protocol row in RAM at once): each row is converted and seeded as it
+    // arrives, so a durable (disk-backed) replica syncs any table size in O(1)
+    // memory — the same reason Zero's initial sync streams COPY data.
+    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+    let stream = client.query_raw(&sql, params).await?;
+    futures_util::pin_mut!(stream);
     let mut count = 0;
-    for pg_row in &pg_rows {
+    while let Some(pg_row) = stream.try_next().await? {
+        let pg_row = &pg_row;
         let mut row = oql::value::Row::new();
         for (name, ty) in &columns {
             let text: Option<String> = pg_row.try_get(name.as_str()).ok().flatten();
