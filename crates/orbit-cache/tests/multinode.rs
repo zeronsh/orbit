@@ -32,7 +32,7 @@ const PUB: &str = "orbit_mn_pub";
 fn cfg(listen: &str) -> ServerConfig {
     ServerConfig {
         host: "127.0.0.1".into(),
-        port: 5433,
+        port: std::env::var("ORBIT_PG_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5433),
         user: "orbit".into(),
         database: "orbit".into(),
         password: None,
@@ -127,7 +127,9 @@ async fn wait_for_id(ws: &mut Ws, id: &str) {
 #[tokio::test]
 async fn mutation_reaches_clients_on_two_view_syncers() {
     let host = "127.0.0.1";
-    let conn_str = format!("host={host} port=5433 user=orbit dbname=orbit");
+    let pg_port: u16 =
+        std::env::var("ORBIT_PG_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5433);
+    let conn_str = format!("host={host} port={pg_port} user=orbit dbname=orbit");
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.expect("connect orbit-pg");
     tokio::spawn(async move {
         let _ = connection.await;

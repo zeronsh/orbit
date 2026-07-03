@@ -35,7 +35,7 @@ const PUB: &str = "orbit_cvr_pub";
 fn cfg(listen: &str) -> ServerConfig {
     ServerConfig {
         host: "127.0.0.1".into(),
-        port: 5433,
+        port: std::env::var("ORBIT_PG_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5433),
         user: "orbit".into(),
         database: "orbit".into(),
         password: None,
@@ -143,8 +143,10 @@ async fn collect_puts_until(ws: &mut Ws, target: &str) -> (HashSet<String>, Stri
 
 #[tokio::test]
 async fn reconnect_to_other_node_resumes_as_delta() {
-    let conn_str = "host=127.0.0.1 port=5433 user=orbit dbname=orbit";
-    let (client, connection) = tokio_postgres::connect(conn_str, NoTls).await.expect("connect orbit-pg");
+    let pg_port: u16 =
+        std::env::var("ORBIT_PG_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5433);
+    let conn_str = format!("host=127.0.0.1 port={pg_port} user=orbit dbname=orbit");
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.expect("connect orbit-pg");
     tokio::spawn(async move {
         let _ = connection.await;
     });

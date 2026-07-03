@@ -36,6 +36,9 @@ pub struct SqliteSource {
     connections: Vec<Conn>,
     overlay: Option<(u64, SourceChange)>,
     push_epoch: u64,
+    /// Names of secondary indexes already created (lazily, per fetch shape), so
+    /// the hot path doesn't re-issue `CREATE INDEX IF NOT EXISTS` DDL.
+    created_indexes: RefCell<std::collections::HashSet<String>>,
 }
 
 impl SqliteSource {
@@ -57,6 +60,13 @@ impl SqliteSource {
         primary_key: Vec<String>,
     ) -> Rc<RefCell<SqliteSource>> {
         let table = table.into();
+        // Replica-appropriate settings (same as Zero's zqlite replica): WAL for
+        // concurrent-read-friendly durability (no-op on in-memory databases),
+        // NORMAL synchronous (safe under WAL), and a prepared-statement cache so
+        // the per-push/per-fetch statements never re-parse SQL.
+        let _ = db.pragma_update(None, "journal_mode", "WAL");
+        let _ = db.pragma_update(None, "synchronous", "NORMAL");
+        db.set_prepared_statement_cache_capacity(64);
         // Keep declared primary-key order (it drives order-by tie-breaks).
         let pk = primary_key;
         let col_defs = columns
@@ -77,6 +87,7 @@ impl SqliteSource {
             connections: Vec::new(),
             overlay: None,
             push_epoch: 0,
+            created_indexes: RefCell::new(std::collections::HashSet::new()),
         }))
     }
 
@@ -90,7 +101,11 @@ impl SqliteSource {
     /// Insert a row directly (initial load), bypassing change propagation.
     pub fn insert_initial(&self, row: &Row) {
         let (sql, params) = self.insert_sql(row);
-        self.db.execute(&sql, rusqlite::params_from_iter(params)).expect("insert_initial");
+        self.db
+            .prepare_cached(&sql)
+            .expect("prepare insert")
+            .execute(rusqlite::params_from_iter(params))
+            .expect("insert_initial");
     }
 
     /// Look up the stored row matching the primary key of `key_row`.
@@ -99,9 +114,9 @@ impl SqliteSource {
         let select = cols.iter().map(|c| format!("\"{}\"", c.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
         let sql = format!("SELECT {select} FROM \"{}\" WHERE {}", self.table, self.pk_where());
         let params: Vec<SqlVal> =
-            self.primary_key.iter().map(|k| SqlVal(key_row.get(k).cloned().unwrap_or(Value::Null))).collect();
+            self.primary_key.iter().map(|k| self.param(k, key_row.get(k).cloned().unwrap_or(Value::Null))).collect();
         let col_types: Vec<(String, ColumnType)> = cols.iter().map(|c| (c.clone(), self.columns[c])).collect();
-        let mut stmt = self.db.prepare(&sql).ok()?;
+        let mut stmt = self.db.prepare_cached(&sql).ok()?;
         stmt.query_row(rusqlite::params_from_iter(params), |r| {
             let mut row = Row::new();
             for (i, (name, ty)) in col_types.iter().enumerate() {
@@ -116,11 +131,26 @@ impl SqliteSource {
         self.columns.keys().cloned().collect()
     }
 
+    /// Bind `v` for column `col`, respecting the column's declared type. JSON
+    /// columns store the JSON-serialized TEXT of the value so any JSON primitive
+    /// (bool/number/string/object) round-trips exactly — a native binding would
+    /// collapse `true` and `1` into the same INTEGER. SQL NULL stays NULL.
+    fn param(&self, col: &str, v: Value) -> SqlVal {
+        match (self.columns.get(col), &v) {
+            (_, Value::Null) => SqlVal(Value::Null),
+            (Some(ColumnType::Json), _) => {
+                SqlVal(Value::String(serde_json::to_string(&v).unwrap_or_default()))
+            }
+            _ => SqlVal(v),
+        }
+    }
+
     fn insert_sql(&self, row: &Row) -> (String, Vec<SqlVal>) {
         let cols = self.col_list();
         let placeholders = (1..=cols.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
         let col_idents = cols.iter().map(|c| format!("\"{}\"", c.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
-        let params = cols.iter().map(|c| SqlVal(row.get(c).cloned().unwrap_or(Value::Null))).collect();
+        let params =
+            cols.iter().map(|c| self.param(c, row.get(c).cloned().unwrap_or(Value::Null))).collect();
         (
             format!("INSERT OR REPLACE INTO \"{}\" ({col_idents}) VALUES ({placeholders})", self.table),
             params,
@@ -128,10 +158,13 @@ impl SqliteSource {
     }
 
     fn pk_where(&self) -> String {
+        // `IS` (not `=`): row identity treats NULL as matching NULL
+        // (`values_identical`), and a primary-key component can be NULL. SQLite's
+        // `IS` works with bound parameters and stays index-sargable.
         self.primary_key
             .iter()
             .enumerate()
-            .map(|(i, c)| format!("\"{}\" = ?{}", c.replace('"', "\"\""), i + 1))
+            .map(|(i, c)| format!("\"{}\" IS ?{}", c.replace('"', "\"\""), i + 1))
             .collect::<Vec<_>>()
             .join(" AND ")
     }
@@ -140,29 +173,21 @@ impl SqliteSource {
         match change {
             SourceChange::Add(r) => {
                 let (sql, params) = self.insert_sql(r);
-                self.db.execute(&sql, rusqlite::params_from_iter(params)).unwrap();
+                self.db.prepare_cached(&sql).unwrap().execute(rusqlite::params_from_iter(params)).unwrap();
             }
             SourceChange::Remove(r) => {
                 let params: Vec<SqlVal> =
-                    self.primary_key.iter().map(|k| SqlVal(r.get(k).cloned().unwrap_or(Value::Null))).collect();
-                self.db
-                    .execute(
-                        &format!("DELETE FROM \"{}\" WHERE {}", self.table, self.pk_where()),
-                        rusqlite::params_from_iter(params),
-                    )
-                    .unwrap();
+                    self.primary_key.iter().map(|k| self.param(k, r.get(k).cloned().unwrap_or(Value::Null))).collect();
+                let sql = format!("DELETE FROM \"{}\" WHERE {}", self.table, self.pk_where());
+                self.db.prepare_cached(&sql).unwrap().execute(rusqlite::params_from_iter(params)).unwrap();
             }
             SourceChange::Edit { row, old_row } => {
                 let params: Vec<SqlVal> =
-                    self.primary_key.iter().map(|k| SqlVal(old_row.get(k).cloned().unwrap_or(Value::Null))).collect();
-                self.db
-                    .execute(
-                        &format!("DELETE FROM \"{}\" WHERE {}", self.table, self.pk_where()),
-                        rusqlite::params_from_iter(params),
-                    )
-                    .unwrap();
+                    self.primary_key.iter().map(|k| self.param(k, old_row.get(k).cloned().unwrap_or(Value::Null))).collect();
+                let sql = format!("DELETE FROM \"{}\" WHERE {}", self.table, self.pk_where());
+                self.db.prepare_cached(&sql).unwrap().execute(rusqlite::params_from_iter(params)).unwrap();
                 let (sql, p) = self.insert_sql(row);
-                self.db.execute(&sql, rusqlite::params_from_iter(p)).unwrap();
+                self.db.prepare_cached(&sql).unwrap().execute(rusqlite::params_from_iter(p)).unwrap();
             }
         }
     }
@@ -186,7 +211,7 @@ impl SqliteSource {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!("SELECT {select} FROM \"{}\" ORDER BY {order}", self.table);
-        let mut stmt = self.db.prepare(&sql).unwrap();
+        let mut stmt = self.db.prepare_cached(&sql).unwrap();
         let col_types: Vec<(String, ColumnType)> = cols.iter().map(|c| (c.clone(), self.columns[c])).collect();
         let rows = stmt
             .query_map([], |r| {
@@ -221,56 +246,172 @@ impl SqliteSource {
         ))
     }
 
+    /// Fetch with FULL SQL pushdown — constraint (`WHERE =`), cursor (a
+    /// sargable lexicographic bound, null-aware to match `compare_values`'
+    /// nulls-first order), `ORDER BY` (directions flipped for reverse), and
+    /// `LIMIT` all execute inside SQLite against a lazily-created covering
+    /// index. No table scan, no in-memory filter/sort. The in-flight overlay row
+    /// is spliced into the (already-sorted) result; with a `LIMIT`, one extra
+    /// row is fetched while an overlay is active so a spliced-out row can be
+    /// backfilled.
     fn fetch_conn(&self, req: &FetchRequest, conn_idx: usize) -> Vec<Node> {
         let conn = &self.connections[conn_idx];
-        let mut rows = self.select_all(&conn.sort);
+        let overlay_active = matches!(&self.overlay, Some((epoch, _)) if conn.last_pushed_epoch >= *epoch);
 
-        // Overlay (post-change view during a push), gated by epoch.
-        if let Some((epoch, change)) = &self.overlay {
-            if conn.last_pushed_epoch >= *epoch {
-                match change {
-                    SourceChange::Add(r) => rows.push(r.clone()),
-                    SourceChange::Remove(r) => rows.retain(|x| !self.pk_eq(x, r)),
-                    SourceChange::Edit { row, old_row } => {
-                        rows.retain(|x| !self.pk_eq(x, old_row));
-                        rows.push(row.clone());
+        // Effective per-column directions (reverse flips each).
+        let eff: Vec<(String, Direction)> = conn
+            .sort
+            .iter()
+            .map(|(f, d)| {
+                let dir = match (d, req.reverse) {
+                    (Direction::Asc, false) | (Direction::Desc, true) => Direction::Asc,
+                    _ => Direction::Desc,
+                };
+                (f.clone(), dir)
+            })
+            .collect();
+
+        self.ensure_index(req.constraint.as_ref(), &conn.sort);
+
+        // SELECT list + WHERE.
+        let cols = self.col_list();
+        let select = cols.iter().map(|c| ident(c)).collect::<Vec<_>>().join(", ");
+        let mut wheres: Vec<String> = Vec::new();
+        let mut params: Vec<SqlVal> = Vec::new();
+        if let Some(c) = &req.constraint {
+            for (k, v) in c.iter() {
+                if matches!(v, Value::Null) {
+                    // Join semantics: a null key never matches anything
+                    // (`values_equal(null, null) == false`, like SQL `= NULL`).
+                    wheres.push("0".to_string());
+                } else {
+                    params.push(self.param(k, v.clone()));
+                    wheres.push(format!("{} = ?{}", ident(k), params.len()));
+                }
+            }
+        }
+        if let Some(start) = &req.start {
+            let conv = |col: &str, v: Value| self.param(col, v);
+            wheres.push(start_bound_sql(&eff, &start.row, start.basis, &mut params, &conv));
+        }
+        let order = eff
+            .iter()
+            .map(|(c, d)| format!("{} {}", ident(c), if matches!(d, Direction::Asc) { "ASC" } else { "DESC" }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut sql = format!("SELECT {select} FROM {}", ident(&self.table));
+        if !wheres.is_empty() {
+            sql.push_str(&format!(" WHERE {}", wheres.join(" AND ")));
+        }
+        sql.push_str(&format!(" ORDER BY {order}"));
+        // With an active overlay a Remove/Edit can drop one fetched row, so read
+        // one extra to backfill the window.
+        let fetch_limit = req.limit.map(|k| if overlay_active { k + 1 } else { k });
+        if let Some(k) = fetch_limit {
+            sql.push_str(&format!(" LIMIT {k}"));
+        }
+
+        let col_types: Vec<(String, ColumnType)> = cols.iter().map(|c| (c.clone(), self.columns[c])).collect();
+        let mut stmt = self.db.prepare_cached(&sql).unwrap();
+        let mut rows: Vec<Row> = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| {
+                let mut row = Row::new();
+                for (i, (name, ty)) in col_types.iter().enumerate() {
+                    row.insert(name.as_str(), read_value(r, i, *ty));
+                }
+                Ok(row)
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Overlay splice: present the post-change view without re-sorting. The
+        // spliced-in row must satisfy the constraint AND the start bound; rows
+        // from SQL already do.
+        if overlay_active {
+            let (_, change) = self.overlay.as_ref().unwrap();
+            let ord2: oql::value::Ordering2 = eff
+                .iter()
+                .map(|(f, d)| {
+                    (f.clone(), match d {
+                        Direction::Asc => oql::value::Direction::Asc,
+                        Direction::Desc => oql::value::Direction::Desc,
+                    })
+                })
+                .collect();
+            let cmp = Comparator::new(ord2, false);
+            let admits = |r: &Row| {
+                let c_ok = req.constraint.as_ref().is_none_or(|c| constraint_matches_row(c, r));
+                let s_ok = req.start.as_ref().is_none_or(|start| {
+                    let c = cmp.compare(r, &start.row);
+                    match start.basis {
+                        Basis::At => c != CmpOrdering::Less,
+                        Basis::After => c == CmpOrdering::Greater,
+                    }
+                });
+                c_ok && s_ok
+            };
+            match change {
+                SourceChange::Add(r) => {
+                    if admits(r) {
+                        insert_sorted_row(&mut rows, r.clone(), &cmp);
+                    }
+                }
+                SourceChange::Remove(r) => rows.retain(|x| !self.pk_eq(x, r)),
+                SourceChange::Edit { row, old_row } => {
+                    rows.retain(|x| !self.pk_eq(x, old_row));
+                    if admits(row) {
+                        insert_sorted_row(&mut rows, row.clone(), &cmp);
                     }
                 }
             }
         }
-
-        if let Some(c) = &req.constraint {
-            rows.retain(|r| constraint_matches_row(c, r));
-        }
-
-        let order: oql::value::Ordering2 = conn
-            .sort
-            .iter()
-            .map(|(f, d)| {
-                (f.clone(), match d {
-                    Direction::Asc => oql::value::Direction::Asc,
-                    Direction::Desc => oql::value::Direction::Desc,
-                })
-            })
-            .collect();
-        let cmp = Comparator::new(order, req.reverse);
-        rows.sort_by(|a, b| cmp.compare(a, b));
-
-        if let Some(start) = &req.start {
-            let pos = rows.iter().position(|r| {
-                let c = cmp.compare(r, &start.row);
-                match start.basis {
-                    Basis::At => c != CmpOrdering::Less,
-                    Basis::After => c == CmpOrdering::Greater,
-                }
-            });
-            rows = match pos {
-                Some(p) => rows.split_off(p),
-                None => Vec::new(),
-            };
+        if let Some(k) = req.limit {
+            rows.truncate(k);
         }
 
         rows.into_iter().map(Node::new).collect()
+    }
+
+    /// Create (once) a covering index for this fetch shape: the equality
+    /// constraint columns first, then the sort columns with their directions —
+    /// so `WHERE k = ? ORDER BY s LIMIT n` is an index seek, not a scan+sort.
+    fn ensure_index(&self, constraint: Option<&oql::ivm::constraint::Constraint>, sort: &AstOrdering) {
+        let ccols: Vec<&String> = constraint.map(|c| c.keys().collect()).unwrap_or_default();
+        // The PK index already serves unconstrained PK-ordered fetches.
+        if ccols.is_empty() {
+            let pk_prefix = sort.len() <= self.primary_key.len()
+                && sort
+                    .iter()
+                    .zip(self.primary_key.iter())
+                    .all(|((f, d), k)| f == k && matches!(d, Direction::Asc));
+            if pk_prefix {
+                return;
+            }
+        }
+        let mut name = format!("orbit_idx_{}", self.table);
+        let mut cols_sql: Vec<String> = Vec::new();
+        for c in &ccols {
+            name.push_str(&format!("_{c}"));
+            cols_sql.push(ident(c));
+        }
+        for (f, d) in sort {
+            let dir = if matches!(d, Direction::Asc) { "ASC" } else { "DESC" };
+            name.push_str(&format!("_{f}{}", if matches!(d, Direction::Asc) { "a" } else { "d" }));
+            cols_sql.push(format!("{} {dir}", ident(f)));
+        }
+        let name: String = name.chars().map(|ch| if ch.is_alphanumeric() || ch == '_' { ch } else { '_' }).collect();
+        if self.created_indexes.borrow().contains(&name) {
+            return;
+        }
+        let sql = format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+            ident(&name),
+            ident(&self.table),
+            cols_sql.join(", ")
+        );
+        self.db.execute_batch(&sql).expect("create index");
+        self.created_indexes.borrow_mut().insert(name);
     }
 
     fn pk_eq(&self, a: &Row, b: &Row) -> bool {
@@ -491,6 +632,91 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
     }
 }
 
+/// Quote an identifier for SQLite.
+fn ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Insert `row` into `rows` (sorted ascending by `cmp`) at its upper bound —
+/// matching where a stable sort would land a freshly appended row.
+fn insert_sorted_row(rows: &mut Vec<Row>, row: Row, cmp: &Comparator) {
+    let pos = rows.partition_point(|x| cmp.compare(x, &row) != CmpOrdering::Greater);
+    rows.insert(pos, row);
+}
+
+/// The SQL for a `start` cursor: the sargable lexicographic bound over the
+/// effective (reverse-applied) order — `(a > ?) OR (a = ? AND b > ?) OR …`,
+/// plus the all-equal branch for `Basis::At`. Comparisons are **null-aware to
+/// match `compare_values`** (null sorts first): ascending, "x > NULL" is
+/// `x IS NOT NULL` and "x < v" admits NULL; equality uses `IS`. Mirrors Zero's
+/// `gatherStartConstraints`.
+fn start_bound_sql(
+    eff: &[(String, Direction)],
+    from: &Row,
+    basis: Basis,
+    params: &mut Vec<SqlVal>,
+    conv: &dyn Fn(&str, Value) -> SqlVal,
+) -> String {
+    // eq / gt / lt with nulls-first semantics on the EFFECTIVE ascending order.
+    let eq = |col: &str, v: &Value, params: &mut Vec<SqlVal>| -> String {
+        if matches!(v, Value::Null) {
+            format!("{} IS NULL", ident(col))
+        } else {
+            params.push(conv(col, v.clone()));
+            format!("{} = ?{}", ident(col), params.len())
+        }
+    };
+    let after = |col: &str, v: &Value, dir: &Direction, params: &mut Vec<SqlVal>| -> String {
+        match dir {
+            // Effective ascending: strictly greater. NULL is smallest, so
+            // "> NULL" is IS NOT NULL, and "> v" naturally excludes NULL.
+            Direction::Asc => {
+                if matches!(v, Value::Null) {
+                    format!("{} IS NOT NULL", ident(col))
+                } else {
+                    params.push(conv(col, v.clone()));
+                    format!("{} > ?{}", ident(col), params.len())
+                }
+            }
+            // Effective descending: strictly less. Nothing is less than NULL;
+            // "< v" must ALSO admit NULL (null sorts last in effective desc).
+            Direction::Desc => {
+                if matches!(v, Value::Null) {
+                    "0".to_string()
+                } else {
+                    params.push(conv(col, v.clone()));
+                    format!("({} < ?{} OR {} IS NULL)", ident(col), params.len(), ident(col))
+                }
+            }
+        }
+    };
+
+    let mut branches: Vec<String> = Vec::new();
+    for i in 0..eff.len() {
+        let mut group: Vec<String> = Vec::new();
+        for (j, (col, _)) in eff.iter().enumerate().take(i) {
+            let v = from.get(col).cloned().unwrap_or(Value::Null);
+            let _ = j;
+            group.push(eq(col, &v, params));
+        }
+        let (col, dir) = &eff[i];
+        let v = from.get(col).cloned().unwrap_or(Value::Null);
+        group.push(after(col, &v, dir, params));
+        branches.push(format!("({})", group.join(" AND ")));
+    }
+    if matches!(basis, Basis::At) {
+        let group: Vec<String> = eff
+            .iter()
+            .map(|(col, _)| {
+                let v = from.get(col).cloned().unwrap_or(Value::Null);
+                eq(col, &v, params)
+            })
+            .collect();
+        branches.push(format!("({})", group.join(" AND ")));
+    }
+    format!("({})", branches.join(" OR "))
+}
+
 /// Newtype so we can implement `ToSql` for [`Value`].
 struct SqlVal(Value);
 
@@ -529,12 +755,16 @@ fn read_value(row: &rusqlite::Row, idx: usize, ty: ColumnType) -> Value {
                     .unwrap_or(Value::Null),
                 _ => Value::Null,
             },
-            ColumnType::Json => v
-                .as_str()
-                .ok()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .map(Value::from_json)
-                .unwrap_or(Value::Null),
+            ColumnType::Json => match v {
+                ValueRef::Text(t) => std::str::from_utf8(t)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .map(Value::from_json)
+                    .unwrap_or(Value::Null),
+                ValueRef::Integer(i) => Value::Number(i as f64),
+                ValueRef::Real(f) => Value::Number(f),
+                _ => Value::Null,
+            },
             ColumnType::String => v.as_str().map(|s| Value::String(s.to_string())).unwrap_or(Value::Null),
             ColumnType::Null => Value::Null,
         },
