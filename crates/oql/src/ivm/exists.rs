@@ -26,7 +26,7 @@ pub struct Exists {
     primary_key: Vec<String>,
     /// Currently-passing parents, keyed by PK. `None` until hydrated.
     passing: RefCell<Option<BTreeMap<Vec<Value>, Node>>>,
-    output: Option<Link>,
+    output: Option<super::operator::WeakLink>,
 }
 
 impl Exists {
@@ -125,9 +125,9 @@ impl Operator for Exists {
     }
 
     fn output(&self) -> Option<Link> {
-        self.output.clone()
+        self.output.as_ref().and_then(std::rc::Weak::upgrade)
     }
     fn set_output(&mut self, out: Link) {
-        self.output = Some(out);
+        self.output = Some(Rc::downgrade(&out));
     }
 }

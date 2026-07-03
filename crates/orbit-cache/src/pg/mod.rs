@@ -16,6 +16,12 @@ pub struct ReplicationStream {
     decoder: Decoder,
     /// Highest WAL position seen; reported back in Standby Status Updates.
     last_lsn: u64,
+    /// Highest WAL position the consumer has durably applied (see
+    /// [`confirm`](Self::confirm)). This — not `last_lsn` — is what standby
+    /// status updates acknowledge, so Postgres never prunes WAL the consumer
+    /// hasn't safely committed: a crash between receipt and durable apply is
+    /// recovered by slot re-delivery instead of becoming a permanent gap.
+    confirmed_lsn: u64,
     /// Max time to wait for ANY inbound frame (data OR keepalive) before treating
     /// the stream as dead. A healthy Postgres sends keepalives at least every
     /// `wal_sender_timeout/2` (default 30s), so a stall well beyond that means a
@@ -62,6 +68,7 @@ impl ReplicationStream {
             conn,
             decoder: Decoder::new(),
             last_lsn: start_lsn,
+            confirmed_lsn: start_lsn,
             idle_timeout: std::time::Duration::from_secs(180),
         })
     }
@@ -70,6 +77,15 @@ impl ReplicationStream {
     /// doubles as the change-stream resume watermark.
     pub fn last_lsn(&self) -> u64 {
         self.last_lsn
+    }
+
+    /// Mark WAL up to `lsn` as durably applied by the consumer. Acknowledgements
+    /// (keepalive replies and [`ack`](Self::ack)) advance only to this point.
+    /// Callers that don't need durable replay (in-memory replicas that re-sync
+    /// on boot) confirm every received event; durable consumers confirm after
+    /// each committed transaction.
+    pub fn confirm(&mut self, lsn: u64) {
+        self.confirmed_lsn = self.confirmed_lsn.max(lsn);
     }
 
     /// Read the next data event (Insert/Update/Delete/Begin/Commit), returning the
@@ -121,7 +137,9 @@ impl ReplicationStream {
                             self.last_lsn = self.last_lsn.max(wal_end);
                             let reply_requested = body[17] == 1;
                             if reply_requested {
-                                self.conn.send_standby_status(self.last_lsn, false).await?;
+                                // Ack only the durably-confirmed position (standby
+                                // "flushed" semantics), not merely-received WAL.
+                                self.conn.send_standby_status(self.confirmed_lsn, false).await?;
                             }
                             continue;
                         }
@@ -135,9 +153,9 @@ impl ReplicationStream {
         }
     }
 
-    /// Acknowledge all received WAL up to the latest position.
+    /// Acknowledge WAL up to the durably-confirmed position.
     pub async fn ack(&mut self) -> Result<()> {
-        let lsn = self.last_lsn;
+        let lsn = self.confirmed_lsn;
         self.conn.send_standby_status(lsn, false).await
     }
 }

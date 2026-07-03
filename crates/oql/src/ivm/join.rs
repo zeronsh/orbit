@@ -29,6 +29,11 @@ pub struct Join {
     parent_key: Vec<String>,
     child_key: Vec<String>,
     relationship_name: String,
+    /// The forwarding ports wired as the parent/child inputs' outputs. Owned
+    /// here (the upstream holds only weak refs): dropping the Join drops the
+    /// ports, which orphans the upstream weak links, which prunes the sources.
+    _parent_port: Option<Link>,
+    _child_port: Option<Link>,
     /// Skip re-materializing the parent's child list on `Change::Child` parents.
     /// Sound only when set by the builder: nothing above this join reads a Child
     /// change's parent relationships (the wire layer recurses into the inner
@@ -36,7 +41,7 @@ pub struct Join {
     /// This is what keeps `push_child` O(log fan-in) instead of O(fan-in):
     /// without it, one child add re-fetches every sibling just to be discarded.
     shallow_child_parents: bool,
-    output: Option<Link>,
+    output: Option<super::operator::WeakLink>,
     schema: Rc<Schema>,
 }
 
@@ -92,20 +97,24 @@ impl Join {
             parent_key,
             child_key,
             relationship_name,
+            _parent_port: None,
+            _child_port: None,
             shallow_child_parents,
             output: None,
             schema: Rc::new(schema),
         }));
 
-        // Wire inputs to forwarding ports.
+        // Wire inputs to forwarding ports (weak back-refs; the Join owns them).
         let parent_port: Link = Rc::new(RefCell::new(JoinParentPort {
-            join: Rc::clone(&join),
+            join: Rc::downgrade(&join),
         }));
         let child_port: Link = Rc::new(RefCell::new(JoinChildPort {
-            join: Rc::clone(&join),
+            join: Rc::downgrade(&join),
         }));
-        parent.set_output(parent_port);
-        child.set_output(child_port);
+        parent.set_output(parent_port.clone());
+        child.set_output(child_port.clone());
+        join.borrow_mut()._parent_port = Some(parent_port);
+        join.borrow_mut()._child_port = Some(child_port);
 
         join
     }
@@ -220,39 +229,54 @@ impl Operator for Join {
         unreachable!("Join is pushed via its parent/child ports, not directly")
     }
     fn output(&self) -> Option<Link> {
-        self.output.clone()
+        self.output.as_ref().and_then(std::rc::Weak::upgrade)
     }
     fn set_output(&mut self, out: Link) {
-        self.output = Some(out);
+        self.output = Some(Rc::downgrade(&out));
     }
 }
 
-/// Adapter: forwards an input's push to [`Join::push_parent`].
+/// Adapter: forwards an input's push to [`Join::push_parent`]. Holds the Join
+/// weakly (the Join owns its ports, so a reachable port implies a live Join —
+/// strong back-refs would cycle and leak the Join forever).
 struct JoinParentPort {
-    join: Rc<RefCell<Join>>,
+    join: std::rc::Weak<RefCell<Join>>,
 }
 impl Operator for JoinParentPort {
     fn push(&mut self, change: Change) -> Changes {
-        self.join.borrow_mut().push_parent(change)
+        match self.join.upgrade() {
+            Some(j) => j.borrow_mut().push_parent(change),
+            None => Changes::new(),
+        }
     }
     fn output(&self) -> Option<Link> {
-        self.join.borrow().output.clone()
+        self.join.upgrade().and_then(|j| {
+            let out = j.borrow().output.clone();
+            out.and_then(|w| w.upgrade())
+        })
     }
     fn set_output(&mut self, _out: Link) {
         unreachable!("a join port's output follows the join's output")
     }
 }
 
-/// Adapter: forwards an input's push to [`Join::push_child`].
+/// Adapter: forwards an input's push to [`Join::push_child`]. Weak back-ref —
+/// see [`JoinParentPort`].
 struct JoinChildPort {
-    join: Rc<RefCell<Join>>,
+    join: std::rc::Weak<RefCell<Join>>,
 }
 impl Operator for JoinChildPort {
     fn push(&mut self, change: Change) -> Changes {
-        self.join.borrow_mut().push_child(change)
+        match self.join.upgrade() {
+            Some(j) => j.borrow_mut().push_child(change),
+            None => Changes::new(),
+        }
     }
     fn output(&self) -> Option<Link> {
-        self.join.borrow().output.clone()
+        self.join.upgrade().and_then(|j| {
+            let out = j.borrow().output.clone();
+            out.and_then(|w| w.upgrade())
+        })
     }
     fn set_output(&mut self, _out: Link) {
         unreachable!("a join port's output follows the join's output")

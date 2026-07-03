@@ -124,7 +124,13 @@ fn sql_literal(v: &Value) -> String {
         Value::Null => "NULL".to_string(),
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Number(n) => {
-            if n.fract() == 0.0 && n.is_finite() {
+            // Integer rendering only within i64's exactly-representable f64 range:
+            // `1e20 as i64` would silently saturate to i64::MAX (data corruption).
+            // Non-finite values would render as `NaN`/`inf` — invalid SQL that
+            // poisons the mutation — so render them as NULL instead.
+            if !n.is_finite() {
+                "NULL".to_string()
+            } else if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 {
                 format!("{}", *n as i64)
             } else {
                 format!("{n}")

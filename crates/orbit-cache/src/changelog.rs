@@ -31,6 +31,12 @@ pub struct PgChangeLog {
     table: String,
     tx: mpsc::UnboundedSender<LoggedChange>,
     tls: PgTlsMode,
+    /// Highest WAL LSN durably flushed to the log. The replicator acknowledges
+    /// replication WAL only up to this point, so a crash between the hot-path
+    /// `append` (a channel send) and the batched flush replays from the slot
+    /// instead of leaving a silent hole in the log (which a delta-resuming
+    /// view-syncer would skip right over — pos stays contiguous).
+    durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl PgChangeLog {
@@ -52,10 +58,18 @@ impl PgChangeLog {
         let (tx, rx) = mpsc::unbounded_channel();
         let writer_conn = conn_str.clone();
         let writer_table = table.clone();
+        let durable_lsn = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer_durable = std::sync::Arc::clone(&durable_lsn);
         tokio::spawn(async move {
-            run_writer(writer_conn, writer_table, rx, tls).await;
+            run_writer(writer_conn, writer_table, rx, tls, writer_durable).await;
         });
-        Ok(PgChangeLog { conn_str, table, tx, tls })
+        Ok(PgChangeLog { conn_str, table, tx, tls, durable_lsn })
+    }
+
+    /// Highest WAL LSN durably flushed by the background writer (0 until the
+    /// first flush this run).
+    pub fn durable_lsn(&self) -> u64 {
+        self.durable_lsn.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Append a change from the hot path. Non-blocking; never awaits PG.
@@ -90,15 +104,23 @@ impl PgChangeLog {
                 &[&(after as i64), &limit],
             )
             .await?;
-        let out = rows
-            .iter()
-            .map(|r| {
-                let pos = r.get::<_, i64>(0) as u64;
-                let json: String = r.get(1);
-                let event = serde_json::from_str(&json).unwrap_or(LogicalEvent::Other);
-                (pos, event)
-            })
-            .collect();
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let pos = r.get::<_, i64>(0) as u64;
+            let json: String = r.get(1);
+            match serde_json::from_str(&json) {
+                Ok(event) => out.push((pos, event)),
+                Err(e) => {
+                    // Do NOT substitute a no-op: a corrupt/unknown event (version
+                    // skew, corruption) delivered with its real pos would advance
+                    // the reader's watermark past a change it never applied —
+                    // silent divergence. Stop here; the caller's contiguity check
+                    // turns the cut into a Reset (full re-restore). Correct.
+                    eprintln!("change-log: unreadable event at pos {pos} ({e}); truncating read");
+                    break;
+                }
+            }
+        }
         Ok((min.map(|m| m as u64), out))
     }
 
@@ -121,12 +143,22 @@ async fn connect(conn_str: &str, mode: PgTlsMode) -> Result<tokio_postgres::Clie
     Ok(client)
 }
 
-/// Background writer: drains the channel into batched multi-row inserts.
-/// Reconnects on error; a dropped batch just means those changes aren't available
-/// for delta-resume (a view-syncer needing them falls back to a full re-restore —
-/// correct, only non-minimal), so we never block the hot path to guarantee it.
-async fn run_writer(conn_str: String, table: String, mut rx: mpsc::UnboundedReceiver<LoggedChange>, tls: PgTlsMode) {
+/// Background writer: drains the channel into batched multi-row inserts. The
+/// hot path never blocks (unbounded channel), but a failed flush is RETRIED —
+/// never dropped — because the log's positions are contiguous: a silently
+/// missing batch would be skipped unnoticed by delta-resuming view-syncers.
+/// `ON CONFLICT DO NOTHING` makes the retry idempotent. After each successful
+/// flush the batch's highest LSN becomes the durable watermark that gates the
+/// replicator's WAL acknowledgements.
+async fn run_writer(
+    conn_str: String,
+    table: String,
+    mut rx: mpsc::UnboundedReceiver<LoggedChange>,
+    tls: PgTlsMode,
+    durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
     const MAX_BATCH: usize = 1024;
+    let mut pending: Option<Vec<LoggedChange>> = None;
     loop {
         let client = match connect(&conn_str, tls).await {
             Ok(c) => c,
@@ -137,20 +169,31 @@ async fn run_writer(conn_str: String, table: String, mut rx: mpsc::UnboundedRece
             }
         };
         loop {
-            let first = match rx.recv().await {
-                Some(x) => x,
-                None => return, // sender dropped → replicator shutting down
-            };
-            let mut batch = vec![first];
-            while batch.len() < MAX_BATCH {
-                match rx.try_recv() {
-                    Ok(x) => batch.push(x),
-                    Err(_) => break,
+            let batch = match pending.take() {
+                Some(b) => b, // retry the batch that failed before reconnecting
+                None => {
+                    let first = match rx.recv().await {
+                        Some(x) => x,
+                        None => return, // sender dropped → replicator shutting down
+                    };
+                    let mut batch = vec![first];
+                    while batch.len() < MAX_BATCH {
+                        match rx.try_recv() {
+                            Ok(x) => batch.push(x),
+                            Err(_) => break,
+                        }
+                    }
+                    batch
                 }
-            }
+            };
             if let Err(e) = flush_batch(&client, &table, &batch).await {
-                eprintln!("change-log writer: flush failed ({e:#}); reconnecting");
-                break; // reconnect; this batch is dropped (re-restore covers it)
+                eprintln!("change-log writer: flush failed ({e:#}); reconnecting to retry");
+                pending = Some(batch);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                break; // reconnect, then retry the same batch
+            }
+            if let Some(max) = batch.iter().map(|(_, lsn, _)| *lsn).max() {
+                durable_lsn.fetch_max(max, std::sync::atomic::Ordering::Release);
             }
         }
     }

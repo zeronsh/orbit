@@ -33,7 +33,7 @@ pub struct CondFilter {
     primary_key: Vec<String>,
     /// Primary keys currently passing the predicate (`None` until hydrated).
     passing: RefCell<Option<BTreeSet<Vec<Value>>>>,
-    output: Option<Link>,
+    output: Option<super::operator::WeakLink>,
 }
 
 impl CondFilter {
@@ -150,9 +150,9 @@ impl Operator for CondFilter {
     }
 
     fn output(&self) -> Option<Link> {
-        self.output.clone()
+        self.output.as_ref().and_then(std::rc::Weak::upgrade)
     }
     fn set_output(&mut self, out: Link) {
-        self.output = Some(out);
+        self.output = Some(Rc::downgrade(&out));
     }
 }

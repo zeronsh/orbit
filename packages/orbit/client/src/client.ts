@@ -513,18 +513,31 @@ export class Orbit<
     // Auth token is sent in the `Sec-WebSocket-Protocol` header (the only way to
     // pass auth on a browser WebSocket handshake). The server forwards it as a
     // Bearer token to the app's push/query endpoints.
-    const token = typeof this.#opts.auth === 'function' ? await this.#opts.auth() : this.#opts.auth;
-    if (this.#closed) {
+    //
+    // A rejected auth() (e.g. token refresh failing while offline) or a throwing
+    // WebSocket constructor must NOT strand the client: without the catch there
+    // is no socket, so no close event, no reconnect — and #connecting stays true,
+    // making every future #connect a no-op until reload.
+    let ws: WebSocket;
+    try {
+      const token = typeof this.#opts.auth === 'function' ? await this.#opts.auth() : this.#opts.auth;
+      if (this.#closed) {
+        this.#connecting = false;
+        return;
+      }
+      // clientID rides in the connect URL (Zero-style) so a view-syncer can load
+      // this client's persisted view and, on reconnect to ANY node, resume as a
+      // delta instead of re-sending the whole result. baseCookie is the last cookie
+      // we applied — the server fast-resumes only if it matches the stored version.
+      let url = `${this.#opts.server}/sync/v51/connect?clientID=${encodeURIComponent(this.clientID)}`;
+      if (this.#cookie != null) url += `&baseCookie=${encodeURIComponent(this.#cookie)}`;
+      ws = token ? new WebSocket(url, [encodeSecProtocol(token)]) : new WebSocket(url);
+    } catch (e) {
       this.#connecting = false;
+      this.#onError?.({ kind: 'connect-failed', message: String(e) });
+      this.#scheduleReconnect();
       return;
     }
-    // clientID rides in the connect URL (Zero-style) so a view-syncer can load
-    // this client's persisted view and, on reconnect to ANY node, resume as a
-    // delta instead of re-sending the whole result. baseCookie is the last cookie
-    // we applied — the server fast-resumes only if it matches the stored version.
-    let url = `${this.#opts.server}/sync/v51/connect?clientID=${encodeURIComponent(this.clientID)}`;
-    if (this.#cookie != null) url += `&baseCookie=${encodeURIComponent(this.#cookie)}`;
-    const ws = token ? new WebSocket(url, [encodeSecProtocol(token)]) : new WebSocket(url);
     this.#ws = ws;
 
     ws.addEventListener('open', () => {

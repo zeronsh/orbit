@@ -141,3 +141,85 @@ fn sqlite_replica_persists_across_reopen() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+// --- Durability: transactions, watermark, fresh-sync phantom clearing --------
+
+fn item_cols() -> Vec<(String, ColumnType)> {
+    vec![("id".to_string(), ColumnType::String), ("n".to_string(), ColumnType::Number)]
+}
+
+/// A multi-table upstream transaction commits atomically; an uncommitted one
+/// (crash before Commit) rolls back on reopen — no torn half-transaction.
+#[test]
+fn durable_transactions_are_atomic_across_tables_and_crashes() {
+    let dir = std::env::temp_dir().join(format!("orbit_sqlite_txn_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    {
+        let mut replica = SqliteReplica::durable(&dir);
+        replica.add_table("a", item_cols(), vec!["id".into()]);
+        replica.add_table("b", item_cols(), vec!["id".into()]);
+
+        // Txn 1: rows in BOTH tables, committed with watermark 10.
+        replica.begin_txn();
+        replica.apply(LogicalEvent::Insert { table: "a".into(), row: row(&[("id", "a1".into()), ("n", 1.0.into())]) });
+        replica.apply(LogicalEvent::Insert { table: "b".into(), row: row(&[("id", "b1".into()), ("n", 1.0.into())]) });
+        replica.commit_txn(10);
+
+        // Txn 2: applied but NEVER committed — the "crash" is dropping the
+        // replica (and its connection) with the transaction open.
+        replica.begin_txn();
+        replica.apply(LogicalEvent::Insert { table: "a".into(), row: row(&[("id", "a2".into()), ("n", 2.0.into())]) });
+        replica.apply(LogicalEvent::Insert { table: "b".into(), row: row(&[("id", "b2".into()), ("n", 2.0.into())]) });
+    }
+
+    // Reopen: txn 1 present in both tables, txn 2 fully rolled back, watermark = 10.
+    let mut replica = SqliteReplica::durable(&dir);
+    let a = replica.add_table("a", item_cols(), vec!["id".into()]);
+    let b = replica.add_table("b", item_cols(), vec!["id".into()]);
+    assert_eq!(replica.resume_watermark(), Some(10), "watermark from the committed txn");
+    let a_rows = a.borrow().all_rows();
+    let b_rows = b.borrow().all_rows();
+    assert_eq!(a_rows.len(), 1, "a: only the committed row survives: {a_rows:?}");
+    assert_eq!(b_rows.len(), 1, "b: only the committed row survives: {b_rows:?}");
+    assert_eq!(a_rows[0]["id"], "a1".into());
+    assert_eq!(b_rows[0]["id"], "b1".into());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `start_fresh` drops rows a previous run persisted (they may have been deleted
+/// upstream while this replica was offline — initial sync only upserts, so
+/// without the clear they'd survive as phantoms) and resets the watermark.
+#[test]
+fn start_fresh_clears_stale_rows_and_watermark() {
+    let dir = std::env::temp_dir().join(format!("orbit_sqlite_fresh_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    {
+        let mut replica = SqliteReplica::durable(&dir);
+        replica.add_table("t", item_cols(), vec!["id".into()]);
+        replica.begin_txn();
+        replica.apply(LogicalEvent::Insert { table: "t".into(), row: row(&[("id", "stale".into()), ("n", 1.0.into())]) });
+        replica.commit_txn(7);
+    }
+
+    // "Restart" that decides on a fresh sync (e.g. watermark policy change):
+    let mut replica = SqliteReplica::durable(&dir);
+    let t = replica.add_table("t", item_cols(), vec!["id".into()]);
+    assert_eq!(replica.resume_watermark(), Some(7));
+    replica.start_fresh();
+    assert_eq!(replica.resume_watermark(), None, "watermark cleared");
+    assert!(t.borrow().all_rows().is_empty(), "stale rows cleared (no phantoms)");
+
+    // Re-seed as initial sync would, then verify only the new state exists.
+    replica.begin_txn();
+    replica.seed("t", row(&[("id", "current".into()), ("n", 2.0.into())]));
+    replica.commit_txn(0);
+    let rows = t.borrow().all_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "current".into());
+    assert_eq!(replica.resume_watermark(), None, "lsn 0 = still no replayable watermark");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

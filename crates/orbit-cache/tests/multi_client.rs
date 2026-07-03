@@ -103,7 +103,7 @@ async fn two_clients_both_receive_pokes() {
                         spawn_local(async move {
                             let ws = tokio_tungstenite::accept_async(sock).await.unwrap();
                             let queries = orbit_cache::QueryRegistry::new();
-                            let _ = serve_client(ws, &*replica, None, &mutators, &queries, &orbit_cache::Forwarder::new(Default::default()), &orbit_cache::AuthContext::default(), vec![], None, None, ticks, &orbit_cache::LmidMap::default()).await;
+                            let _ = serve_client(ws, &*replica, None, &mutators, &queries, &orbit_cache::Forwarder::new(Default::default()), &orbit_cache::AuthContext::default(), vec![], None, None, ticks, &orbit_cache::LmidMap::default(), None).await;
                         });
                     }
                 });

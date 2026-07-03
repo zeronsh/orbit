@@ -151,6 +151,7 @@ async fn lmid_ack_rides_with_own_rows_not_another_clients_tick() {
                                 None,
                                 ticks,
                                 &lmids,
+                                None,
                             )
                             .await;
                         });

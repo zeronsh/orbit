@@ -206,9 +206,20 @@ where
                     Mutation::Crud { args, .. } => {
                         args.iter().flat_map(|a| a.ops.iter().cloned()).collect()
                     }
-                    Mutation::Custom { name, args, .. } => {
-                        mutators.run(name, replica, args).unwrap_or_default()
-                    }
+                    Mutation::Custom { name, args, .. } => match mutators.run(name, replica, args) {
+                        Some(ops) => ops,
+                        None => {
+                            // Consumed (lmid still advances, same as the PG path)
+                            // but LOUD — an unknown mutator is version skew, not a
+                            // no-op.
+                            eprintln!(
+                                "unknown mutator {name:?} from {} (mutation {}) — consumed with no effect",
+                                m.client_id(),
+                                m.id()
+                            );
+                            Vec::new()
+                        }
+                    },
                 };
                 for op in &ops {
                     if let Some((table, change)) = crud_to_change(op, replica) {
@@ -399,6 +410,10 @@ pub async fn serve_client<S, P>(
     // Per-client lastMutationIDs, advanced by the replication apply loop from
     // replicated `orbit_client_mutations` rows (see [`capture_lmid`]).
     lmids: &LmidMap,
+    // The local replica's change-stream position (updated by the apply pump), or
+    // `None` where cross-node staleness can't occur (single-node/tests). Gates
+    // serving a client whose persisted view is AHEAD of this replica.
+    replica_pos: Option<Rc<std::cell::Cell<u64>>>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -423,10 +438,47 @@ where
     let mut resume_prior: Option<ClientView> = None;
     if cvr_on {
         let (pg, cid) = (pg.unwrap(), client_id.as_deref().unwrap());
-        let (view, v) = PgCvrStore::load_client_view(pg, cid).await.unwrap_or_default();
+        let (view, v, stored_pos) = PgCvrStore::load_client_view(pg, cid).await.unwrap_or_default();
+        // Staleness gate: the client's persisted view reflects stream position
+        // `stored_pos` (checkpointed by whichever node served it last). If THIS
+        // node's replica is behind that — freshly restored from an older
+        // snapshot, still catching up — serving now would time-travel the client
+        // backwards (authoritative retractions of rows that still exist). Wait
+        // for the apply pump to catch up first (Zero: "wait for the next
+        // advancement").
+        let mut caught_up = true;
+        if let Some(pos) = &replica_pos {
+            if pos.get() < stored_pos {
+                eprintln!(
+                    "client {cid}: replica at {} but client view at {stored_pos}; waiting for catch-up",
+                    pos.get()
+                );
+                // Bounded wait: same-lineage lag catches up in moments; a stream
+                // whose positions restarted (slot/log recreated) never will —
+                // don't deadlock on it. On timeout the stored pos is treated as
+                // incomparable: NO fast delta (it could suppress rows the client
+                // lacks against a stale replica) — full resync instead, which is
+                // an authoritative replacement and converges via later pokes.
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                while pos.get() < stored_pos {
+                    match tokio::time::timeout_at(deadline, ticks.recv()).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) => anyhow::bail!("tick channel closed while waiting for catch-up"),
+                        Err(_) => {
+                            eprintln!(
+                                "client {cid}: replica still at {} (< {stored_pos}) after wait; forcing full resync",
+                                pos.get()
+                            );
+                            caught_up = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         version = v;
         checkpoint = view.clone();
-        let fast = client_base_cookie == Some(v);
+        let fast = caught_up && client_base_cookie == Some(v);
         resume_prior = Some(if fast { view } else { ClientView::new() });
     }
     let mut last_ckpt = std::time::Instant::now();
@@ -440,7 +492,7 @@ where
     if !initial_queries.is_empty() {
         let resume = resume_prior.take();
         subscribe(initial_queries, provider, queries, forwarder, auth, &mut tx, &mut active, &mut version, &mut base_cookie, &mut row_refs, resume.as_ref()).await?;
-        cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version).await?;
+        cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version, replica_pos.as_ref().map(|p| p.get()).unwrap_or(0)).await?;
     }
 
     loop {
@@ -483,17 +535,46 @@ where
                                         if m.id() <= current_lmid(pg, m.client_id()).await? {
                                             continue; // already processed (re-delivered on reconnect)
                                         }
-                                        match m {
-                                            orbit_protocol::Mutation::Crud { .. } => {
-                                                crate::mutagen::apply_mutation(pg, m).await?;
-                                            }
-                                            orbit_protocol::Mutation::Custom { name, args, .. } => {
-                                                if let Some(ops) = mutators.run(name, provider, args) {
-                                                    for op in &ops {
-                                                        crate::mutagen::apply_crud_op(pg, op).await?;
+                                        // Application errors are CONSUMED per mutation (Zero's
+                                        // model): the lastMutationID still advances and an
+                                        // `error` message tells the client. Killing the socket
+                                        // here would make a permanently-failing mutation a
+                                        // poison pill — the client re-sends it on every
+                                        // reconnect, forever, wedging everything queued
+                                        // behind it. An unknown mutator (version skew) is the
+                                        // same case, made LOUD instead of silently dropped.
+                                        let applied: anyhow::Result<()> = async {
+                                            match m {
+                                                orbit_protocol::Mutation::Crud { .. } => {
+                                                    crate::mutagen::apply_mutation(pg, m).await
+                                                }
+                                                orbit_protocol::Mutation::Custom { name, args, .. } => {
+                                                    match mutators.run(name, provider, args) {
+                                                        Some(ops) => {
+                                                            for op in &ops {
+                                                                crate::mutagen::apply_crud_op(pg, op).await?;
+                                                            }
+                                                            Ok(())
+                                                        }
+                                                        None => Err(anyhow::anyhow!(
+                                                            "unknown mutator {name:?} (client/server version skew?)"
+                                                        )),
                                                     }
                                                 }
                                             }
+                                        }
+                                        .await;
+                                        if let Err(e) = &applied {
+                                            eprintln!(
+                                                "mutation {} from {} failed (consumed): {e:#}",
+                                                m.id(),
+                                                m.client_id()
+                                            );
+                                            send(&mut tx, &Downstream::Error(orbit_protocol::ErrorBody {
+                                                kind: orbit_protocol::ErrorKind::MutationFailed,
+                                                message: format!("mutation {} failed: {e}", m.id()),
+                                            }))
+                                            .await?;
                                         }
                                         advance_lmid(pg, m.client_id(), m.id()).await?;
                                     }
@@ -502,12 +583,12 @@ where
                             Upstream::InitConnection(b) => {
                                 let resume = resume_prior.take();
                                 subscribe(b.desired_queries_patch, provider, queries, forwarder, auth, &mut tx, &mut active, &mut version, &mut base_cookie, &mut row_refs, resume.as_ref()).await?;
-                                cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version).await?;
+                                cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version, replica_pos.as_ref().map(|p| p.get()).unwrap_or(0)).await?;
                             }
                             Upstream::ChangeDesiredQueries(b) => {
                                 let resume = resume_prior.take();
                                 subscribe(b.desired_queries_patch, provider, queries, forwarder, auth, &mut tx, &mut active, &mut version, &mut base_cookie, &mut row_refs, resume.as_ref()).await?;
-                                cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version).await?;
+                                cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version, replica_pos.as_ref().map(|p| p.get()).unwrap_or(0)).await?;
                             }
                         }
                     }
@@ -536,7 +617,7 @@ where
                 // Throttled CVR checkpoint (off the per-mutation hot path) so a
                 // reconnect to another node resumes from a recent view.
                 if cvr_on && last_ckpt.elapsed() >= std::time::Duration::from_secs(1) {
-                    cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version).await?;
+                    cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version, replica_pos.as_ref().map(|p| p.get()).unwrap_or(0)).await?;
                     last_ckpt = std::time::Instant::now();
                 }
             }
@@ -544,7 +625,7 @@ where
     }
     // Persist the final view on a clean disconnect, at the latest cookie — so a
     // reconnect that reports this cookie takes the fast delta path.
-    cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version).await?;
+    cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version, replica_pos.as_ref().map(|p| p.get()).unwrap_or(0)).await?;
     drop(active);
     Ok(())
 }
@@ -557,10 +638,11 @@ async fn cvr_checkpoint(
     checkpoint: &mut ClientView,
     row_refs: &RowRefs,
     version: u64,
+    pos: u64,
 ) -> anyhow::Result<()> {
     if let (Some(pg), Some(cid)) = (pg, client_id.as_deref()) {
         let current = row_refs.view();
-        PgCvrStore::commit_client_view(pg, cid, checkpoint, &current, version).await?;
+        PgCvrStore::commit_client_view(pg, cid, checkpoint, &current, version, pos).await?;
         *checkpoint = current;
     }
     Ok(())
@@ -632,7 +714,21 @@ where
                 poke(tx, version, base_cookie, Some(hash.clone()), None, rows).await?;
                 active.push(ActiveQuery { hash, catch, schema });
             }
-            QueriesPatchOp::Del { hash } => active.retain(|q| q.hash != hash),
+            QueriesPatchOp::Del { hash } => {
+                // Retract the query's rows BEFORE dropping its pipeline: decrement
+                // its refcounts and delete rows no other live query provides.
+                // Silently dropping it would leak the counts — and permanently
+                // suppress future deletes of rows this query shared.
+                let mut dels = RowsPatch::new();
+                for q in active.iter().filter(|q| q.hash == hash) {
+                    let nodes = q.catch.borrow().fetch();
+                    dels.extend(crate::view_sync::retract_patches_dedup(&nodes, &q.schema, row_refs));
+                }
+                if !dels.is_empty() {
+                    poke(tx, version, base_cookie, None, None, dels).await?;
+                }
+                active.retain(|q| q.hash != hash);
+            }
             _ => {}
         }
     }

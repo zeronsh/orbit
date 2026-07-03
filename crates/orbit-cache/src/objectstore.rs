@@ -57,9 +57,27 @@ impl ObjectStore for LocalObjectStore {
         if let Some(p) = path.parent() {
             tokio::fs::create_dir_all(p).await.ok();
         }
-        // Write to a temp file then rename so readers never see a torn snapshot.
-        let tmp = path.with_extension("writing");
-        tokio::fs::write(&tmp, &bytes).await.with_context(|| format!("write {tmp:?}"))?;
+        // Write to a temp file, fsync, then rename: readers never see a torn
+        // snapshot, and a power loss can't rename a not-yet-flushed file into
+        // place (rename is only atomic for data the filesystem has persisted).
+        // Unique tmp name: two writers (deploy overlap — the departing and the
+        // new replicator both snapshot) must not interleave into one tmp file.
+        let unique = format!(
+            "writing.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let tmp = path.with_extension(unique);
+        {
+            let mut f = tokio::fs::File::create(&tmp).await.with_context(|| format!("create {tmp:?}"))?;
+            tokio::io::AsyncWriteExt::write_all(&mut f, &bytes)
+                .await
+                .with_context(|| format!("write {tmp:?}"))?;
+            f.sync_all().await.with_context(|| format!("fsync {tmp:?}"))?;
+        }
         tokio::fs::rename(&tmp, &path).await.with_context(|| format!("rename into {path:?}"))?;
         Ok(())
     }

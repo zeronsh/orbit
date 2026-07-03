@@ -56,7 +56,7 @@ pub struct Take {
     partitions: RefCell<Option<BTreeMap<Vec<Value>, Partition>>>,
     /// Last-emitted top-`limit` window per partition (for diffing).
     windows: RefCell<BTreeMap<Vec<Value>, Vec<Node>>>,
-    output: Option<Link>,
+    output: Option<super::operator::WeakLink>,
 }
 
 impl Take {
@@ -334,10 +334,10 @@ impl Operator for Take {
     }
 
     fn output(&self) -> Option<Link> {
-        self.output.clone()
+        self.output.as_ref().and_then(std::rc::Weak::upgrade)
     }
     fn set_output(&mut self, out: Link) {
-        self.output = Some(out);
+        self.output = Some(Rc::downgrade(&out));
     }
 }
 

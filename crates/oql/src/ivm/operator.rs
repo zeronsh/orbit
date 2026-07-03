@@ -83,6 +83,12 @@ pub trait Operator {
 
 /// A shared, push-target handle to an operator.
 pub type Link = Rc<RefCell<dyn Operator>>;
+/// The DOWNSTREAM (output) form of a [`Link`]: operators store their output as
+/// `Weak` so ownership flows strictly upstream (each operator owns its input).
+/// Dropping a pipeline's terminal (`Catch`) then unravels the whole chain, and
+/// a source's push simply skips (and prunes) connections whose downstream died —
+/// no explicit disconnect API, no leaked pipelines on query churn.
+pub type WeakLink = std::rc::Weak<RefCell<dyn Operator>>;
 /// A shared, fetch handle to an input.
 pub type InputRef = Rc<RefCell<dyn Input>>;
 
