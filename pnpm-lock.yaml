@@ -30,8 +30,8 @@ importers:
         specifier: ^0.5.2
         version: 0.5.2(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(yjs@13.6.31)
       '@zeronsh/orbit':
-        specifier: ^0.3.7
-        version: 0.3.7(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(prettier@3.9.4)(react@19.2.7)(ts-morph@28.0.0)
+        specifier: ^0.3.8
+        version: 0.3.8(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(prettier@3.9.4)(react@19.2.7)(ts-morph@28.0.0)
       better-auth:
         specifier: ^1.6.23
         version: 1.6.23(@tanstack/react-start@1.168.26(esbuild@0.27.7)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(rolldown@1.1.3)(rollup@4.62.2)(vite@8.1.0(@types/node@26.0.1)(esbuild@0.27.7)(jiti@2.7.0)))(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
@@ -1042,8 +1042,8 @@ packages:
       react-dom: ^18 || ^19
       yjs: ^13.6.0
 
-  '@zeronsh/orbit@0.3.7':
-    resolution: {integrity: sha512-/HpuyDf5ZKAJRU8EGs5g0VYq+ltwzv6PPhcHcjLdUtMlxBO1M2DYoujuL7tpaRMPxz9+wPuxsgC56EksfYNiuA==}
+  '@zeronsh/orbit@0.3.8':
+    resolution: {integrity: sha512-ziamH41Z6X05uIp5WJfrBdVcA79KGTs5f0dD9WesN1sq0mpiGrv+y85gHlEHRD3uZaEyYzrCr+IgxHsuo22oyA==}
     hasBin: true
     peerDependencies:
       drizzle-orm: '>=0.36.0'
@@ -3127,7 +3127,7 @@ snapshots:
       react-dom: 19.2.7(react@19.2.7)
       yjs: 13.6.31
 
-  '@zeronsh/orbit@0.3.7(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(prettier@3.9.4)(react@19.2.7)(ts-morph@28.0.0)':
+  '@zeronsh/orbit@0.3.8(drizzle-orm@1.0.0-rc.3(@types/pg@8.20.0)(pg@8.22.0)(zod@4.4.3))(pg@8.22.0)(prettier@3.9.4)(react@19.2.7)(ts-morph@28.0.0)':
     dependencies:
       '@standard-schema/spec': 1.1.0
       commander: 14.0.3
