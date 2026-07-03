@@ -231,6 +231,7 @@ fn shard_main(
                             info.base_cookie,
                             ticks,
                             &lmids,
+                            None, // sharded = single node: no cross-node staleness
                         )
                         .await;
                     }

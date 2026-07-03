@@ -89,7 +89,7 @@ async fn named_query_resolved_server_side() {
                 spawn_local(async move {
                     let (sock, _) = listener.accept().await.unwrap();
                     let ws = tokio_tungstenite::accept_async(sock).await.unwrap();
-                    let _ = serve_client(ws, &*replica, None, &mutators, &queries, &orbit_cache::Forwarder::new(Default::default()), &orbit_cache::AuthContext::default(), vec![], None, None, tick_tx.subscribe(), &orbit_cache::LmidMap::default()).await;
+                    let _ = serve_client(ws, &*replica, None, &mutators, &queries, &orbit_cache::Forwarder::new(Default::default()), &orbit_cache::AuthContext::default(), vec![], None, None, tick_tx.subscribe(), &orbit_cache::LmidMap::default(), None).await;
                 });
             }
 

@@ -92,7 +92,11 @@ impl OverlayChange {
 
 /// A connection (one downstream consumer) of a [`MemorySource`].
 struct Connection {
-    output: Option<Link>,
+    /// Weak: the pipeline owns itself top-down (Catch → … → SourceConnection);
+    /// when a query is dropped the chain unravels and this upgrade fails, at
+    /// which point the push loop prunes the connection. Keeps query churn from
+    /// leaking dead pipelines that would receive every future change forever.
+    output: Option<super::operator::WeakLink>,
     last_pushed_epoch: u64,
     schema: Rc<Schema>,
     /// Precomputed ordering + forward comparator (avoids rebuilding per fetch).
@@ -106,6 +110,8 @@ struct Connection {
     /// iteration order already matches and the adaptive sort is ~O(n), so the
     /// partial-select fast path would be a pessimization.
     order_is_pk_asc: bool,
+    /// Downstream dropped (weak upgrade failed): slot is reusable by `connect`.
+    dead: bool,
 }
 
 /// An in-memory table source.
@@ -467,14 +473,17 @@ pub fn connect(
             Some(sort),
             cmp.clone(),
         ));
-        conn_idx = s.connections.len();
+        // Reuse a pruned (dead-downstream) slot if any — churned queries must
+        // not grow the connection table forever.
+        let dead = s.connections.iter().position(|c| c.dead);
+        conn_idx = dead.unwrap_or(s.connections.len());
         let order_total = s.primary_key.iter().all(|k| order.iter().any(|(f, _)| f == k));
         let order_is_pk_asc = order.len() == s.primary_key.len()
             && order
                 .iter()
                 .zip(s.primary_key.iter())
                 .all(|((f, d), k)| f == k && *d == Direction::Asc);
-        s.connections.push(Connection {
+        let conn = Connection {
             output: None,
             last_pushed_epoch: 0,
             schema,
@@ -482,7 +491,13 @@ pub fn connect(
             cmp,
             order_total,
             order_is_pk_asc,
-        });
+            dead: false,
+        };
+        if dead.is_some() {
+            s.connections[conn_idx] = conn;
+        } else {
+            s.connections.push(conn);
+        }
     }
     Rc::new(RefCell::new(SourceConnection {
         source: Rc::clone(src),
@@ -514,11 +529,23 @@ pub fn source_push(src: &Rc<RefCell<MemorySource>>, change: SourceChange) {
     for i in 0..n {
         let output = {
             let mut s = src.borrow_mut();
+            if s.connections[i].dead {
+                continue;
+            }
             s.connections[i].last_pushed_epoch = epoch;
-            s.connections[i].output.clone()
+            s.connections[i].output.as_ref().and_then(std::rc::Weak::upgrade)
         };
-        if let Some(output) = output {
-            deliver(&output, overlay.to_change());
+        match output {
+            Some(output) => deliver(&output, overlay.to_change()),
+            None => {
+                // Downstream pipeline was dropped (query GC / disconnect):
+                // prune so no future work is spent on it.
+                let mut s = src.borrow_mut();
+                if s.connections[i].output.is_some() {
+                    s.connections[i].output = None;
+                    s.connections[i].dead = true;
+                }
+            }
         }
     }
 
@@ -547,10 +574,13 @@ impl Operator for SourceConnection {
         unreachable!("a source connection never receives a push from upstream")
     }
     fn output(&self) -> Option<Link> {
-        self.source.borrow().connections[self.conn_idx].output.clone()
+        self.source.borrow().connections[self.conn_idx]
+            .output
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade)
     }
     fn set_output(&mut self, out: Link) {
-        self.source.borrow_mut().connections[self.conn_idx].output = Some(out);
+        self.source.borrow_mut().connections[self.conn_idx].output = Some(Rc::downgrade(&out));
     }
 }
 

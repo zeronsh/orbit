@@ -169,7 +169,13 @@ impl RawConn {
             match msg.tag {
                 b'R' => {
                     // Authentication: int32 auth type.
-                    let code = i32::from_be_bytes(msg.body[0..4].try_into().unwrap());
+                    if msg.body.len() < 4 {
+                        bail!("short authentication message");
+                    }
+                    if msg.body.len() < 4 {
+            bail!("short authentication message");
+        }
+        let code = i32::from_be_bytes(msg.body[0..4].try_into().unwrap());
                     match code {
                         0 => {}                  // AuthenticationOk
                         3 => self.send_password_message(password).await?, // cleartext
@@ -276,6 +282,13 @@ impl RawConn {
         let len = i32::from_be_bytes(len_buf) as usize;
         if len < 4 {
             bail!("invalid message length {len}");
+        }
+        // Sanity cap: a corrupted / desynced frame length must fail cleanly, not
+        // attempt a multi-GB allocation. 1 GiB comfortably exceeds any real
+        // logical-replication message (rows are bounded by PG's 1 GB field cap).
+        const MAX_MESSAGE: usize = 1 << 30;
+        if len - 4 > MAX_MESSAGE {
+            bail!("implausible message length {len} (corrupt or desynced stream)");
         }
         let mut body = vec![0u8; len - 4];
         self.stream.read_exact(&mut body).await?;

@@ -22,9 +22,12 @@ use std::rc::Rc;
 
 struct Conn {
     sort: AstOrdering,
-    output: Option<Link>,
+    /// Weak (see the memory source): dead downstream pipelines are pruned by
+    /// the push loop instead of receiving every future change forever.
+    output: Option<oql::ivm::operator::WeakLink>,
     last_pushed_epoch: u64,
     schema: Rc<Schema>,
+    dead: bool,
 }
 
 /// A SQLite-backed source for one table.
@@ -32,7 +35,9 @@ pub struct SqliteSource {
     table: String,
     columns: BTreeMap<String, ColumnType>,
     primary_key: Vec<String>,
-    db: Connection,
+    /// Shared with every other table of the same replica: ONE database, so a
+    /// multi-table upstream transaction commits (or rolls back) atomically.
+    db: Rc<Connection>,
     connections: Vec<Conn>,
     overlay: Option<(u64, SourceChange)>,
     push_epoch: u64,
@@ -55,6 +60,17 @@ impl SqliteSource {
 
     pub fn with_connection(
         db: Connection,
+        table: impl Into<String>,
+        columns: BTreeMap<String, ColumnType>,
+        primary_key: Vec<String>,
+    ) -> Rc<RefCell<SqliteSource>> {
+        Self::with_shared(Rc::new(db), table, columns, primary_key)
+    }
+
+    /// Create a source over a connection shared with other tables of the same
+    /// replica (one database file → atomic multi-table transactions).
+    pub fn with_shared(
+        db: Rc<Connection>,
         table: impl Into<String>,
         columns: BTreeMap<String, ColumnType>,
         primary_key: Vec<String>,
@@ -428,8 +444,17 @@ pub fn connect(src: &Rc<RefCell<SqliteSource>>, sort: AstOrdering) -> Rc<RefCell
     {
         let mut s = src.borrow_mut();
         let schema = s.build_schema(&sort);
-        conn_idx = s.connections.len();
-        s.connections.push(Conn { sort, output: None, last_pushed_epoch: 0, schema });
+        let conn = Conn { sort, output: None, last_pushed_epoch: 0, schema, dead: false };
+        match s.connections.iter().position(|c| c.dead) {
+            Some(i) => {
+                conn_idx = i;
+                s.connections[i] = conn;
+            }
+            None => {
+                conn_idx = s.connections.len();
+                s.connections.push(conn);
+            }
+        }
     }
     Rc::new(RefCell::new(SqliteConnection { source: Rc::clone(src), conn_idx }))
 }
@@ -447,11 +472,21 @@ pub fn source_push(src: &Rc<RefCell<SqliteSource>>, change: SourceChange) {
     for i in 0..n {
         let output = {
             let mut s = src.borrow_mut();
+            if s.connections[i].dead {
+                continue;
+            }
             s.connections[i].last_pushed_epoch = epoch;
-            s.connections[i].output.clone()
+            s.connections[i].output.as_ref().and_then(std::rc::Weak::upgrade)
         };
-        if let Some(output) = output {
-            deliver(&output, base_change(&change));
+        match output {
+            Some(output) => deliver(&output, base_change(&change)),
+            None => {
+                let mut s = src.borrow_mut();
+                if s.connections[i].output.is_some() {
+                    s.connections[i].output = None;
+                    s.connections[i].dead = true;
+                }
+            }
         }
     }
     let mut s = src.borrow_mut();
@@ -490,10 +525,13 @@ impl Operator for SqliteConnection {
         unreachable!("a source connection never receives a push from upstream")
     }
     fn output(&self) -> Option<Link> {
-        self.source.borrow().connections[self.conn_idx].output.clone()
+        self.source.borrow().connections[self.conn_idx]
+            .output
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade)
     }
     fn set_output(&mut self, out: Link) {
-        self.source.borrow_mut().connections[self.conn_idx].output = Some(out);
+        self.source.borrow_mut().connections[self.conn_idx].output = Some(Rc::downgrade(&out));
     }
 }
 
@@ -526,23 +564,48 @@ impl SourceProvider for SqliteProvider {
 }
 
 /// A SQLite-backed replica: a [`ReplicaBackend`](crate::replica::ReplicaBackend)
-/// holding a [`SqliteSource`] per table. Pass a directory to make it durable.
-#[derive(Default)]
+/// holding a [`SqliteSource`] per table — **all tables in ONE database** (a
+/// single file for [`durable`](Self::durable)), so an upstream transaction
+/// spanning tables commits atomically and the replication watermark lives in
+/// the same database as the rows it describes.
 pub struct SqliteReplica {
     sources: std::collections::HashMap<String, Rc<RefCell<SqliteSource>>>,
     columns: std::collections::HashMap<String, Vec<(String, ColumnType)>>,
-    dir: Option<std::path::PathBuf>,
+    conn: Rc<Connection>,
 }
 
 impl SqliteReplica {
-    /// An in-memory replica (each table in its own in-memory database).
+    /// An in-memory replica (all tables in one in-memory database).
     pub fn in_memory() -> Self {
-        SqliteReplica::default()
+        Self::with_connection(Connection::open_in_memory().expect("open sqlite"))
     }
 
-    /// A durable replica storing each table at `dir/<table>.db`.
+    /// A durable replica: one database file at `dir/replica.db`.
     pub fn durable(dir: impl Into<std::path::PathBuf>) -> Self {
-        SqliteReplica { dir: Some(dir.into()), ..Default::default() }
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir).ok();
+        Self::with_connection(Connection::open(dir.join("replica.db")).expect("open sqlite file"))
+    }
+
+    fn with_connection(conn: Connection) -> Self {
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        conn.set_prepared_statement_cache_capacity(128);
+        // The replication watermark: the commit LSN of the last upstream
+        // transaction fully applied to THIS database, written inside that same
+        // transaction (see `commit_txn`) so it can never disagree with the rows.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS orbit_replication_state (
+                 id  INTEGER PRIMARY KEY CHECK (id = 1),
+                 lsn INTEGER NOT NULL
+             )",
+        )
+        .expect("create replication state table");
+        SqliteReplica {
+            sources: std::collections::HashMap::new(),
+            columns: std::collections::HashMap::new(),
+            conn: Rc::new(conn),
+        }
     }
 
     pub fn add_table(
@@ -551,15 +614,8 @@ impl SqliteReplica {
         columns: Vec<(String, ColumnType)>,
         primary_key: Vec<String>,
     ) -> Rc<RefCell<SqliteSource>> {
-        let conn = match &self.dir {
-            Some(dir) => {
-                std::fs::create_dir_all(dir).ok();
-                Connection::open(dir.join(format!("{name}.db"))).expect("open sqlite file")
-            }
-            None => Connection::open_in_memory().expect("open sqlite"),
-        };
         let col_map: BTreeMap<String, ColumnType> = columns.iter().cloned().collect();
-        let src = SqliteSource::with_connection(conn, name, col_map, primary_key);
+        let src = SqliteSource::with_shared(Rc::clone(&self.conn), name, col_map, primary_key);
         self.columns.insert(name.to_string(), columns);
         self.sources.insert(name.to_string(), Rc::clone(&src));
         src
@@ -629,6 +685,48 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
             .iter()
             .map(|(name, src)| (name.clone(), src.borrow().all_rows()))
             .collect()
+    }
+
+    fn begin_txn(&self) {
+        // One SQLite transaction per upstream transaction: a crash mid-apply
+        // rolls back on reopen instead of persisting a torn half-transaction.
+        let _ = self.conn.execute_batch("BEGIN IMMEDIATE");
+    }
+
+    fn commit_txn(&self, lsn: u64) {
+        // The watermark commits atomically WITH the rows it describes.
+        let _ = self
+            .conn
+            .prepare_cached(
+                "INSERT INTO orbit_replication_state (id, lsn) VALUES (1, ?1)
+                 ON CONFLICT (id) DO UPDATE SET lsn = excluded.lsn",
+            )
+            .and_then(|mut st| st.execute([lsn as i64]));
+        let _ = self.conn.execute_batch("COMMIT");
+    }
+
+    fn resume_watermark(&self) -> Option<u64> {
+        self.conn
+            .query_row("SELECT lsn FROM orbit_replication_state WHERE id = 1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .ok()
+            .filter(|l| *l > 0)
+            .map(|l| l as u64)
+    }
+
+    fn start_fresh(&self) {
+        // Atomically drop everything stale before a fresh initial sync: the
+        // sync only upserts, so rows deleted upstream while this replica was
+        // offline would otherwise survive as phantoms.
+        let _ = self.conn.execute_batch("BEGIN IMMEDIATE");
+        for src in self.sources.values() {
+            let table = src.borrow().table_name().to_string();
+            let sql = format!("DELETE FROM \"{}\"", table.replace('"', "\"\""));
+            let _ = self.conn.execute_batch(&sql);
+        }
+        let _ = self.conn.execute_batch("DELETE FROM orbit_replication_state");
+        let _ = self.conn.execute_batch("COMMIT");
     }
 }
 

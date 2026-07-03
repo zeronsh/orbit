@@ -26,6 +26,28 @@ pub trait ReplicaBackend: oql::SourceProvider {
     /// All rows of every table — for snapshotting the replica to object storage
     /// (view-syncer nodes restore from this instead of re-syncing from Postgres).
     fn snapshot(&self) -> Vec<(String, Vec<oql::value::Row>)>;
+
+    // --- Durability hooks (no-ops for the in-memory replica) ---------------
+
+    /// Start of a replication transaction: a durable backend opens a storage
+    /// transaction so the whole upstream transaction commits atomically (a
+    /// crash mid-transaction rolls back instead of persisting a torn half).
+    fn begin_txn(&self) {}
+    /// End of a replication transaction with its commit LSN. A durable backend
+    /// records `lsn` as its resume watermark **inside** the same storage
+    /// transaction, then commits — so the watermark can never disagree with the
+    /// data it describes.
+    fn commit_txn(&self, _lsn: u64) {}
+    /// The durably-recorded resume point from a previous run, if any. `Some`
+    /// lets the server skip the full initial sync and resume from the slot.
+    fn resume_watermark(&self) -> Option<u64> {
+        None
+    }
+    /// Reset all replicated data before a fresh initial sync. A durable backend
+    /// must drop stale rows here — initial sync only upserts, so rows deleted
+    /// upstream while the server was offline would otherwise survive as
+    /// phantoms.
+    fn start_fresh(&self) {}
 }
 
 /// A registry of replicated tables.

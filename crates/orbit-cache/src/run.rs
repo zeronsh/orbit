@@ -179,7 +179,12 @@ async fn run_sharded_inner(cfg: ServerConfig, num_shards: usize) -> Result<()> {
             };
             loop {
                 match stream.next_event().await {
-                    Ok((_lsn, ev)) => server.broadcast_event(ev),
+                    Ok((lsn, ev)) => {
+                        server.broadcast_event(ev);
+                        // In-memory shards re-initial-sync on boot, so WAL needs no
+                        // durable-replay guarantee: confirm on receipt.
+                        stream.confirm(lsn);
+                    }
                     Err(e) => {
                         // Crash-only (same policy as the view-syncer's Reset): an
                         // in-process reconnect could double-apply re-delivered WAL
@@ -255,11 +260,28 @@ async fn run_inner<B: ReplicaBackend + 'static>(
         .context("creating logical replication slot — is the server started with wal_level=logical?")?;
 
     let replica = Rc::new(backend);
-    for t in &cfg.tables {
-        let n = initial_sync_backend(&pg, replica.as_ref(), &t.name)
-            .await
-            .with_context(|| format!("initial sync of table {}", t.name))?;
-        eprintln!("initial sync: {} rows from {}", n, t.name);
+    // A durable backend that recorded a watermark resumes from the slot instead
+    // of re-syncing; a fresh sync first CLEARS the backend (initial sync only
+    // upserts, so rows deleted upstream while offline would otherwise survive
+    // as phantoms in a durable replica).
+    let resume_watermark = replica.resume_watermark();
+    match resume_watermark {
+        Some(w) => eprintln!("durable replica: resuming from watermark {w} (skipping initial sync)"),
+        None => {
+            replica.start_fresh();
+            // One storage transaction around the whole sync: a crash mid-sync
+            // rolls back to empty-with-no-watermark (→ clean redo), and a
+            // durable backend commits once instead of once per row. The
+            // watermark stays unset (lsn 0) until the first replicated commit.
+            replica.begin_txn();
+            for t in &cfg.tables {
+                let n = initial_sync_backend(&pg, replica.as_ref(), &t.name)
+                    .await
+                    .with_context(|| format!("initial sync of table {}", t.name))?;
+                eprintln!("initial sync: {} rows from {}", n, t.name);
+            }
+            replica.commit_txn(0);
+        }
     }
     let mutators = Rc::new(mutators);
     let queries = Rc::new(queries);
@@ -269,7 +291,18 @@ async fn run_inner<B: ReplicaBackend + 'static>(
 
     // Replication pump: apply each change once, then notify all clients.
     // Per-client lastMutationIDs, advanced from replicated `orbit_client_mutations`.
+    // Seeded from Postgres at boot so mutations processed before a restart can
+    // still be acked to reconnecting clients (the stream only carries NEW ones).
     let lmids: crate::server::LmidMap = Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+    {
+        let sql = format!("SELECT client_id, last_mutation_id FROM {}", crate::pg::LMID_TABLE);
+        if let Ok(rows) = pg.query(&sql, &[]).await {
+            let mut m = lmids.borrow_mut();
+            for r in rows {
+                m.insert(r.get::<_, String>(0), r.get::<_, i64>(1) as u64);
+            }
+        }
+    }
     {
         let replica = replica.clone();
         let ticks_tx = ticks_tx.clone();
@@ -285,27 +318,44 @@ async fn run_inner<B: ReplicaBackend + 'static>(
                     return;
                 }
             };
-            // Apply every change in a transaction, but poke subscribers once at
-            // Commit so a multi-statement transaction is delivered atomically.
-            let mut dirty = false;
+            // Buffer each upstream transaction and apply it atomically at its
+            // Commit: the backend wraps it in a storage transaction (durable
+            // backends record the commit LSN as their watermark inside it), the
+            // tick fires once per transaction, and — on a durable resume — whole
+            // transactions at or below the watermark are skipped instead of
+            // being re-applied over newer state. WAL is acknowledged only up to
+            // the last durably-committed transaction.
+            let mut dedup_lsn: u64 = resume_watermark.unwrap_or(0);
+            let mut txn_buf: Vec<LogicalEvent> = Vec::new();
             loop {
                 match stream.next_event().await {
-                    Ok((_lsn, ev)) => {
-                        let is_data = matches!(
-                            ev,
-                            LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
-                        );
-                        let is_commit = matches!(ev, LogicalEvent::Commit);
-                        crate::server::capture_lmid(&ev, &lmids);
-                        replica.apply(ev);
-                        if is_data {
-                            dirty = true;
+                    Ok((lsn, LogicalEvent::Commit)) => {
+                        if lsn > dedup_lsn {
+                            replica.begin_txn();
+                            let mut dirty = false;
+                            for ev in txn_buf.drain(..) {
+                                if matches!(
+                                    ev,
+                                    LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
+                                ) {
+                                    dirty = true;
+                                }
+                                crate::server::capture_lmid(&ev, &lmids);
+                                replica.apply(ev);
+                            }
+                            replica.apply(LogicalEvent::Commit);
+                            replica.commit_txn(lsn);
+                            dedup_lsn = lsn;
+                            if dirty {
+                                let _ = ticks_tx.send(());
+                            }
+                        } else {
+                            txn_buf.clear(); // re-delivered (already durable): skip whole txn
                         }
-                        if is_commit && dirty {
-                            let _ = ticks_tx.send(());
-                            dirty = false;
-                        }
+                        stream.confirm(dedup_lsn);
                     }
+                    Ok((_lsn, LogicalEvent::Begin)) => txn_buf.clear(),
+                    Ok((_lsn, ev)) => txn_buf.push(ev),
                     Err(e) => {
                         // Crash-only (same policy as the view-syncer's Reset): see
                         // run_sharded_inner — reconnecting in-process risks
@@ -323,7 +373,7 @@ async fn run_inner<B: ReplicaBackend + 'static>(
     // Accept loop.
     let listener = TcpListener::bind(&cfg.listen_addr).await?;
     eprintln!("orbit-server listening on {}", cfg.listen_addr);
-    accept_ws_clients(listener, replica, pg, mutators, queries, forwarder, ticks_tx, lmids).await
+    accept_ws_clients(listener, replica, pg, mutators, queries, forwarder, ticks_tx, lmids, None).await
 }
 
 /// Accept WebSocket clients and serve each over the shared `replica`, flushing on
@@ -338,6 +388,7 @@ async fn accept_ws_clients<B: ReplicaBackend + 'static>(
     forwarder: Rc<crate::forward::Forwarder>,
     ticks_tx: broadcast::Sender<()>,
     lmids: crate::server::LmidMap,
+    replica_pos: Option<Rc<std::cell::Cell<u64>>>,
 ) -> Result<()> {
     loop {
         let (sock, _) = listener.accept().await?;
@@ -348,6 +399,7 @@ async fn accept_ws_clients<B: ReplicaBackend + 'static>(
         let forwarder = forwarder.clone();
         let ticks = ticks_tx.subscribe();
         let lmids = lmids.clone();
+        let replica_pos = replica_pos.clone();
         spawn_local(async move {
             match crate::handshake::accept_zero_ws(sock).await {
                 Ok((ws, info)) => {
@@ -365,6 +417,7 @@ async fn accept_ws_clients<B: ReplicaBackend + 'static>(
                         info.base_cookie,
                         ticks,
                         &lmids,
+                        replica_pos,
                     )
                     .await
                     {
@@ -589,6 +642,16 @@ async fn run_replicator_inner<O: ObjectStore + 'static>(
                     } else {
                         txn_buf.clear(); // already logged (re-delivered) → skip the txn
                     }
+                    // Ack only durably-logged WAL: with a durable log, the
+                    // writer's flushed watermark; without one (ring-only mode,
+                    // where any gap already forces a snapshot Reset), the
+                    // applied position. A crash between receipt and flush then
+                    // replays from the slot instead of leaving a silent hole
+                    // that delta-resuming view-syncers would skip over.
+                    match &log {
+                        Some(l) => stream.confirm(l.durable_lsn()),
+                        None => stream.confirm(dedup_lsn),
+                    }
                 }
                 Ok((lsn, ev)) => txn_buf.push((lsn, ev)),
                 Err(e) => {
@@ -646,6 +709,25 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
     // Per-client lastMutationIDs, advanced from replicated `orbit_client_mutations`
     // events forwarded through the change-stream.
     let lmids: crate::server::LmidMap = Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+    // This node's applied change-stream position — the staleness gate compares it
+    // to each connecting client's persisted view position.
+    let replica_pos: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(watermark));
+
+    // CVR GC: ephemeral clients (each non-persisted tab gets a random clientID)
+    // leave their materialized views in Postgres forever without a sweep.
+    {
+        let gc_pg = Rc::clone(&pg);
+        spawn_local(async move {
+            loop {
+                match crate::cvr::PgCvrStore::gc_stale_clients(&gc_pg, 7).await {
+                    Ok(n) if n > 0 => eprintln!("cvr gc: swept {n} stale client rows"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("cvr gc failed (retrying next cycle): {e:#}"),
+                }
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+    }
 
     // Change-stream pump: apply remote changes to the local replica + tick.
     {
@@ -653,8 +735,15 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
         let ticks_tx = ticks_tx.clone();
         let lmids = lmids.clone();
         let addr = change_stream_addr.clone();
+        let replica_pos = replica_pos.clone();
         spawn_local(async move {
             let mut watermark = watermark;
+            replica_pos.set(watermark);
+            // Consecutive read failures at the SAME watermark: a deterministic
+            // decode error (e.g. serde skew during a rolling upgrade) would
+            // otherwise reconnect-loop forever at a frozen watermark while the
+            // WS server serves ever-staler data. Crash-only after a few tries.
+            let mut stuck_failures = 0u32;
             loop {
                 let mut client = match ChangeStreamClient::connect(&addr, watermark).await {
                     Ok(c) => c,
@@ -664,22 +753,38 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
                         continue;
                     }
                 };
+                let reconnect_watermark = watermark;
                 let mut dirty = false;
+                // Buffer each transaction and apply it in one synchronous slice
+                // (no awaits between events): a concurrent `subscribe` hydration
+                // on this LocalSet can then never read a torn mid-transaction
+                // state that existed in no Postgres snapshot.
+                let mut txn_buf: Vec<(u64, LogicalEvent)> = Vec::new();
                 loop {
                     match client.next().await {
                         Ok(Some(ChangeMsg::Change { pos, event })) => {
-                            let is_data = matches!(
-                                event,
-                                LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
-                            );
-                            let is_commit = matches!(event, LogicalEvent::Commit);
-                            crate::server::capture_lmid(&event, &lmids);
-                            replica.apply(event);
-                            watermark = pos;
-                            if is_data {
-                                dirty = true;
+                            if matches!(event, LogicalEvent::Begin) {
+                                txn_buf.clear();
                             }
-                            if is_commit && dirty {
+                            let is_commit = matches!(event, LogicalEvent::Commit);
+                            txn_buf.push((pos, event));
+                            if !is_commit {
+                                continue;
+                            }
+                            for (p, ev) in txn_buf.drain(..) {
+                                if matches!(
+                                    ev,
+                                    LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
+                                ) {
+                                    dirty = true;
+                                }
+                                crate::server::capture_lmid(&ev, &lmids);
+                                replica.apply(ev);
+                                watermark = p;
+                            }
+                            replica_pos.set(watermark);
+                            stuck_failures = 0;
+                            if dirty {
                                 let _ = ticks_tx.send(());
                                 dirty = false;
                             }
@@ -696,6 +801,16 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
                         }
                         Ok(None) => break, // disconnected — reconnect from watermark
                         Err(e) => {
+                            if watermark == reconnect_watermark {
+                                stuck_failures += 1;
+                                if stuck_failures >= 5 {
+                                    eprintln!("change-stream read failed {stuck_failures}x at watermark {watermark} ({e:#}); exiting to re-restore snapshot");
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    std::process::exit(1);
+                                }
+                            } else {
+                                stuck_failures = 0;
+                            }
                             eprintln!("change-stream read error: {e:#}; reconnecting");
                             break;
                         }
@@ -708,5 +823,5 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
 
     let listener = TcpListener::bind(&cfg.listen_addr).await?;
     eprintln!("view-syncer listening on {}", cfg.listen_addr);
-    accept_ws_clients(listener, replica, pg, mutators, queries, forwarder, ticks_tx, lmids).await
+    accept_ws_clients(listener, replica, pg, mutators, queries, forwarder, ticks_tx, lmids, Some(replica_pos)).await
 }

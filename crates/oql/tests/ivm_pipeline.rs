@@ -224,3 +224,50 @@ fn take_limits_and_maintains_window_on_push() {
     assert!(changes.iter().any(|c| matches!(c, Change::Add(n) if n.row["id"] == "b".into())));
     assert_eq!(ids(&catch.borrow().fetch()), vec!["aa".into(), "b".into()]);
 }
+
+/// Dropping a pipeline's terminal must unravel the whole chain and stop the
+/// source from pushing into it: outputs are weak links, so a dropped query
+/// can't leak its operators or receive future changes (the pre-fix behavior
+/// grew CPU + memory with every churned query, forever).
+#[test]
+fn dropped_pipeline_is_pruned_from_the_source() {
+    use oql::ivm::{connect, source_push, Catch, ColumnType, Filter, MemorySource, Predicate, SourceChange};
+    use oql::ivm::operator::{Link, OpHandle};
+    use oql::value::Value;
+    use std::rc::Rc;
+
+    let mut cols = std::collections::BTreeMap::new();
+    cols.insert("id".to_string(), ColumnType::Number);
+    let src = MemorySource::new("t", cols, vec!["id".into()]);
+
+    // Build a query pipeline, then DROP it (query GC / view destroy).
+    let weak_catch;
+    {
+        let conn = OpHandle::new(connect(&src, vec![("id".to_string(), oql::ast::Direction::Asc)]));
+        let pred: Predicate = Rc::new(|_| true);
+        let fh = OpHandle::new(Filter::new(conn, pred));
+        let catch = Catch::new(fh.input.clone());
+        let link: Link = catch.clone();
+        fh.set_output(link);
+        catch.borrow().fetch();
+        weak_catch = Rc::downgrade(&catch);
+    } // catch dropped here
+
+    assert!(weak_catch.upgrade().is_none(), "dropping the terminal frees the chain (no Rc cycle)");
+
+    // Pushes after the drop must not panic and must not resurrect anything.
+    let row: oql::value::Row = [("id".to_string(), Value::from(1.0))].into_iter().collect();
+    source_push(&src, SourceChange::Add(row));
+
+    // A NEW pipeline still works (and reuses the pruned slot).
+    let conn = OpHandle::new(connect(&src, vec![("id".to_string(), oql::ast::Direction::Asc)]));
+    let pred: Predicate = Rc::new(|_| true);
+    let fh = OpHandle::new(Filter::new(conn, pred));
+    let catch = Catch::new(fh.input.clone());
+    let link: Link = catch.clone();
+    fh.set_output(link);
+    assert_eq!(catch.borrow().fetch().len(), 1);
+    let row2: oql::value::Row = [("id".to_string(), Value::from(2.0))].into_iter().collect();
+    source_push(&src, SourceChange::Add(row2));
+    assert_eq!(catch.borrow().fetch().len(), 2, "new pipeline receives pushes");
+}

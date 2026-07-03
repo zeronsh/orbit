@@ -65,7 +65,11 @@ struct QueryResponse {
 
 impl Forwarder {
     pub fn new(config: ForwardConfig) -> Self {
-        Forwarder { config, http: reqwest::Client::new() }
+        Forwarder { config, http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .expect("build http client") }
     }
 
     pub fn forwards_mutations(&self) -> bool {

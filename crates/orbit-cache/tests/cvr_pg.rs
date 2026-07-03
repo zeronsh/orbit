@@ -68,9 +68,9 @@ async fn commit_client_view_upsert_delete_and_version_are_atomic() {
     let mut v1: HashMap<(String, String), String> = HashMap::new();
     v1.insert(("todo".into(), "a".into()), "{\"id\":\"a\"}".into());
     v1.insert(("todo".into(), "b".into()), "{\"id\":\"b\"}".into());
-    PgCvrStore::commit_client_view(&c, &cid, &empty, &v1, 5).await.unwrap();
+    PgCvrStore::commit_client_view(&c, &cid, &empty, &v1, 5, 100).await.unwrap();
 
-    let (loaded, ver) = PgCvrStore::load_client_view(&c, &cid).await.unwrap();
+    let (loaded, ver, _pos) = PgCvrStore::load_client_view(&c, &cid).await.unwrap();
     assert_eq!(ver, 5);
     assert_eq!(loaded, v1, "both rows persisted, carrying their version");
 
@@ -78,15 +78,15 @@ async fn commit_client_view_upsert_delete_and_version_are_atomic() {
     let mut v2: HashMap<(String, String), String> = HashMap::new();
     v2.insert(("todo".into(), "a".into()), "{\"id\":\"a\",\"n\":1}".into());
     v2.insert(("todo".into(), "c".into()), "{\"id\":\"c\"}".into());
-    PgCvrStore::commit_client_view(&c, &cid, &v1, &v2, 7).await.unwrap();
+    PgCvrStore::commit_client_view(&c, &cid, &v1, &v2, 7, 200).await.unwrap();
 
-    let (loaded, ver) = PgCvrStore::load_client_view(&c, &cid).await.unwrap();
+    let (loaded, ver, _pos) = PgCvrStore::load_client_view(&c, &cid).await.unwrap();
     assert_eq!(ver, 7);
     assert_eq!(loaded, v2, "upsert + delete + version all applied together; no stale `b`");
 
     // A no-op commit (prior == current) still records the version and drops nothing.
-    PgCvrStore::commit_client_view(&c, &cid, &v2, &v2, 9).await.unwrap();
-    let (loaded, ver) = PgCvrStore::load_client_view(&c, &cid).await.unwrap();
+    PgCvrStore::commit_client_view(&c, &cid, &v2, &v2, 9, 300).await.unwrap();
+    let (loaded, ver, _pos) = PgCvrStore::load_client_view(&c, &cid).await.unwrap();
     assert_eq!(ver, 9);
     assert_eq!(loaded, v2);
 

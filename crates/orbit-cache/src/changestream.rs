@@ -160,18 +160,26 @@ impl ChangeStreamServer {
         // view-syncer resumes by *delta* instead of re-restoring the whole replica.
         // Any hole / pruned-past / too-far-behind falls through to a Reset.
         if resume < floor {
-            const MAX_CATCHUP: i64 = 200_000;
+            // Paginated: bridge any gap the log retains (up to LOG_RETENTION),
+            // not just one page — a syncer 200K+ behind used to Reset even
+            // though its delta was durably available.
+            const PAGE: i64 = 50_000;
             if let Some(log) = self.log.as_ref() {
-                let (_min, events) = log.read_after(resume, MAX_CATCHUP).await?;
-                for (pos, event) in events {
-                    if pos > floor {
-                        break; // the ring backlog takes over from here
+                'bridge: while last < floor {
+                    let (_min, events) = log.read_after(last, PAGE).await?;
+                    if events.is_empty() {
+                        break; // nothing more in the log → Reset check below
                     }
-                    if pos != last + 1 {
-                        break; // hole in the log → fall through to Reset
+                    for (pos, event) in events {
+                        if pos > floor {
+                            break 'bridge; // the ring backlog takes over from here
+                        }
+                        if pos != last + 1 {
+                            break 'bridge; // hole / unreadable entry → Reset
+                        }
+                        send(&mut w, &ChangeMsg::Change { pos, event }).await?;
+                        last = pos;
                     }
-                    send(&mut w, &ChangeMsg::Change { pos, event }).await?;
-                    last = pos;
                 }
             }
             if last < floor {

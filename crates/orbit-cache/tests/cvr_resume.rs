@@ -162,7 +162,8 @@ async fn reconnect_to_other_node_resumes_as_delta() {
              CREATE TABLE cvr_item (id text PRIMARY KEY, n int);
              ALTER TABLE cvr_item REPLICA IDENTITY FULL;
              INSERT INTO cvr_item VALUES ('i1', 1), ('i2', 2);
-             DELETE FROM orbit_cvr_client_rows WHERE client_id = 'c1';",
+             DELETE FROM orbit_cvr_client_rows WHERE client_id = 'c1';
+             DELETE FROM orbit_cvr_clients WHERE client_id = 'c1';",
         ))
         .await
         .unwrap();

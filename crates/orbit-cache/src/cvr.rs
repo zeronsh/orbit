@@ -133,8 +133,12 @@ impl PgCvrStore {
                  );
                  CREATE TABLE IF NOT EXISTS orbit_cvr_clients (
                      client_id text PRIMARY KEY,
-                     version bigint NOT NULL
-                 );",
+                     version bigint NOT NULL,
+                     pos bigint NOT NULL DEFAULT 0,
+                     last_seen timestamptz NOT NULL DEFAULT now()
+                 );
+                 ALTER TABLE orbit_cvr_clients ADD COLUMN IF NOT EXISTS pos bigint NOT NULL DEFAULT 0;
+                 ALTER TABLE orbit_cvr_clients ADD COLUMN IF NOT EXISTS last_seen timestamptz NOT NULL DEFAULT now();",
             )
             .await?;
         Ok(())
@@ -147,23 +151,35 @@ impl PgCvrStore {
     pub async fn load_client_view(
         client: &tokio_postgres::Client,
         client_id: &str,
-    ) -> anyhow::Result<(ClientView, u64)> {
+    ) -> anyhow::Result<(ClientView, u64, u64)> {
+        // ONE statement (a single Postgres snapshot): reading rows and version
+        // separately could pair one writer's rows with another's version under a
+        // concurrent checkpoint (e.g. a zombie connection on another node) — the
+        // fast delta path would then suppress rows the client doesn't hold.
         let rows = client
             .query(
-                "SELECT table_name, row_id, row_val FROM orbit_cvr_client_rows WHERE client_id = $1",
+                "SELECT c.version, c.pos, r.table_name, r.row_id, r.row_val
+                 FROM orbit_cvr_clients c
+                 LEFT JOIN orbit_cvr_client_rows r ON r.client_id = c.client_id
+                 WHERE c.client_id = $1",
                 &[&client_id],
             )
             .await?;
-        let view = rows
-            .iter()
-            .map(|r| ((r.get::<_, String>(0), r.get::<_, String>(1)), r.get::<_, String>(2)))
-            .collect();
-        let version = client
-            .query_opt("SELECT version FROM orbit_cvr_clients WHERE client_id = $1", &[&client_id])
-            .await?
-            .map(|r| r.get::<_, i64>(0) as u64)
-            .unwrap_or(0);
-        Ok((view, version))
+        let mut view = ClientView::new();
+        let mut version = 0u64;
+        let mut pos = 0u64;
+        for r in &rows {
+            version = r.get::<_, i64>(0) as u64;
+            pos = r.get::<_, i64>(1) as u64;
+            if let (Some(t), Some(id), Some(val)) = (
+                r.get::<_, Option<String>>(2),
+                r.get::<_, Option<String>>(3),
+                r.get::<_, Option<String>>(4),
+            ) {
+                view.insert((t, id), val);
+            }
+        }
+        Ok((view, version, pos))
     }
 
     /// Persist a client's view as the delta from `prior` to `current` (upsert new/
@@ -177,6 +193,7 @@ impl PgCvrStore {
         prior: &ClientView,
         current: &ClientView,
         version: u64,
+        pos: u64,
     ) -> anyhow::Result<()> {
         // The row delta (changed/new rows to upsert, dropped rows to delete) and the
         // version write must land atomically: a reconnect that reports `version` as
@@ -224,8 +241,10 @@ impl PgCvrStore {
                      USING UNNEST($5::text[], $6::text[]) AS d(t, i)
                      WHERE r.client_id = $1 AND r.table_name = d.t AND r.row_id = d.i
                  )
-                 INSERT INTO orbit_cvr_clients (client_id, version) VALUES ($1, $7)
-                 ON CONFLICT (client_id) DO UPDATE SET version = EXCLUDED.version",
+                 INSERT INTO orbit_cvr_clients (client_id, version, pos, last_seen)
+                 VALUES ($1, $7, $8, now())
+                 ON CONFLICT (client_id) DO UPDATE
+                 SET version = EXCLUDED.version, pos = EXCLUDED.pos, last_seen = now()",
                 &[
                     &client_id,
                     &up_tables,
@@ -234,10 +253,34 @@ impl PgCvrStore {
                     &del_tables,
                     &del_ids,
                     &(version as i64),
+                    &(pos as i64),
                 ],
             )
             .await?;
         Ok(())
+    }
+
+    /// Drop CVRs of clients not seen for `max_age_days` (ephemeral tabs get a
+    /// random clientID each session, so without GC their materialized views
+    /// accumulate in Postgres forever). A swept client that does return simply
+    /// full-resyncs. One statement (CTE) so rows and client entries go together.
+    pub async fn gc_stale_clients(
+        client: &tokio_postgres::Client,
+        max_age_days: i32,
+    ) -> anyhow::Result<u64> {
+        let n = client
+            .execute(
+                "WITH stale AS (
+                     DELETE FROM orbit_cvr_clients
+                     WHERE last_seen < now() - make_interval(days => $1)
+                     RETURNING client_id
+                 )
+                 DELETE FROM orbit_cvr_client_rows r USING stale s
+                 WHERE r.client_id = s.client_id",
+                &[&max_age_days],
+            )
+            .await?;
+        Ok(n)
     }
 
     /// Record a processed mutation. Returns false (and writes nothing) if it was

@@ -19,7 +19,7 @@ pub type Predicate = Rc<dyn Fn(&Row) -> bool>;
 pub struct Filter {
     input: Rc<RefCell<dyn Input>>,
     predicate: Predicate,
-    output: Option<Link>,
+    output: Option<super::operator::WeakLink>,
 }
 
 impl Filter {
@@ -53,10 +53,10 @@ impl Operator for Filter {
         filter_push(change, &self.predicate)
     }
     fn output(&self) -> Option<Link> {
-        self.output.clone()
+        self.output.as_ref().and_then(std::rc::Weak::upgrade)
     }
     fn set_output(&mut self, out: Link) {
-        self.output = Some(out);
+        self.output = Some(Rc::downgrade(&out));
     }
 }
 

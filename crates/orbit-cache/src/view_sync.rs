@@ -149,6 +149,19 @@ pub fn resume_deletes(prior: &ClientView, refs: &RowRefs) -> RowsPatch {
         .collect()
 }
 
+/// Retraction patches for an entire query being dropped: decrement every row it
+/// contributed and emit `del`s for rows no other live query still provides.
+/// Without this, removing a query (TTL GC, view destroy) leaks its refcounts —
+/// and a later genuine upstream DELETE of a shared row decrements to a nonzero
+/// count and never reaches the client (a phantom row until full resync).
+pub fn retract_patches_dedup(nodes: &[Node], schema: &Schema, refs: &mut RowRefs) -> RowsPatch {
+    let mut out = Vec::new();
+    for node in nodes {
+        node_dels_dedup(node, schema, refs, &mut out);
+    }
+    out
+}
+
 /// Like [`changes_to_patches`] but ref-counted (see [`RowRefs`]).
 pub fn changes_to_patches_dedup(changes: &[Change], schema: &Schema, refs: &mut RowRefs) -> RowsPatch {
     let mut out = Vec::new();
