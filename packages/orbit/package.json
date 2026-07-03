@@ -1,6 +1,6 @@
 {
   "name": "@zeronsh/orbit",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "Orbit — a Rust rebuild of Zero. Type-safe sync client, React bindings, server helpers, and Drizzle schema generation, all under one tree-shakeable package.",
   "type": "module",
   "license": "MIT",
