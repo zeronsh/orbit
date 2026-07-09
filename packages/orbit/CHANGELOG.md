@@ -1,5 +1,11 @@
 # @zeronsh/orbit
 
+## 0.3.10
+
+### Patch Changes
+
+- 2ddd434: Immediately detach dropped IVM query pipelines and keep source push work proportional to live subscriptions.
+
 ## 0.3.9
 
 ### Patch Changes
