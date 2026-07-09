@@ -162,8 +162,38 @@ async fn websocket_subscribe_then_incremental_poke() {
             .collect();
         assert_eq!(ids, vec!["w4"], "the same poke carries the w4 row");
 
+        // Removing a desired query drops its terminal Catch. That must cascade
+        // through the pipeline and detach its source connection immediately.
+        let del = Upstream::ChangeDesiredQueries(ChangeDesiredQueriesBody {
+            desired_queries_patch: vec![QueriesPatchOp::Del { hash: "h1".into() }],
+            traceparent: None,
+        });
+        ws.send(Message::Text(serde_json::to_string(&del).unwrap())).await.unwrap();
+        // The removal poke is also a deterministic barrier: the pipeline is
+        // dropped after its rows are retracted.
+        assert!(read_poke_put_ids(&mut ws).await.is_empty());
+        assert_eq!(src.borrow().connection_count(), 0);
+
+        // Leave a fresh query active when the socket closes; connection teardown
+        // must release it even without an explicit desired-query Del.
+        let ast = Query::table("widget").order_by("id", Direction::Asc).build();
+        let resubscribe = Upstream::ChangeDesiredQueries(ChangeDesiredQueriesBody {
+            desired_queries_patch: vec![QueriesPatchOp::Put {
+                hash: "h2".into(),
+                ttl: None,
+                ast: Some(ast),
+                name: None,
+                args: None,
+            }],
+            traceparent: None,
+        });
+        ws.send(Message::Text(serde_json::to_string(&resubscribe).unwrap())).await.unwrap();
+        assert_eq!(read_poke_put_ids(&mut ws).await, vec!["w1", "w2", "w3", "w4"]);
+        assert_eq!(src.borrow().connection_count(), 1);
+
         ws.close(None).await.unwrap();
     };
 
     tokio::join!(server, client);
+    assert_eq!(src.borrow().connection_count(), 0);
 }
