@@ -1,5 +1,11 @@
 # @zeronsh/orbit
 
+## 0.3.11
+
+### Patch Changes
+
+- 2af785a: Store fixed-size row fingerprints in persisted client views to prevent reconnect hydration from duplicating large row payloads in memory.
+
 ## 0.3.10
 
 ### Patch Changes
