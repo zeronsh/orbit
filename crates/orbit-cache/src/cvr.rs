@@ -138,7 +138,14 @@ impl PgCvrStore {
                      last_seen timestamptz NOT NULL DEFAULT now()
                  );
                  ALTER TABLE orbit_cvr_clients ADD COLUMN IF NOT EXISTS pos bigint NOT NULL DEFAULT 0;
-                 ALTER TABLE orbit_cvr_clients ADD COLUMN IF NOT EXISTS last_seen timestamptz NOT NULL DEFAULT now();",
+                 ALTER TABLE orbit_cvr_clients ADD COLUMN IF NOT EXISTS last_seen timestamptz NOT NULL DEFAULT now();
+
+                 -- Older releases persisted every full row JSON once per client,
+                 -- multiplying large message histories across CVRs. Compact those
+                 -- values in-place to the SHA-256 fingerprints newer servers use.
+                 UPDATE orbit_cvr_client_rows
+                 SET row_val = encode(sha256(convert_to(row_val, 'UTF8')), 'hex')
+                 WHERE length(row_val) <> 64 OR row_val !~ '^[0-9a-f]{64}$';",
             )
             .await?;
         Ok(())
@@ -147,7 +154,7 @@ impl PgCvrStore {
     /// The rows a client currently holds — its materialized view — plus the version
     /// (cookie) that view corresponds to, so a reconnect to *any* node can be served
     /// as a delta **only when the client proves it has this view** (its acked cookie
-    /// equals this version). `(table, json(pk)) → json(row)`; version defaults to 0.
+    /// equals this version). `(table, json(pk)) → sha256(row)`; version defaults to 0.
     pub async fn load_client_view(
         client: &tokio_postgres::Client,
         client_id: &str,
@@ -176,7 +183,14 @@ impl PgCvrStore {
                 r.get::<_, Option<String>>(3),
                 r.get::<_, Option<String>>(4),
             ) {
-                view.insert((t, id), val);
+                // Be tolerant of a legacy value written during a rolling upgrade.
+                // `ensure_schema` normally compacts all of these before listening.
+                let fingerprint = if crate::view_sync::is_fingerprint(&val) {
+                    val
+                } else {
+                    crate::view_sync::fingerprint_json(&val)
+                };
+                view.insert((t, id), fingerprint);
             }
         }
         Ok((view, version, pos))
@@ -196,12 +210,11 @@ impl PgCvrStore {
         pos: u64,
     ) -> anyhow::Result<()> {
         // The row delta (changed/new rows to upsert, dropped rows to delete) and the
-        // version write must land atomically: a reconnect that reports `version` as
-        // its cookie takes the fast delta path, which trusts the stored rows to match
-        // that version exactly. If the version could be persisted without (or ahead of)
-        // its rows, the delta would suppress rows the client never received — permanent
-        // divergence. So this is ONE statement: a single SQL statement is an implicit,
-        // all-or-nothing Postgres transaction, so `(rows, version)` can never tear.
+        // fingerprint delta and version write must land atomically: a reconnect that
+        // reports `version` as its cookie takes the fast delta path, which trusts the
+        // stored fingerprints to match that version exactly. If the version could be
+        // persisted without (or ahead of) its fingerprints, the delta could suppress
+        // rows the client never received. So this is ONE all-or-nothing statement.
         //
         // An explicit BEGIN/COMMIT is deliberately avoided — every client connection
         // shares one pooled `tokio_postgres::Client`, so wrapping statements in a

@@ -13,16 +13,31 @@
 use oql::ivm::{Change, Node, RowRef, Schema};
 use oql::value::{Row, Value};
 use orbit_protocol::{RowPatchOp, RowsPatch};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 /// A row's identity in a persisted client view: `(table, json(primary-key))`.
 pub type RowKey = (String, String);
 
-/// A client's materialized view: row identity → canonical JSON of the row value.
-/// This is the persisted CVR payload (what the client currently holds), so a
-/// reconnect — to *any* node — can be served as a delta instead of a full resync.
+/// A client's materialized view: row identity → SHA-256 of the canonical row
+/// JSON. A fingerprint is enough to decide whether a reconnect already has the
+/// exact value, without retaining every client's full row payload in memory and
+/// Postgres (message bodies can be tens of megabytes per client).
 pub type ClientView = HashMap<RowKey, String>;
+
+pub(crate) fn fingerprint_json(json: &str) -> String {
+    format!("{:x}", Sha256::digest(json.as_bytes()))
+}
+
+pub(crate) fn is_fingerprint(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn fingerprint_row(row: &Row) -> String {
+    let json = serde_json::to_vec(row).unwrap_or_default();
+    format!("{:x}", Sha256::digest(json))
+}
 
 /// Per-connection row reference counts + a cheap handle to each row's value — the
 /// core of a CVR. A row may be synced by several queries, so a `del` is only sent
@@ -92,8 +107,8 @@ impl RowRefs {
             e.row = row;
         }
     }
-    /// The client's current view (row identity → value JSON) for CVR checkpointing.
-    /// Serializes here — never on the per-mutation hot path.
+    /// The client's current view (row identity → value fingerprint) for CVR
+    /// checkpointing. Hashes here — never on the per-mutation hot path.
     pub fn view(&self) -> ClientView {
         let mut out = HashMap::new();
         for (table, rows) in &self.tables {
@@ -101,8 +116,7 @@ impl RowRefs {
             for (vals, e) in rows {
                 let id: Row = pk.iter().cloned().zip(vals.iter().cloned()).collect();
                 let id_json = serde_json::to_string(&id).unwrap_or_default();
-                let val_json = serde_json::to_string(&*e.row).unwrap_or_default();
-                out.insert((table.clone(), id_json), val_json);
+                out.insert((table.clone(), id_json), fingerprint_row(&e.row));
             }
         }
         out
@@ -206,8 +220,8 @@ fn node_puts_dedup(
         let suppress = match prior {
             Some(p) => {
                 let id_json = serde_json::to_string(&pk_id(&node.row, pk)).unwrap_or_default();
-                let val_json = serde_json::to_string(&node.row.to_row()).unwrap_or_default();
-                p.get(&(table.clone(), id_json)) == Some(&val_json)
+                let fingerprint = fingerprint_row(&node.row);
+                p.get(&(table.clone(), id_json)) == Some(&fingerprint)
             }
             None => false,
         };
@@ -332,4 +346,37 @@ fn pk_id(row: &Row, primary_key: &[String]) -> Row {
         .iter()
         .map(|k| (k.clone(), row.get(k).cloned().unwrap_or(Value::Null)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_view_keeps_fixed_size_fingerprints_not_row_payloads() {
+        let content = "x".repeat(1_000_000);
+        let mut row = Row::new();
+        row.insert("id", Value::String("m1".into()));
+        row.insert("content", Value::String(content.clone()));
+
+        let mut refs = RowRefs::new();
+        refs.register_pk("messages", &["id".into()]);
+        refs.incr(
+            "messages",
+            vec![Value::String("m1".into())],
+            RowRef::new(row),
+        );
+
+        let view = refs.view();
+        let fingerprint = view.values().next().unwrap();
+        assert_eq!(fingerprint.len(), 64);
+        assert!(is_fingerprint(fingerprint));
+        assert!(!fingerprint.contains(&content));
+    }
+
+    #[test]
+    fn fingerprint_changes_with_row_value() {
+        assert_ne!(fingerprint_json("{\"id\":1}"), fingerprint_json("{\"id\":2}"));
+        assert_eq!(fingerprint_json("{\"id\":1}"), fingerprint_json("{\"id\":1}"));
+    }
 }
