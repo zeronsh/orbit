@@ -3,6 +3,7 @@
 //! and already-processed mutations are deduplicated.
 
 use orbit_cache::PgCvrStore;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::NoTls;
 
@@ -17,6 +18,10 @@ async fn connect() -> tokio_postgres::Client {
         let _ = connection.await;
     });
     client
+}
+
+fn fingerprint(json: &str) -> String {
+    format!("{:x}", Sha256::digest(json.as_bytes()))
 }
 
 #[tokio::test]
@@ -66,8 +71,8 @@ async fn commit_client_view_upsert_delete_and_version_are_atomic() {
     // First commit: two fresh rows at version 5, from an empty prior.
     let empty: HashMap<(String, String), String> = HashMap::new();
     let mut v1: HashMap<(String, String), String> = HashMap::new();
-    v1.insert(("todo".into(), "a".into()), "{\"id\":\"a\"}".into());
-    v1.insert(("todo".into(), "b".into()), "{\"id\":\"b\"}".into());
+    v1.insert(("todo".into(), "a".into()), fingerprint("{\"id\":\"a\"}"));
+    v1.insert(("todo".into(), "b".into()), fingerprint("{\"id\":\"b\"}"));
     PgCvrStore::commit_client_view(&c, &cid, &empty, &v1, 5, 100).await.unwrap();
 
     let (loaded, ver, _pos) = PgCvrStore::load_client_view(&c, &cid).await.unwrap();
@@ -76,8 +81,8 @@ async fn commit_client_view_upsert_delete_and_version_are_atomic() {
 
     // Second commit: update `a`, delete `b`, add `c`, bump to version 7 — atomically.
     let mut v2: HashMap<(String, String), String> = HashMap::new();
-    v2.insert(("todo".into(), "a".into()), "{\"id\":\"a\",\"n\":1}".into());
-    v2.insert(("todo".into(), "c".into()), "{\"id\":\"c\"}".into());
+    v2.insert(("todo".into(), "a".into()), fingerprint("{\"id\":\"a\",\"n\":1}"));
+    v2.insert(("todo".into(), "c".into()), fingerprint("{\"id\":\"c\"}"));
     PgCvrStore::commit_client_view(&c, &cid, &v1, &v2, 7, 200).await.unwrap();
 
     let (loaded, ver, _pos) = PgCvrStore::load_client_view(&c, &cid).await.unwrap();
@@ -89,6 +94,45 @@ async fn commit_client_view_upsert_delete_and_version_are_atomic() {
     let (loaded, ver, _pos) = PgCvrStore::load_client_view(&c, &cid).await.unwrap();
     assert_eq!(ver, 9);
     assert_eq!(loaded, v2);
+
+    c.execute("DELETE FROM orbit_cvr_client_rows WHERE client_id=$1", &[&cid]).await.ok();
+    c.execute("DELETE FROM orbit_cvr_clients WHERE client_id=$1", &[&cid]).await.ok();
+}
+
+#[tokio::test]
+async fn ensure_schema_compacts_legacy_full_row_values() {
+    let cid = format!("legacy_cv_{}", std::process::id());
+    let c = connect().await;
+    PgCvrStore::ensure_schema(&c).await.unwrap();
+    c.execute("DELETE FROM orbit_cvr_client_rows WHERE client_id=$1", &[&cid]).await.unwrap();
+    c.execute("DELETE FROM orbit_cvr_clients WHERE client_id=$1", &[&cid]).await.unwrap();
+
+    let legacy = format!("{{\"id\":\"m1\",\"content\":\"{}\"}}", "x".repeat(100_000));
+    c.execute(
+        "INSERT INTO orbit_cvr_client_rows (client_id, table_name, row_id, row_val)
+         VALUES ($1, 'messages', 'm1', $2)",
+        &[&cid, &legacy],
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "INSERT INTO orbit_cvr_clients (client_id, version, pos) VALUES ($1, 1, 1)",
+        &[&cid],
+    )
+    .await
+    .unwrap();
+
+    PgCvrStore::ensure_schema(&c).await.unwrap();
+    let stored: String = c
+        .query_one("SELECT row_val FROM orbit_cvr_client_rows WHERE client_id=$1", &[&cid])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(stored, fingerprint(&legacy));
+    assert_eq!(stored.len(), 64);
+
+    let (loaded, _, _) = PgCvrStore::load_client_view(&c, &cid).await.unwrap();
+    assert_eq!(loaded.values().next(), Some(&stored));
 
     c.execute("DELETE FROM orbit_cvr_client_rows WHERE client_id=$1", &[&cid]).await.ok();
     c.execute("DELETE FROM orbit_cvr_clients WHERE client_id=$1", &[&cid]).await.ok();
