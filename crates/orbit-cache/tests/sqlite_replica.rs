@@ -67,6 +67,26 @@ fn ivm_over_sqlite_source() {
 }
 
 #[test]
+fn dropping_sqlite_pipeline_disconnects_source() {
+    let src = SqliteSource::new("task", cols(), vec!["id".into()]);
+    let mut provider = SqliteProvider::new();
+    provider.add(src.clone());
+    let ast = Query::table("task").order_by("id", Direction::Asc).build();
+
+    let catch = {
+        let top = build_pipeline(&ast, &provider);
+        let catch = Catch::new(top.input.clone());
+        let link: Link = catch.clone();
+        top.set_output(link);
+        catch
+    };
+
+    assert_eq!(src.borrow().connection_count(), 1);
+    drop(catch);
+    assert_eq!(src.borrow().connection_count(), 0);
+}
+
+#[test]
 fn sqlite_replica_backend_applies_events() {
     // The SqliteReplica backend: apply replication events + serve queries over it.
     let mut replica = SqliteReplica::in_memory();

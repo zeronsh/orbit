@@ -97,6 +97,7 @@ struct Connection {
     /// which point the push loop prunes the connection. Keeps query churn from
     /// leaking dead pipelines that would receive every future change forever.
     output: Option<super::operator::WeakLink>,
+    active_pos: usize,
     last_pushed_epoch: u64,
     schema: Rc<Schema>,
     /// Precomputed ordering + forward comparator (avoids rebuilding per fetch).
@@ -110,8 +111,6 @@ struct Connection {
     /// iteration order already matches and the adaptive sort is ~O(n), so the
     /// partial-select fast path would be a pessimization.
     order_is_pk_asc: bool,
-    /// Downstream dropped (weak upgrade failed): slot is reusable by `connect`.
-    dead: bool,
 }
 
 /// An in-memory table source.
@@ -126,7 +125,10 @@ pub struct MemorySource {
     /// Lazily-built secondary indexes, one per (constraint columns, ordering)
     /// pair in use. A handful per source, so identity lookup is a linear scan.
     indexes: RefCell<Vec<SortedIndex>>,
-    connections: Vec<Connection>,
+    /// Stable reusable slots plus a dense live-slot index: teardown is eager,
+    /// and push cost is proportional to active queries only.
+    connections: Vec<Option<Connection>>,
+    active_connections: Vec<usize>,
     overlay: Option<(u64, OverlayChange)>,
     push_epoch: u64,
 }
@@ -144,6 +146,7 @@ impl MemorySource {
             data: BTreeMap::new(),
             indexes: RefCell::new(Vec::new()),
             connections: Vec::new(),
+            active_connections: Vec::new(),
             overlay: None,
             push_epoch: 0,
         }))
@@ -205,6 +208,26 @@ impl MemorySource {
 
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    /// Number of live query connections attached to this source.
+    pub fn connection_count(&self) -> usize {
+        self.active_connections.len()
+    }
+
+    fn disconnect(&mut self, conn_idx: usize) {
+        let Some(connection) = self.connections[conn_idx].take() else {
+            return;
+        };
+        let active_pos = connection.active_pos;
+        debug_assert_eq!(self.active_connections[active_pos], conn_idx);
+        self.active_connections.swap_remove(active_pos);
+        if let Some(&moved_idx) = self.active_connections.get(active_pos) {
+            self.connections[moved_idx].as_mut().unwrap().active_pos = active_pos;
+        }
+        while self.connections.last().is_some_and(Option::is_none) {
+            self.connections.pop();
+        }
     }
 
     fn build_order(&self, sort: &AstOrdering) -> Ordering2 {
@@ -275,7 +298,9 @@ impl MemorySource {
     /// Fetch for connection `conn_idx`, applying overlay, constraint, sort, and
     /// start cursor.
     fn fetch_conn(&self, req: &FetchRequest, conn_idx: usize) -> Vec<Node> {
-        let conn = &self.connections[conn_idx];
+        let conn = self.connections[conn_idx]
+            .as_ref()
+            .expect("source connection slot was disconnected");
         let overlay = self
             .overlay
             .as_ref()
@@ -473,31 +498,33 @@ pub fn connect(
             Some(sort),
             cmp.clone(),
         ));
-        // Reuse a pruned (dead-downstream) slot if any — churned queries must
-        // not grow the connection table forever.
-        let dead = s.connections.iter().position(|c| c.dead);
-        conn_idx = dead.unwrap_or(s.connections.len());
         let order_total = s.primary_key.iter().all(|k| order.iter().any(|(f, _)| f == k));
         let order_is_pk_asc = order.len() == s.primary_key.len()
             && order
                 .iter()
                 .zip(s.primary_key.iter())
                 .all(|((f, d), k)| f == k && *d == Direction::Asc);
-        let conn = Connection {
+        let connection = Connection {
             output: None,
+            active_pos: s.active_connections.len(),
             last_pushed_epoch: 0,
             schema,
             order,
             cmp,
             order_total,
             order_is_pk_asc,
-            dead: false,
         };
-        if dead.is_some() {
-            s.connections[conn_idx] = conn;
-        } else {
-            s.connections.push(conn);
-        }
+        conn_idx = match s.connections.iter().position(Option::is_none) {
+            Some(idx) => {
+                s.connections[idx] = Some(connection);
+                idx
+            }
+            None => {
+                s.connections.push(Some(connection));
+                s.connections.len() - 1
+            }
+        };
+        s.active_connections.push(conn_idx);
     }
     Rc::new(RefCell::new(SourceConnection {
         source: Rc::clone(src),
@@ -525,27 +552,17 @@ pub fn source_push(src: &Rc<RefCell<MemorySource>>, change: SourceChange) {
         e
     };
 
-    let n = src.borrow().connections.len();
-    for i in 0..n {
+    let n = src.borrow().active_connections.len();
+    for active_pos in 0..n {
         let output = {
             let mut s = src.borrow_mut();
-            if s.connections[i].dead {
-                continue;
-            }
-            s.connections[i].last_pushed_epoch = epoch;
-            s.connections[i].output.as_ref().and_then(std::rc::Weak::upgrade)
+            let conn_idx = s.active_connections[active_pos];
+            let conn = s.connections[conn_idx].as_mut().unwrap();
+            conn.last_pushed_epoch = epoch;
+            conn.output.as_ref().and_then(std::rc::Weak::upgrade)
         };
-        match output {
-            Some(output) => deliver(&output, overlay.to_change()),
-            None => {
-                // Downstream pipeline was dropped (query GC / disconnect):
-                // prune so no future work is spent on it.
-                let mut s = src.borrow_mut();
-                if s.connections[i].output.is_some() {
-                    s.connections[i].output = None;
-                    s.connections[i].dead = true;
-                }
-            }
+        if let Some(output) = output {
+            deliver(&output, overlay.to_change());
         }
     }
 
@@ -562,7 +579,13 @@ pub struct SourceConnection {
 
 impl Input for SourceConnection {
     fn get_schema(&self) -> Rc<Schema> {
-        Rc::clone(&self.source.borrow().connections[self.conn_idx].schema)
+        let source = self.source.borrow();
+        Rc::clone(
+            &source.connections[self.conn_idx]
+                .as_ref()
+                .expect("source connection slot was disconnected")
+                .schema,
+        )
     }
     fn fetch(&self, req: &FetchRequest) -> Vec<Node> {
         self.source.borrow().fetch_conn(req, self.conn_idx)
@@ -575,12 +598,21 @@ impl Operator for SourceConnection {
     }
     fn output(&self) -> Option<Link> {
         self.source.borrow().connections[self.conn_idx]
-            .output
             .as_ref()
+            .and_then(|conn| conn.output.as_ref())
             .and_then(std::rc::Weak::upgrade)
     }
     fn set_output(&mut self, out: Link) {
-        self.source.borrow_mut().connections[self.conn_idx].output = Some(Rc::downgrade(&out));
+        self.source.borrow_mut().connections[self.conn_idx]
+            .as_mut()
+            .expect("source connection slot was disconnected")
+            .output = Some(Rc::downgrade(&out));
+    }
+}
+
+impl Drop for SourceConnection {
+    fn drop(&mut self) {
+        self.source.borrow_mut().disconnect(self.conn_idx);
     }
 }
 
@@ -588,4 +620,84 @@ impl Operator for SourceConnection {
 #[allow(unused)]
 fn _values_equal(a: &Value, b: &Value) -> bool {
     values_equal(a, b)
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::ast::Direction as AstDirection;
+    use crate::ivm::operator::OpHandle;
+    use crate::ivm::{Catch, Filter, Join, Predicate, Take};
+
+    fn string_columns(names: &[&str]) -> BTreeMap<String, ColumnType> {
+        names.iter().map(|name| (name.to_string(), ColumnType::String)).collect()
+    }
+
+    fn ascending(column: &str) -> AstOrdering {
+        vec![(column.to_string(), AstDirection::Asc)]
+    }
+
+    #[test]
+    fn dropping_terminal_disconnects_and_reuses_source_slot() {
+        let source = MemorySource::new("item", string_columns(&["id"]), vec!["id".into()]);
+        let build = || {
+            let connection = OpHandle::new(connect(&source, ascending("id")));
+            let predicate: Predicate = Rc::new(|_| true);
+            let filter = OpHandle::new(Filter::new(connection, predicate));
+            let top = OpHandle::new(Take::new(filter, 10));
+            let catch = Catch::new(Rc::clone(&top.input));
+            top.set_output(catch.clone());
+            catch
+        };
+
+        let first = build();
+        let second = build();
+        assert_eq!(source.borrow().connections.len(), 2);
+        drop(first);
+        assert_eq!(source.borrow().connection_count(), 1);
+
+        let replacement = build();
+        assert_eq!(source.borrow().connection_count(), 2);
+        assert_eq!(source.borrow().connections.len(), 2, "the vacant slot is reused");
+
+        drop(second);
+        drop(replacement);
+        assert_eq!(source.borrow().connection_count(), 0);
+        assert!(source.borrow().connections.is_empty());
+    }
+
+    #[test]
+    fn dropping_join_terminal_releases_both_branches_and_ports() {
+        let parent = MemorySource::new("parent", string_columns(&["id"]), vec!["id".into()]);
+        let child = MemorySource::new(
+            "child",
+            string_columns(&["id", "parent_id"]),
+            vec!["id".into()],
+        );
+
+        let (catch, weak_join) = {
+            let parent_connection = OpHandle::new(connect(&parent, ascending("id")));
+            let child_connection = OpHandle::new(connect(&child, ascending("id")));
+            let join = Join::new(
+                parent_connection,
+                child_connection,
+                vec!["id".into()],
+                vec!["parent_id".into()],
+                "children",
+                false,
+            );
+            let weak_join = Rc::downgrade(&join);
+            let top = OpHandle::new(join);
+            let catch = Catch::new(Rc::clone(&top.input));
+            top.set_output(catch.clone());
+            (catch, weak_join)
+        };
+
+        assert_eq!(parent.borrow().connection_count(), 1);
+        assert_eq!(child.borrow().connection_count(), 1);
+        drop(catch);
+        assert!(weak_join.upgrade().is_none());
+        assert_eq!(parent.borrow().connection_count(), 0);
+        assert_eq!(child.borrow().connection_count(), 0);
+    }
 }

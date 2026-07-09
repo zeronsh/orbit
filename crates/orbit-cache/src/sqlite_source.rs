@@ -25,9 +25,9 @@ struct Conn {
     /// Weak (see the memory source): dead downstream pipelines are pruned by
     /// the push loop instead of receiving every future change forever.
     output: Option<oql::ivm::operator::WeakLink>,
+    active_pos: usize,
     last_pushed_epoch: u64,
     schema: Rc<Schema>,
-    dead: bool,
 }
 
 /// A SQLite-backed source for one table.
@@ -38,7 +38,8 @@ pub struct SqliteSource {
     /// Shared with every other table of the same replica: ONE database, so a
     /// multi-table upstream transaction commits (or rolls back) atomically.
     db: Rc<Connection>,
-    connections: Vec<Conn>,
+    connections: Vec<Option<Conn>>,
+    active_connections: Vec<usize>,
     overlay: Option<(u64, SourceChange)>,
     push_epoch: u64,
     /// Names of secondary indexes already created (lazily, per fetch shape), so
@@ -101,6 +102,7 @@ impl SqliteSource {
             primary_key: pk,
             db,
             connections: Vec::new(),
+            active_connections: Vec::new(),
             overlay: None,
             push_epoch: 0,
             created_indexes: RefCell::new(std::collections::HashSet::new()),
@@ -112,6 +114,26 @@ impl SqliteSource {
     }
     pub fn primary_key(&self) -> &[String] {
         &self.primary_key
+    }
+
+    /// Number of live query connections attached to this source.
+    pub fn connection_count(&self) -> usize {
+        self.active_connections.len()
+    }
+
+    fn disconnect(&mut self, conn_idx: usize) {
+        let Some(connection) = self.connections[conn_idx].take() else {
+            return;
+        };
+        let active_pos = connection.active_pos;
+        debug_assert_eq!(self.active_connections[active_pos], conn_idx);
+        self.active_connections.swap_remove(active_pos);
+        if let Some(&moved_idx) = self.active_connections.get(active_pos) {
+            self.connections[moved_idx].as_mut().unwrap().active_pos = active_pos;
+        }
+        while self.connections.last().is_some_and(Option::is_none) {
+            self.connections.pop();
+        }
     }
 
     /// Insert a row directly (initial load), bypassing change propagation.
@@ -271,7 +293,9 @@ impl SqliteSource {
     /// row is fetched while an overlay is active so a spliced-out row can be
     /// backfilled.
     fn fetch_conn(&self, req: &FetchRequest, conn_idx: usize) -> Vec<Node> {
-        let conn = &self.connections[conn_idx];
+        let conn = self.connections[conn_idx]
+            .as_ref()
+            .expect("SQLite source connection slot was disconnected");
         let overlay_active = matches!(&self.overlay, Some((epoch, _)) if conn.last_pushed_epoch >= *epoch);
 
         // Effective per-column directions (reverse flips each).
@@ -444,17 +468,24 @@ pub fn connect(src: &Rc<RefCell<SqliteSource>>, sort: AstOrdering) -> Rc<RefCell
     {
         let mut s = src.borrow_mut();
         let schema = s.build_schema(&sort);
-        let conn = Conn { sort, output: None, last_pushed_epoch: 0, schema, dead: false };
-        match s.connections.iter().position(|c| c.dead) {
-            Some(i) => {
-                conn_idx = i;
-                s.connections[i] = conn;
+        let connection = Conn {
+            sort,
+            output: None,
+            active_pos: s.active_connections.len(),
+            last_pushed_epoch: 0,
+            schema,
+        };
+        conn_idx = match s.connections.iter().position(Option::is_none) {
+            Some(idx) => {
+                s.connections[idx] = Some(connection);
+                idx
             }
             None => {
-                conn_idx = s.connections.len();
-                s.connections.push(conn);
+                s.connections.push(Some(connection));
+                s.connections.len() - 1
             }
-        }
+        };
+        s.active_connections.push(conn_idx);
     }
     Rc::new(RefCell::new(SqliteConnection { source: Rc::clone(src), conn_idx }))
 }
@@ -468,25 +499,17 @@ pub fn source_push(src: &Rc<RefCell<SqliteSource>>, change: SourceChange) {
         s.overlay = Some((e, change.clone()));
         e
     };
-    let n = src.borrow().connections.len();
-    for i in 0..n {
+    let n = src.borrow().active_connections.len();
+    for active_pos in 0..n {
         let output = {
             let mut s = src.borrow_mut();
-            if s.connections[i].dead {
-                continue;
-            }
-            s.connections[i].last_pushed_epoch = epoch;
-            s.connections[i].output.as_ref().and_then(std::rc::Weak::upgrade)
+            let conn_idx = s.active_connections[active_pos];
+            let conn = s.connections[conn_idx].as_mut().unwrap();
+            conn.last_pushed_epoch = epoch;
+            conn.output.as_ref().and_then(std::rc::Weak::upgrade)
         };
-        match output {
-            Some(output) => deliver(&output, base_change(&change)),
-            None => {
-                let mut s = src.borrow_mut();
-                if s.connections[i].output.is_some() {
-                    s.connections[i].output = None;
-                    s.connections[i].dead = true;
-                }
-            }
+        if let Some(output) = output {
+            deliver(&output, base_change(&change));
         }
     }
     let mut s = src.borrow_mut();
@@ -513,7 +536,13 @@ pub struct SqliteConnection {
 
 impl Input for SqliteConnection {
     fn get_schema(&self) -> Rc<Schema> {
-        Rc::clone(&self.source.borrow().connections[self.conn_idx].schema)
+        let source = self.source.borrow();
+        Rc::clone(
+            &source.connections[self.conn_idx]
+                .as_ref()
+                .expect("SQLite source connection slot was disconnected")
+                .schema,
+        )
     }
     fn fetch(&self, req: &FetchRequest) -> Vec<Node> {
         self.source.borrow().fetch_conn(req, self.conn_idx)
@@ -526,12 +555,21 @@ impl Operator for SqliteConnection {
     }
     fn output(&self) -> Option<Link> {
         self.source.borrow().connections[self.conn_idx]
-            .output
             .as_ref()
+            .and_then(|conn| conn.output.as_ref())
             .and_then(std::rc::Weak::upgrade)
     }
     fn set_output(&mut self, out: Link) {
-        self.source.borrow_mut().connections[self.conn_idx].output = Some(Rc::downgrade(&out));
+        self.source.borrow_mut().connections[self.conn_idx]
+            .as_mut()
+            .expect("SQLite source connection slot was disconnected")
+            .output = Some(Rc::downgrade(&out));
+    }
+}
+
+impl Drop for SqliteConnection {
+    fn drop(&mut self) {
+        self.source.borrow_mut().disconnect(self.conn_idx);
     }
 }
 
