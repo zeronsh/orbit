@@ -55,6 +55,22 @@ pub trait ReplicaBackend: oql::SourceProvider {
     /// upstream while the server was offline would otherwise survive as
     /// phantoms.
     fn start_fresh(&self) {}
+
+    /// A point-in-time memory/size sample for the metrics exporter.
+    fn metrics_sample(&self) -> ReplicaSample {
+        ReplicaSample::default()
+    }
+}
+
+/// What a replica reports to the metrics sampler. Fields a backend can't
+/// cheaply measure stay 0.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct ReplicaSample {
+    pub rows: u64,
+    /// Estimated logical bytes of stored rows (in-memory backend).
+    pub logical_bytes: u64,
+    /// On-disk size of the SQLite database (SQLite backend).
+    pub file_bytes: u64,
 }
 
 /// A registry of replicated tables.
@@ -156,5 +172,14 @@ impl ReplicaBackend for Replica {
             .iter()
             .map(|(name, src)| (name.clone(), src.borrow().all_rows()))
             .collect()
+    }
+    fn metrics_sample(&self) -> ReplicaSample {
+        let mut s = ReplicaSample::default();
+        for src in self.sources.values() {
+            let (rows, bytes) = src.borrow().estimated_bytes();
+            s.rows += rows as u64;
+            s.logical_bytes += bytes as u64;
+        }
+        s
     }
 }

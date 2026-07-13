@@ -31,6 +31,12 @@ pub enum ChangeMsg {
     Change { pos: u64, event: LogicalEvent },
     /// The requested resume point is no longer retained — re-snapshot and retry.
     Reset,
+    /// Backlog (log bridge + ring) fully replayed; the subscriber is at the
+    /// stream head as of `seq` and now live-tails. Drives view-syncer
+    /// readiness. Wire compat: an OLDER node deserializing this unknown
+    /// variant errors → its stuck-failure path exits → restart on the new
+    /// release — deploy replicator and view-syncers together.
+    CaughtUp { seq: u64 },
 }
 
 /// Server-side serialization mirror of [`ChangeMsg`] that borrows the event
@@ -41,6 +47,7 @@ pub enum ChangeMsg {
 enum ChangeMsgOut<'a> {
     Change { pos: u64, event: &'a LogicalEvent },
     Reset,
+    CaughtUp { seq: u64 },
 }
 
 /// Ring + broadcast tuning. Defaults come from `ORBIT_CHANGE_*` env vars via
@@ -216,10 +223,21 @@ impl ChangeStreamServer {
         (r.buf.len(), r.bytes)
     }
 
+    /// Live broadcast subscribers (for metrics).
+    pub fn subscriber_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
     /// Accept view-syncer connections forever.
     pub async fn serve(self: Arc<Self>, addr: &str) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
         eprintln!("change-stream listening on {addr}");
+        self.serve_on(listener).await
+    }
+
+    /// [`serve`](Self::serve) over a pre-bound listener — lets the caller
+    /// observe the bind (readiness) before handing the accept loop over.
+    pub async fn serve_on(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         loop {
             let (sock, _) = listener.accept().await?;
             let me = self.clone();
@@ -306,6 +324,10 @@ impl ChangeStreamServer {
                 last = pos;
             }
         }
+        // Backlog fully replayed — the subscriber is at the head it observed
+        // at connect time (readiness signal; also correct when the backlog was
+        // empty because the subscriber was already current).
+        send(&mut w, &ChangeMsgOut::CaughtUp { seq }).await?;
         loop {
             match rx.recv().await {
                 Ok((pos, event)) if pos > last => {

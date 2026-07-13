@@ -13,6 +13,7 @@
 
 pub mod changelog;
 pub mod changestream;
+pub mod metrics;
 pub mod cvr;
 pub mod forward;
 pub mod handshake;
@@ -29,6 +30,7 @@ pub mod sqlite_source;
 pub mod view_sync;
 
 pub use changestream::{ChangeMsg, ChangeStreamClient, ChangeStreamConfig, ChangeStreamServer};
+pub use metrics::{Metrics, ReadyComponent, Role};
 pub use objectstore::{LocalObjectStore, ObjectStore, ReplicaSnapshot};
 #[cfg(feature = "s3")]
 pub use objectstore::S3ObjectStore;

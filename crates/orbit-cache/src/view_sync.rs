@@ -64,6 +64,16 @@ impl RowRefs {
     pub fn new() -> Self {
         RowRefs::default()
     }
+
+    /// Rows currently referenced by this client's views (for metrics).
+    pub fn len(&self) -> usize {
+        self.tables.values().map(|t| t.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     fn register_pk(&mut self, table: &str, pk: &[String]) {
         if !self.pks.contains_key(table) {
             self.pks.insert(table.to_string(), pk.to_vec());

@@ -9,7 +9,9 @@
 //!   ORBIT_PG_SSLMODE (or PGSSLMODE) — disable (default) | require | verify-full,
 //!   ORBIT_LISTEN (127.0.0.1:4848),
 //!   ORBIT_TABLES — comma-separated `table:pkcol` specs (columns are discovered
-//!     as text; e.g. `issue:id,comment:id`).
+//!     as text; e.g. `issue:id,comment:id`),
+//!   ORBIT_METRICS_LISTEN — metrics/health HTTP bind (default 0.0.0.0:9090; set
+//!     empty or `off` to disable): GET /metrics /ready /live.
 //!
 //! For richer column typing, embed and configure [`orbit_cache::ServerConfig`]
 //! directly. This binary keeps every column as text/JSON-friendly by default.
@@ -29,6 +31,11 @@ async fn main() -> anyhow::Result<()> {
         orbit_cache::pg::tls::PgConnInfo::from_env(5433, "orbit", "orbit")?;
     let listen_addr = env("ORBIT_LISTEN", "127.0.0.1:4848");
     let tables_spec = env("ORBIT_TABLES", "");
+    // Metrics/readiness on 9090 unless explicitly disabled (the library serves
+    // it only when this env var is set).
+    if std::env::var("ORBIT_METRICS_LISTEN").is_err() {
+        std::env::set_var("ORBIT_METRICS_LISTEN", "0.0.0.0:9090");
+    }
 
     // Discover columns at runtime from information_schema for each configured
     // table (typed String/Number/Boolean/Json) before starting.

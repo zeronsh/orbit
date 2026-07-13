@@ -53,6 +53,14 @@ services:
       - orbit-data:/data
     ports:
       - "4848:4848"
+      - "9090:9090" # metrics/health: GET /metrics /ready /live
+    healthcheck:
+      # Unready until initial sync completed and the WS listener is bound.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9090/ready || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 30
+      start_period: 30s
 
 volumes:
   orbit-pg:

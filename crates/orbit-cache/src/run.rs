@@ -244,6 +244,18 @@ async fn run_inner<B: ReplicaBackend + 'static>(
     queries: QueryRegistry,
     backend: B,
 ) -> Result<()> {
+    // Metrics + readiness first: /ready answers 503 through initial sync.
+    let metrics = crate::metrics::Metrics::new(crate::metrics::Role::SingleNode);
+    crate::metrics::set_node_metrics(metrics.clone());
+    if let Some(addr) = crate::metrics::metrics_listen_from_env() {
+        let m = metrics.clone();
+        spawn_local(async move {
+            if let Err(e) = crate::metrics::serve_metrics(addr, m).await {
+                eprintln!("metrics server error: {e:#}");
+            }
+        });
+    }
+
     let (pg, driver) = tls::connect(&cfg.conn_str(), cfg.tls).await?;
     tokio::spawn(driver);
     // Shared-CVR tables (per-client view + version) so identifying clients can
@@ -370,9 +382,26 @@ async fn run_inner<B: ReplicaBackend + 'static>(
         });
     }
 
+    // Periodic replica sampler (rows / bytes / file size).
+    {
+        let replica = replica.clone();
+        let m = metrics.clone();
+        spawn_local(async move {
+            loop {
+                let s = replica.metrics_sample();
+                m.replica_rows.store(s.rows, std::sync::atomic::Ordering::Relaxed);
+                m.replica_logical_bytes.store(s.logical_bytes, std::sync::atomic::Ordering::Relaxed);
+                m.replica_sqlite_file_bytes.store(s.file_bytes, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
+
     // Accept loop.
+    metrics.mark_ready(crate::metrics::ReadyComponent::Restored);
     let listener = TcpListener::bind(&cfg.listen_addr).await?;
     eprintln!("orbit-server listening on {}", cfg.listen_addr);
+    metrics.mark_ready(crate::metrics::ReadyComponent::ListenerBound);
     accept_ws_clients(listener, replica, pg, mutators, queries, forwarder, ticks_tx, lmids, None).await
 }
 
@@ -438,7 +467,8 @@ async fn accept_ws_clients<B: ReplicaBackend + 'static>(
 pub trait SnapshotStrategy {
     type Backend: ReplicaBackend + 'static;
     /// Persist a snapshot of `replica` reflecting change-stream position `pos`.
-    async fn write<O: ObjectStore>(&self, store: &O, replica: &Self::Backend, pos: u64) -> Result<()>;
+    /// Returns the snapshot's size in bytes (metrics).
+    async fn write<O: ObjectStore>(&self, store: &O, replica: &Self::Backend, pos: u64) -> Result<u64>;
     /// The position of the latest stored snapshot, if any. The replicator reads
     /// this on startup (last-resort fallback) so its change-stream sequence
     /// continues from where the last instance left off rather than resetting to 0.
@@ -460,9 +490,12 @@ pub struct JsonSnapshots;
 impl SnapshotStrategy for JsonSnapshots {
     type Backend = Replica;
 
-    async fn write<O: ObjectStore>(&self, store: &O, replica: &Replica, pos: u64) -> Result<()> {
+    async fn write<O: ObjectStore>(&self, store: &O, replica: &Replica, pos: u64) -> Result<u64> {
         let snap = ReplicaSnapshot { pos, tables: replica.snapshot() }; // sync gather (no await)
-        store.put(ReplicaSnapshot::KEY, snap.to_bytes()).await
+        let bytes = snap.to_bytes();
+        let n = bytes.len() as u64;
+        store.put(ReplicaSnapshot::KEY, bytes).await?;
+        Ok(n)
     }
 
     async fn stored_pos<O: ObjectStore>(&self, store: &O) -> Result<Option<u64>> {
@@ -592,7 +625,7 @@ impl SnapshotStrategy for SqliteSnapshots {
         store: &O,
         replica: &crate::sqlite_source::SqliteReplica,
         pos: u64,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let src = replica
             .db_path()
             .context("file snapshots need a durable (file-backed) replica")?
@@ -607,14 +640,15 @@ impl SnapshotStrategy for SqliteSnapshots {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let result: Result<()> = async {
+        let result: Result<u64> = async {
             crate::sqlite_source::SqliteReplica::backup_to(src, tmp.clone()).await?;
+            let n = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
             crate::objectstore::put_file(store, SQLITE_SNAPSHOT_KEY, &tmp, self.cfg.snapshot_part_size)
                 .await?;
             // Advisory pos, written AFTER the db object so it never over-claims.
             // (The authoritative pos rides inside the file itself.)
             store.put(SQLITE_SNAPSHOT_POS_KEY, pos.to_string().into_bytes()).await?;
-            Ok(())
+            Ok(n)
         }
         .await;
         let _ = tokio::fs::remove_file(&tmp).await;
@@ -751,6 +785,19 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
     snap: Rc<S>,
     replica: S::Backend,
 ) -> Result<()> {
+    // Metrics + readiness first: /ready answers 503 through initial sync and
+    // the first snapshot write.
+    let metrics = crate::metrics::Metrics::new(crate::metrics::Role::Replicator);
+    crate::metrics::set_node_metrics(metrics.clone());
+    if let Some(addr) = crate::metrics::metrics_listen_from_env() {
+        let m = metrics.clone();
+        spawn_local(async move {
+            if let Err(e) = crate::metrics::serve_metrics(addr, m).await {
+                eprintln!("metrics server error: {e:#}");
+            }
+        });
+    }
+
     let (pg, driver) = tls::connect(&cfg.conn_str(), cfg.tls).await?;
     tokio::spawn(driver);
 
@@ -832,10 +879,14 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
         log.clone(),
     );
     {
+        // Bind before spawning the accept loop so the readiness component
+        // reflects an actually-listening change stream.
+        let listener = TcpListener::bind(&change_stream_addr).await?;
+        eprintln!("change-stream listening on {change_stream_addr}");
+        metrics.mark_ready(crate::metrics::ReadyComponent::ListenerBound);
         let server = server.clone();
-        let addr = change_stream_addr.clone();
         tokio::spawn(async move {
-            if let Err(e) = server.serve(&addr).await {
+            if let Err(e) = server.serve_on(listener).await {
                 eprintln!("change-stream server error: {e:#}");
             }
         });
@@ -843,8 +894,38 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
 
     // Refresh the snapshot with the freshly-synced replica at the continued
     // watermark, so view-syncers restore current data aligned with `start_seq`.
-    snap.write(store.as_ref(), replica.as_ref(), start_seq).await?;
+    let snap_bytes = snap.write(store.as_ref(), replica.as_ref(), start_seq).await?;
+    metrics.snapshot_bytes.store(snap_bytes, std::sync::atomic::Ordering::Relaxed);
+    metrics.mark_ready(crate::metrics::ReadyComponent::Restored);
     eprintln!("replicator change-stream resuming at seq {start_seq} (dedup lsn {dedup_lsn})");
+
+    // Periodic sampler: ring/broadcast/changelog/replica gauges.
+    {
+        let server = server.clone();
+        let replica = replica.clone();
+        let m = metrics.clone();
+        let log_stats = log.as_ref().map(|l| l.stats());
+        spawn_local(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            loop {
+                let (entries, bytes) = server.ring_stats();
+                m.change_ring_entries.store(entries as u64, Relaxed);
+                m.change_ring_bytes.store(bytes as u64, Relaxed);
+                m.change_stream_seq.store(server.current_seq(), Relaxed);
+                m.replica_pos.store(server.current_seq(), Relaxed);
+                m.change_stream_subscribers.store(server.subscriber_count() as u64, Relaxed);
+                if let Some(s) = &log_stats {
+                    m.changelog_queue_depth.store(s.queued_events.load(Relaxed), Relaxed);
+                    m.changelog_queue_bytes.store(s.queued_bytes.load(Relaxed), Relaxed);
+                }
+                let s = replica.metrics_sample();
+                m.replica_rows.store(s.rows, Relaxed);
+                m.replica_logical_bytes.store(s.logical_bytes, Relaxed);
+                m.replica_sqlite_file_bytes.store(s.file_bytes, Relaxed);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+    }
 
     // Retention: prune log entries well past the in-memory ring window. A
     // view-syncer behind by more than this re-restores (rare); the rest resume by
@@ -872,12 +953,14 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
         let replica = replica.clone();
         let server = server.clone();
         let snap = snap.clone();
+        let m = metrics.clone();
         spawn_local(async move {
             loop {
                 tokio::time::sleep(snapshot_interval).await;
                 let pos = server.current_seq();
-                if let Err(e) = snap.write(store.as_ref(), replica.as_ref(), pos).await {
-                    eprintln!("snapshot failed: {e:#}");
+                match snap.write(store.as_ref(), replica.as_ref(), pos).await {
+                    Ok(n) => m.snapshot_bytes.store(n, std::sync::atomic::Ordering::Relaxed),
+                    Err(e) => eprintln!("snapshot failed: {e:#}"),
                 }
             }
         });
@@ -1039,7 +1122,35 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
     queries: QueryRegistry,
     snap: Rc<S>,
 ) -> Result<()> {
+    // Metrics + readiness first, so /ready answers 503 through the whole boot
+    // (snapshot restore + change-stream catch-up can take a while).
+    let metrics = crate::metrics::Metrics::new(crate::metrics::Role::ViewSyncer);
+    crate::metrics::set_node_metrics(metrics.clone());
+    if let Some(addr) = crate::metrics::metrics_listen_from_env() {
+        let m = metrics.clone();
+        spawn_local(async move {
+            if let Err(e) = crate::metrics::serve_metrics(addr, m).await {
+                eprintln!("metrics server error: {e:#}");
+            }
+        });
+    }
+
+    // Track peak RSS across the restore (the acceptance test asserts restore
+    // stays inside the container budget).
+    let restore_sampler = {
+        let m = metrics.clone();
+        spawn_local(async move {
+            loop {
+                if let Some(rss) = crate::metrics::rss_bytes() {
+                    m.snapshot_restore_peak_rss_bytes.fetch_max(rss, std::sync::atomic::Ordering::Relaxed);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
     let (replica, watermark) = snap.restore(&store, &cfg).await?;
+    restore_sampler.abort();
+    metrics.mark_ready(crate::metrics::ReadyComponent::Restored);
     let replica = Rc::new(replica);
 
     // Postgres connection only for client mutation write-through (no slot here);
@@ -1085,6 +1196,7 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
         let addr = change_stream_addr.clone();
         let replica_pos = replica_pos.clone();
         let snap = snap.clone();
+        let metrics = metrics.clone();
         spawn_local(async move {
             let mut watermark = watermark;
             replica_pos.set(watermark);
@@ -1138,11 +1250,20 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
                             }
                             replica.commit_txn(0, watermark);
                             replica_pos.set(watermark);
+                            metrics.replica_pos.store(watermark, std::sync::atomic::Ordering::Relaxed);
+                            // Mixed-version fallback: an old replicator never
+                            // sends CaughtUp — the first applied live commit
+                            // still proves we're current.
+                            metrics.mark_ready(crate::metrics::ReadyComponent::CaughtUp);
                             stuck_failures = 0;
                             if dirty {
                                 let _ = ticks_tx.send(());
                                 dirty = false;
                             }
+                        }
+                        Ok(Some(ChangeMsg::CaughtUp { .. })) => {
+                            // Backlog replayed — this node serves current data.
+                            metrics.mark_ready(crate::metrics::ReadyComponent::CaughtUp);
                         }
                         Ok(Some(ChangeMsg::Reset)) => {
                             // Resume point can't be served (replicator restarted, or
@@ -1185,7 +1306,23 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
         });
     }
 
+    // Periodic replica sampler (rows / bytes / file size).
+    {
+        let replica = replica.clone();
+        let m = metrics.clone();
+        spawn_local(async move {
+            loop {
+                let s = replica.metrics_sample();
+                m.replica_rows.store(s.rows, std::sync::atomic::Ordering::Relaxed);
+                m.replica_logical_bytes.store(s.logical_bytes, std::sync::atomic::Ordering::Relaxed);
+                m.replica_sqlite_file_bytes.store(s.file_bytes, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
+
     let listener = TcpListener::bind(&cfg.listen_addr).await?;
     eprintln!("view-syncer listening on {}", cfg.listen_addr);
+    metrics.mark_ready(crate::metrics::ReadyComponent::ListenerBound);
     accept_ws_clients(listener, replica, pg, mutators, queries, forwarder, ticks_tx, lmids, Some(replica_pos)).await
 }

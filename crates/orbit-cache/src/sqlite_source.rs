@@ -904,6 +904,28 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
             .map(|p| p as u64)
     }
 
+    fn metrics_sample(&self) -> crate::replica::ReplicaSample {
+        let mut s = crate::replica::ReplicaSample::default();
+        // File size (incl. WAL) — the disk footprint. Page stats would need a
+        // query per sample; the file is the operative number for capacity.
+        if let Some(path) = self.db_path() {
+            for suffix in ["", "-wal"] {
+                let mut p = path.to_path_buf().into_os_string();
+                p.push(suffix);
+                if let Ok(md) = std::fs::metadata(std::path::PathBuf::from(p)) {
+                    s.file_bytes += md.len();
+                }
+            }
+        } else if let Ok((page_count, page_size)) =
+            self.conn.query_row("SELECT * FROM pragma_page_count(), pragma_page_size()", [], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })
+        {
+            s.file_bytes = (page_count * page_size) as u64;
+        }
+        s
+    }
+
     fn start_fresh(&self) {
         // Atomically drop everything stale before a fresh initial sync: the
         // sync only upserts, so rows deleted upstream while this replica was

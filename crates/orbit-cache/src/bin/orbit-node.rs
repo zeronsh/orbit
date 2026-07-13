@@ -27,6 +27,10 @@
 //!   ORBIT_REPLICA_MMAP_MB       sqlite: mmap budget (PRAGMA mmap_size)
 //!   ORBIT_SNAPSHOT_PART_MB      sqlite: snapshot upload/download buffer (default 8;
 //!                               transfer memory ceiling ≈ 2× this)
+//!   ORBIT_METRICS_LISTEN        metrics/health HTTP bind (default 0.0.0.0:9090;
+//!                               set empty or `off` to disable). GET /metrics
+//!                               (Prometheus), /ready (200 once restored + caught
+//!                               up + serving, else 503), /live.
 
 use std::time::Duration;
 
@@ -103,6 +107,12 @@ async fn main() -> anyhow::Result<()> {
         api_key: std::env::var("ORBIT_API_KEY").ok(),
         forward_cookies: std::env::var("ORBIT_FORWARD_COOKIES").is_ok(),
     };
+
+    // Containers get metrics/readiness on 9090 unless explicitly disabled
+    // (the library serves it only when this env var is set).
+    if std::env::var("ORBIT_METRICS_LISTEN").is_err() {
+        std::env::set_var("ORBIT_METRICS_LISTEN", "0.0.0.0:9090");
+    }
 
     let store = S3ObjectStore::from_env()?;
     let cs_addr = env("ORBIT_CHANGE_STREAM_ADDR", "[::]:4000");

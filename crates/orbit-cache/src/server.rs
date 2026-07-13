@@ -396,8 +396,12 @@ where
     let cookie = format!("{:08}", *version);
     let poke_id = format!("poke-{}", *version);
     let cap = poke_part_cap();
+    let metrics = crate::metrics::node_metrics();
+    let is_hydration = got_query.is_some();
+    let mut sent_bytes = 0usize;
+    let mut sent_parts = 0u64;
 
-    send(tx, &Downstream::PokeStart(PokeStartBody {
+    sent_bytes += send(tx, &Downstream::PokeStart(PokeStartBody {
         poke_id: poke_id.clone(),
         base_cookie: base_cookie.clone(),
         schema_versions: None,
@@ -430,7 +434,7 @@ where
             chunk.push(it.next().unwrap());
         }
         let (lmids, got) = meta.take().unwrap_or((None, None));
-        send(tx, &Downstream::PokePart(PokePartBody {
+        sent_bytes += send(tx, &Downstream::PokePart(PokePartBody {
             poke_id: poke_id.clone(),
             last_mutation_id_changes: lmids,
             got_queries_patch: got,
@@ -438,6 +442,7 @@ where
             ..Default::default()
         }))
         .await?;
+        sent_parts += 1;
         // `send` awaits the socket flush (backpressure); yield anyway so a
         // fast socket can't let one giant hydration monopolize the LocalSet.
         tokio::task::yield_now().await;
@@ -446,25 +451,85 @@ where
         }
     }
 
-    send(tx, &Downstream::PokeEnd(PokeEndBody {
+    sent_bytes += send(tx, &Downstream::PokeEnd(PokeEndBody {
         poke_id,
         cookie: cookie.clone(),
         cancel: None,
     }))
     .await?;
     *base_cookie = Some(cookie);
+    if let Some(m) = &metrics {
+        use std::sync::atomic::Ordering::Relaxed;
+        m.pokes_total.fetch_add(1, Relaxed);
+        m.poke_parts_total.fetch_add(sent_parts, Relaxed);
+        m.poke_bytes_total.fetch_add(sent_bytes as u64, Relaxed);
+        if is_hydration {
+            m.hydration_bytes_total.fetch_add(sent_bytes as u64, Relaxed);
+        }
+    }
     Ok(())
 }
 
+/// Serialize + send one frame; returns its serialized byte length (metrics).
 async fn send<S>(
     tx: &mut SplitSink<WebSocketStream<S>, Message>,
     msg: &Downstream,
-) -> anyhow::Result<()>
+) -> anyhow::Result<usize>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    tx.send(Message::Text(serde_json::to_string(msg)?)).await?;
-    Ok(())
+    let s = serde_json::to_string(msg)?;
+    let n = s.len();
+    tx.send(Message::Text(s)).await?;
+    Ok(n)
+}
+
+/// RAII connection gauges: increments `connected_clients` on connect and
+/// unwinds this connection's contribution to every gauge on ANY exit path.
+struct ConnGauges {
+    m: Option<std::sync::Arc<crate::metrics::Metrics>>,
+    active: u64,
+    matched: u64,
+}
+
+impl ConnGauges {
+    fn new() -> Self {
+        let m = crate::metrics::node_metrics();
+        if let Some(m) = &m {
+            m.connected_clients.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        ConnGauges { m, active: 0, matched: 0 }
+    }
+
+    /// Reconcile the global gauges with this connection's current counts.
+    fn update(&mut self, active: usize, matched: usize) {
+        let Some(m) = &self.m else { return };
+        use std::sync::atomic::Ordering::Relaxed;
+        let (active, matched) = (active as u64, matched as u64);
+        if active >= self.active {
+            m.active_queries.fetch_add(active - self.active, Relaxed);
+        } else {
+            m.active_queries.fetch_sub(self.active - active, Relaxed);
+        }
+        if matched >= self.matched {
+            m.matched_rows.fetch_add(matched - self.matched, Relaxed);
+        } else {
+            m.matched_rows.fetch_sub(self.matched - matched, Relaxed);
+        }
+        self.active = active;
+        self.matched = matched;
+    }
+}
+
+impl Drop for ConnGauges {
+    fn drop(&mut self) {
+        if let Some(m) = &self.m {
+            use std::sync::atomic::Ordering::Relaxed;
+            m.connected_clients.fetch_sub(1, Relaxed);
+            m.active_queries.fetch_sub(self.active, Relaxed);
+            m.matched_rows.fetch_sub(self.matched, Relaxed);
+        }
+    }
 }
 
 /// Serve a connection in a **multi-client** deployment.
@@ -508,6 +573,7 @@ where
     let mut version: u64 = 0;
     let mut base_cookie: Option<String> = None;
     let mut row_refs = RowRefs::new();
+    let mut gauges = ConnGauges::new();
 
     // Shared-CVR cross-node resume: if the client identifies itself and we have a
     // Postgres handle, load the view it last held (persisted by whatever node it was
@@ -575,6 +641,7 @@ where
         let resume = resume_prior.take();
         subscribe(initial_queries, provider, queries, forwarder, auth, &mut tx, &mut active, &mut version, &mut base_cookie, &mut row_refs, resume.as_ref()).await?;
         cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version, replica_pos.as_ref().map(|p| p.get()).unwrap_or(0)).await?;
+        gauges.update(active.len(), row_refs.len());
     }
 
     loop {
@@ -587,7 +654,9 @@ where
                     Message::Text(text) if !text.trim().is_empty() => {
                         let up: Upstream = serde_json::from_str(&text)?;
                         match up {
-                            Upstream::Ping => send(&mut tx, &Downstream::Pong).await?,
+                            Upstream::Ping => {
+                                send(&mut tx, &Downstream::Pong).await?;
+                            }
                             Upstream::Push(push) => {
                                 // The lastMutationID is NOT acked here. It's advanced by the app's
                                 // PushProcessor (or the direct-write path below) in `orbit_client_mutations`
@@ -666,11 +735,13 @@ where
                                 let resume = resume_prior.take();
                                 subscribe(b.desired_queries_patch, provider, queries, forwarder, auth, &mut tx, &mut active, &mut version, &mut base_cookie, &mut row_refs, resume.as_ref()).await?;
                                 cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version, replica_pos.as_ref().map(|p| p.get()).unwrap_or(0)).await?;
+                                gauges.update(active.len(), row_refs.len());
                             }
                             Upstream::ChangeDesiredQueries(b) => {
                                 let resume = resume_prior.take();
                                 subscribe(b.desired_queries_patch, provider, queries, forwarder, auth, &mut tx, &mut active, &mut version, &mut base_cookie, &mut row_refs, resume.as_ref()).await?;
                                 cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version, replica_pos.as_ref().map(|p| p.get()).unwrap_or(0)).await?;
+                                gauges.update(active.len(), row_refs.len());
                             }
                         }
                     }
@@ -696,6 +767,7 @@ where
                     None => HashMap::new(),
                 };
                 flush_active(&active, &mut tx, &mut version, &mut base_cookie, &mut row_refs, ack).await?;
+                gauges.update(active.len(), row_refs.len());
                 // Throttled CVR checkpoint (off the per-mutation hot path) so a
                 // reconnect to another node resumes from a recent view.
                 if cvr_on && last_ckpt.elapsed() >= std::time::Duration::from_secs(1) {

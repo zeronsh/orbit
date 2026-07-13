@@ -49,6 +49,41 @@ Run the cluster node role instead by overriding the command with `orbit-node`.
 | `ORBIT_QUERY_URL` | _(none)_ | App endpoint for custom (named) queries |
 | `ORBIT_API_KEY` | _(none)_ | Sent as `X-Api-Key` to the forwarding endpoints |
 | `ORBIT_FORWARD_COOKIES` | _(unset)_ | If set, forward the client `Cookie` header |
+| `ORBIT_METRICS_LISTEN` | `0.0.0.0:9090` (binaries) | Metrics/health HTTP bind; empty/`off` disables |
+| `ORBIT_REPLICA_CACHE_MB` / `ORBIT_REPLICA_MMAP_MB` | _(SQLite defaults)_ | SQLite page-cache / mmap budget (`ORBIT_REPLICA=sqlite`) |
+| `ORBIT_SNAPSHOT_PART_MB` | `8` | Cluster snapshot transfer buffer (memory ceiling ≈ 2×) |
+| `ORBIT_POKE_PART_BYTES` | `524288` | Serialized cap per `pokePart` frame |
+| `ORBIT_CHANGE_RING_BYTES` / `ORBIT_CHANGE_RING_CAPACITY` | `64 MiB` / `65536` | Replicator change-ring bounds |
+| `ORBIT_CHANGELOG_QUEUE_BYTES` / `_QUEUE_EVENTS` | `32 MiB` / `65536` | Durable change-log queue bounds (backpressure) |
+| `ORBIT_CHANGELOG_BATCH_BYTES` / `_BATCH_EVENTS` | `4 MiB` / `1024` | Durable change-log write-batch flush triggers |
+
+## Metrics & readiness
+
+Every node serves a tiny HTTP endpoint (default `:9090`):
+
+- `GET /metrics` — Prometheus text: replica size (`orbit_replica_*`), snapshot
+  size and restore peak RSS, change-ring and change-log queue bytes, connected
+  clients / active queries / matched rows, poke and hydration bytes, process RSS.
+- `GET /ready` — `200` only after the node completed startup (**replicator**:
+  initial sync + first snapshot + change-stream bound; **view-syncer**: snapshot
+  restored + change-stream caught up + WS bound; **single-node**: sync + WS
+  bound), else `503`. Route traffic only to ready nodes.
+- `GET /live` — always `200`.
+
+Fly.io check (route only to ready machines; grace covers restore + catch-up):
+
+```toml
+# fly.toml
+[[services]]
+  internal_port = 9090
+  protocol = "tcp"
+  [[services.http_checks]]
+    port = 9090
+    path = "/ready"
+    interval = "5s"
+    timeout = "2s"
+    grace_period = "30s"
+```
 
 ## Postgres requirements
 

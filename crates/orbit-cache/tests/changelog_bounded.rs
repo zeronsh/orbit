@@ -127,6 +127,9 @@ async fn byte_evicted_resume_bridges_from_durable_log() {
         match tokio::time::timeout(Duration::from_secs(5), c.next()).await.unwrap().unwrap() {
             Some(ChangeMsg::Change { pos, .. }) => got.push(pos),
             Some(ChangeMsg::Reset) => panic!("got Reset; expected a delta bridged from the log"),
+            // Sent once the backlog is fully replayed (readiness signal); the
+            // delta always precedes it, so it never eats one of these reads.
+            Some(ChangeMsg::CaughtUp { .. }) => continue,
             None => break,
         }
     }
