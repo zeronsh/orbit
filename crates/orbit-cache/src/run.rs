@@ -27,12 +27,11 @@ use tokio::sync::broadcast;
 use tokio::task::{spawn_local, LocalSet};
 use crate::pg::tls::{self, PgTlsMode};
 
-/// How many recent changes the replicator keeps IN MEMORY (the ring) for fast
-/// view-syncer resume. Kept small so the footprint stays bounded — the `VecDeque`
-/// never shrinks, so a 1M cap let it climb toward ~100MB+ under a high change rate
-/// (e.g. cursor presence). A view-syncer lagging further than this resumes from the
-/// durable change-log instead.
-const CHANGE_RING_CAPACITY: usize = 65_536;
+// How many recent changes the replicator keeps IN MEMORY (the ring) for fast
+// view-syncer resume is configured via `ChangeStreamConfig` (65,536 events /
+// 64 MiB by default; `ORBIT_CHANGE_RING_CAPACITY` / `ORBIT_CHANGE_RING_BYTES`).
+// A view-syncer lagging further than the ring resumes from the durable
+// change-log instead.
 
 /// How many recent changes the durable change-log (Postgres) retains for resume
 /// after a longer gap or a restart. On disk, so kept far larger than the ring.
@@ -543,7 +542,13 @@ async fn run_replicator_inner<O: ObjectStore + 'static>(
     };
     let mut dedup_lsn = checkpoint.map(|(_, lsn)| lsn).unwrap_or(0);
 
-    let server = ChangeStreamServer::new_with_log(CHANGE_RING_CAPACITY, start_seq, log.clone());
+    // Ring/broadcast tuning from ORBIT_CHANGE_RING_BYTES / ORBIT_CHANGE_RING_CAPACITY /
+    // ORBIT_BROADCAST_CAP; the struct defaults match CHANGE_RING_CAPACITY + 64 MiB.
+    let server = ChangeStreamServer::with_config(
+        crate::changestream::ChangeStreamConfig::from_env(),
+        start_seq,
+        log.clone(),
+    );
     {
         let server = server.clone();
         let addr = change_stream_addr.clone();
@@ -634,10 +639,13 @@ async fn run_replicator_inner<O: ObjectStore + 'static>(
                     if lsn > dedup_lsn {
                         for (l, e) in txn_buf.drain(..) {
                             replica.apply(e.clone());
-                            server.publish(l, e);
+                            // Awaits only when the durable log's byte budget is
+                            // full — the intended backpressure point that parks
+                            // WAL consumption (see changelog module doc).
+                            server.publish(l, e).await;
                         }
                         replica.apply(LogicalEvent::Commit);
-                        server.publish(lsn, LogicalEvent::Commit);
+                        server.publish(lsn, LogicalEvent::Commit).await;
                         dedup_lsn = lsn;
                     } else {
                         txn_buf.clear(); // already logged (re-delivered) → skip the txn

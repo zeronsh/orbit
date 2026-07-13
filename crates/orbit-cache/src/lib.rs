@@ -28,7 +28,7 @@ pub mod sharded;
 pub mod sqlite_source;
 pub mod view_sync;
 
-pub use changestream::{ChangeMsg, ChangeStreamClient, ChangeStreamServer};
+pub use changestream::{ChangeMsg, ChangeStreamClient, ChangeStreamConfig, ChangeStreamServer};
 pub use objectstore::{LocalObjectStore, ObjectStore, ReplicaSnapshot};
 #[cfg(feature = "s3")]
 pub use objectstore::S3ObjectStore;

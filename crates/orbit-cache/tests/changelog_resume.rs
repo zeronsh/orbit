@@ -41,7 +41,7 @@ async fn resume_from_durable_log_after_ring_eviction() {
 
     // Publish 5 commits → pos 1..=5. The ring keeps {4,5} (floor=3); the log keeps all.
     for i in 0..5u64 {
-        server.publish(1000 + i, LogicalEvent::Commit);
+        server.publish(1000 + i, LogicalEvent::Commit).await;
     }
     // Let the async writer flush to Postgres.
     tokio::time::sleep(Duration::from_millis(900)).await;
