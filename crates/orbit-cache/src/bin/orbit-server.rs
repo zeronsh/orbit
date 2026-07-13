@@ -19,6 +19,12 @@
 use oql::ivm::ColumnType;
 use orbit_cache::{run_server, run_server_sqlite, MutatorRegistry, ServerConfig, TableConfig};
 
+// mimalloc: glibc malloc never returns a freed hydration working set to the
+// OS (arena retention pins RSS at peak), which matters in memory-limited
+// containers. mimalloc purges freed pages back to the OS.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     // Version is kept in lockstep with the `@zeronsh/orbit` npm package + the

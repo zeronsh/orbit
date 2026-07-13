@@ -53,6 +53,7 @@ Run the cluster node role instead by overriding the command with `orbit-node`.
 | `ORBIT_REPLICA_CACHE_MB` / `ORBIT_REPLICA_MMAP_MB` | _(SQLite defaults)_ | SQLite page-cache / mmap budget (`ORBIT_REPLICA=sqlite`) |
 | `ORBIT_SNAPSHOT_PART_MB` | `8` | Cluster snapshot transfer buffer (memory ceiling ≈ 2×) |
 | `ORBIT_POKE_PART_BYTES` | `524288` | Serialized cap per `pokePart` frame |
+| `ORBIT_MAX_CONCURRENT_HYDRATIONS` | `1` | Concurrent fresh query hydrations per node (peak memory ≈ this × result-set size; queued clients wait, they don't fail) |
 | `ORBIT_CHANGE_RING_BYTES` / `ORBIT_CHANGE_RING_CAPACITY` | `64 MiB` / `65536` | Replicator change-ring bounds |
 | `ORBIT_CHANGELOG_QUEUE_BYTES` / `_QUEUE_EVENTS` | `32 MiB` / `65536` | Durable change-log queue bounds (backpressure) |
 | `ORBIT_CHANGELOG_BATCH_BYTES` / `_BATCH_EVENTS` | `4 MiB` / `1024` | Durable change-log write-batch flush triggers |

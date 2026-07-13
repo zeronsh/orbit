@@ -45,6 +45,12 @@ fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+// mimalloc: glibc malloc never returns a freed hydration working set to the
+// OS (arena retention pins RSS at peak), which matters in memory-limited
+// containers. mimalloc purges freed pages back to the OS.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let role = env("ORBIT_ROLE", "view-syncer");

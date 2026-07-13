@@ -1,0 +1,25 @@
+# 512 MB acceptance test: full cluster under hard memory limits (see
+# scripts/acceptance/run.sh). Heavy (multi-minute, memory-sensitive), so it
+# runs nightly + on demand — not on every PR.
+name: acceptance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *" # nightly
+
+jobs:
+  acceptance-512mb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run 512 MB acceptance harness
+        run: scripts/acceptance/run.sh
+      - name: Upload artifacts (metrics poll + logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-out
+          path: acceptance-out/
+          if-no-files-found: warn

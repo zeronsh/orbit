@@ -552,6 +552,13 @@ pub fn source_push(src: &Rc<RefCell<SqliteSource>>, change: SourceChange) {
         e
     };
     let n = src.borrow().active_connections.len();
+    // Convert ONCE and share: a `Node`'s row is an `Rc<Row>`, so cloning the
+    // template per connection bumps a refcount instead of deep-copying the
+    // row (mirrors `MemorySource::source_push`'s OverlayChange sharing).
+    // Deep-copying per connection made every replicated row cost
+    // O(connected clients) heap while it sat in their Catch buffers awaiting
+    // the next flush — a 130 MB replication burst × 6 clients was ~800 MB.
+    let template = base_change(&change);
     for active_pos in 0..n {
         let output = {
             let mut s = src.borrow_mut();
@@ -561,7 +568,7 @@ pub fn source_push(src: &Rc<RefCell<SqliteSource>>, change: SourceChange) {
             conn.output.as_ref().and_then(std::rc::Weak::upgrade)
         };
         if let Some(output) = output {
-            deliver(&output, base_change(&change));
+            deliver(&output, template.clone());
         }
     }
     let mut s = src.borrow_mut();

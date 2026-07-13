@@ -1206,11 +1206,23 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
             // WS server serves ever-staler data. Crash-only after a few tries.
             let mut stuck_failures = 0u32;
             loop {
-                let mut client = match ChangeStreamClient::connect(&addr, watermark).await {
-                    Ok(c) => c,
-                    Err(e) => {
+                // Bounded connect: DNS/TCP to the replicator can hang
+                // indefinitely right after a container restart (observed with
+                // Docker's embedded DNS) — an unbounded connect wedges the
+                // pump forever while the WS server serves ever-staler data.
+                let connect = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    ChangeStreamClient::connect(&addr, watermark),
+                );
+                let mut client = match connect.await {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => {
                         eprintln!("change-stream connect failed: {e:#}; retrying");
                         tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!("change-stream connect timed out; retrying");
                         continue;
                     }
                 };

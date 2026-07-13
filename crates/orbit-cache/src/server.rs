@@ -330,6 +330,31 @@ fn crud_to_change(op: &CrudOp, replica: &Replica) -> Option<(String, SourceChang
     }
 }
 
+thread_local! {
+    /// Per-node hydration admission gate (one serving thread per node, so a
+    /// thread-local is node-scoped — same reasoning as `metrics::NODE_METRICS`).
+    ///
+    /// A fresh hydration materializes its full result (`fetch()` node tree +
+    /// `RowsPatch`) before the chunked sends bound the WIRE memory — the
+    /// PATCH is still O(result set), and on a SQLite replica those rows are
+    /// fresh allocations, not shared `Rc`s. N concurrent full-history
+    /// hydrations therefore hold N × result-set bytes at once; this gate
+    /// bounds peak memory to `ORBIT_MAX_CONCURRENT_HYDRATIONS` × result
+    /// (default 1). Queued clients hydrate as soon as a permit frees — they
+    /// wait, they don't fail.
+    static HYDRATION_GATE: Rc<tokio::sync::Semaphore> = Rc::new(tokio::sync::Semaphore::new(
+        std::env::var("ORBIT_MAX_CONCURRENT_HYDRATIONS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1),
+    ));
+}
+
+fn hydration_gate() -> Rc<tokio::sync::Semaphore> {
+    HYDRATION_GATE.with(Rc::clone)
+}
+
 /// Serialized-size cap per `pokePart` frame. `ORBIT_POKE_PART_BYTES`
 /// (default 512 KiB, floor 4 KiB). Bounds the peak transient allocation of a
 /// poke to O(cap) instead of O(result set): a large hydration becomes many
@@ -849,6 +874,12 @@ where
                     },
                 };
                 let Some(ast) = ast else { continue };
+                // Admission control: the fetch + patch below materialize the
+                // full result, and the permit is held through the chunked
+                // sends — peak node memory stays at (gate width) × result
+                // instead of (connected hydrating clients) × result.
+                let gate = hydration_gate();
+                let _hydrating = gate.acquire().await.expect("hydration gate closed");
                 let top = build_pipeline(&ast, provider);
                 let catch = Catch::new(top.input.clone());
                 let link: Link = catch.clone();

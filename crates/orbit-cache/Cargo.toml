@@ -39,6 +39,11 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rand = "0.8"
 # S3/Tigris-backed object store (replica snapshots). Enable with --features s3.
 object_store = { version = "0.11", features = ["aws"], optional = true }
+# Allocator for the BINARIES (the library stays allocator-agnostic): glibc
+# malloc retains a whole hydration working set (~1.8× result-set bytes) in its
+# arenas after free, pinning container RSS at peak forever; mimalloc purges
+# freed memory back to the OS, keeping steady-state RSS near the true live set.
+mimalloc = "0.1"
 
 [features]
 # An S3-compatible (AWS S3, Tigris, MinIO, …) ObjectStore for replica snapshots.
@@ -48,9 +53,8 @@ s3 = ["dep:object_store"]
 tokio = { workspace = true }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
-# Scalable multithread allocator for the multinode benchmark (the system malloc
-# serializes under per-core fan-out allocation). Representative of production.
-mimalloc = "0.1"
+# (mimalloc moved to [dependencies]: the binaries now use it as the global
+# allocator; benches keep using it from there.)
 
 [[example]]
 name = "multinode_bench"

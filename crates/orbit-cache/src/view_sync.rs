@@ -10,7 +10,7 @@
 //! table name). Hidden relationships (junction edges) are flattened through:
 //! their row is not emitted, but their children are.
 
-use oql::ivm::{Change, Node, RowRef, Schema};
+use oql::ivm::{Change, Node, Schema};
 use oql::value::{Row, Value};
 use orbit_protocol::{RowPatchOp, RowsPatch};
 use sha2::{Digest, Sha256};
@@ -39,12 +39,18 @@ fn fingerprint_row(row: &Row) -> String {
     format!("{:x}", Sha256::digest(json))
 }
 
-/// Per-connection row reference counts + a cheap handle to each row's value — the
-/// core of a CVR. A row may be synced by several queries, so a `del` is only sent
-/// once the last query drops it. The hot path is JSON-free: rows are keyed by their
-/// primary-key *values* (`Value` is `Ord`) and the value is held as a refcounted
-/// [`RowRef`] (an `Rc` bump). JSON is produced only when the view is checkpointed
-/// or diffed on reconnect — both off the per-mutation path.
+/// Per-connection row reference counts + a fixed-size fingerprint of each row's
+/// value — the core of a CVR. A row may be synced by several queries, so a `del`
+/// is only sent once the last query drops it. Rows are keyed by their
+/// primary-key *values* (`Value` is `Ord`); the value is stored as its SHA-256
+/// fingerprint, computed when the row (or a new value for it) is registered.
+///
+/// Why a fingerprint and not the `RowRef` itself: pinning the `Rc<Row>` per
+/// connection holds O(view bytes) heap PER CLIENT on backends whose fetched
+/// rows are fresh allocations (SQLite replica — a 200 MB view × N clients was
+/// an OOM), and made every checkpoint re-serialize + re-hash the entire view.
+/// Hashing once per row *change* is strictly cheaper than hashing the whole
+/// view once per checkpoint second.
 #[derive(Default)]
 pub struct RowRefs {
     /// table → (pk values → entry). Nested (rather than a flat
@@ -57,7 +63,8 @@ pub struct RowRefs {
 
 struct RowEntry {
     count: u32,
-    row: RowRef,
+    /// SHA-256 hex of the row's JSON at last registration (see [`fingerprint_row`]).
+    fingerprint: String,
 }
 
 impl RowRefs {
@@ -79,8 +86,10 @@ impl RowRefs {
             self.pks.insert(table.to_string(), pk.to_vec());
         }
     }
-    /// Increment a key's refcount, recording the current row; true if first (0 → 1).
-    fn incr(&mut self, table: &str, vals: Vec<Value>, row: RowRef) -> bool {
+    /// Increment a key's refcount, recording the current row's fingerprint;
+    /// true if first (0 → 1).
+    fn incr(&mut self, table: &str, vals: Vec<Value>, row: &Row) -> bool {
+        let fingerprint = fingerprint_row(row);
         // Table lookup by &str: allocates the table key only on first sight.
         let rows = match self.tables.get_mut(table) {
             Some(r) => r,
@@ -89,11 +98,11 @@ impl RowRefs {
         match rows.get_mut(&vals) {
             Some(e) => {
                 e.count += 1;
-                e.row = row;
+                e.fingerprint = fingerprint;
                 false
             }
             None => {
-                rows.insert(vals, RowEntry { count: 1, row });
+                rows.insert(vals, RowEntry { count: 1, fingerprint });
                 true
             }
         }
@@ -112,13 +121,14 @@ impl RowRefs {
         false
     }
     /// Update the stored value for an existing key (edit-in-place).
-    fn touch(&mut self, table: &str, vals: &[Value], row: RowRef) {
+    fn touch(&mut self, table: &str, vals: &[Value], row: &Row) {
         if let Some(e) = self.tables.get_mut(table).and_then(|rows| rows.get_mut(vals)) {
-            e.row = row;
+            e.fingerprint = fingerprint_row(row);
         }
     }
     /// The client's current view (row identity → value fingerprint) for CVR
-    /// checkpointing. Hashes here — never on the per-mutation hot path.
+    /// checkpointing. Fingerprints were computed as rows changed, so this only
+    /// rebuilds the identity keys — O(view rows), no row payloads touched.
     pub fn view(&self) -> ClientView {
         let mut out = HashMap::new();
         for (table, rows) in &self.tables {
@@ -126,7 +136,7 @@ impl RowRefs {
             for (vals, e) in rows {
                 let id: Row = pk.iter().cloned().zip(vals.iter().cloned()).collect();
                 let id_json = serde_json::to_string(&id).unwrap_or_default();
-                out.insert((table.clone(), id_json), fingerprint_row(&e.row));
+                out.insert((table.clone(), id_json), e.fingerprint.clone());
             }
         }
         out
@@ -201,7 +211,7 @@ fn change_to_patches_dedup(change: &Change, schema: &Schema, refs: &mut RowRefs,
         Change::Remove(node) => node_dels_dedup(node, schema, refs, out),
         Change::Edit { node, .. } => {
             if !schema.is_hidden {
-                refs.touch(&schema.table_name, &pk_values(&node.row, &schema.primary_key), node.row.clone());
+                refs.touch(&schema.table_name, &pk_values(&node.row, &schema.primary_key), &node.row.0);
                 out.push(RowPatchOp::Put { table_name: schema.table_name.clone(), value: Rc::clone(&node.row.0) });
             }
         }
@@ -224,7 +234,7 @@ fn node_puts_dedup(
         let table = &schema.table_name;
         let pk = &schema.primary_key;
         refs.register_pk(table, pk);
-        refs.incr(table, pk_values(&node.row, pk), node.row.clone());
+        refs.incr(table, pk_values(&node.row, pk), &node.row.0);
         // On resume only (prior present), suppress the put if the client already
         // holds this exact value. The JSON here is off the hot path.
         let suppress = match prior {
@@ -371,11 +381,7 @@ mod tests {
 
         let mut refs = RowRefs::new();
         refs.register_pk("messages", &["id".into()]);
-        refs.incr(
-            "messages",
-            vec![Value::String("m1".into())],
-            RowRef::new(row),
-        );
+        refs.incr("messages", vec![Value::String("m1".into())], &row);
 
         let view = refs.view();
         let fingerprint = view.values().next().unwrap();
