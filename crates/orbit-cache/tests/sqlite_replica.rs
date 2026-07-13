@@ -184,7 +184,7 @@ fn durable_transactions_are_atomic_across_tables_and_crashes() {
         replica.begin_txn();
         replica.apply(LogicalEvent::Insert { table: "a".into(), row: row(&[("id", "a1".into()), ("n", 1.0.into())]) });
         replica.apply(LogicalEvent::Insert { table: "b".into(), row: row(&[("id", "b1".into()), ("n", 1.0.into())]) });
-        replica.commit_txn(10);
+        replica.commit_txn(10, 0);
 
         // Txn 2: applied but NEVER committed — the "crash" is dropping the
         // replica (and its connection) with the transaction open.
@@ -221,7 +221,7 @@ fn start_fresh_clears_stale_rows_and_watermark() {
         replica.add_table("t", item_cols(), vec!["id".into()]);
         replica.begin_txn();
         replica.apply(LogicalEvent::Insert { table: "t".into(), row: row(&[("id", "stale".into()), ("n", 1.0.into())]) });
-        replica.commit_txn(7);
+        replica.commit_txn(7, 0);
     }
 
     // "Restart" that decides on a fresh sync (e.g. watermark policy change):
@@ -235,11 +235,176 @@ fn start_fresh_clears_stale_rows_and_watermark() {
     // Re-seed as initial sync would, then verify only the new state exists.
     replica.begin_txn();
     replica.seed("t", row(&[("id", "current".into()), ("n", 2.0.into())]));
-    replica.commit_txn(0);
+    replica.commit_txn(0, 0);
     let rows = t.borrow().all_rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], "current".into());
     assert_eq!(replica.resume_watermark(), None, "lsn 0 = still no replayable watermark");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- Cluster resume: pos watermark, snapshot backups, schema migration -------
+
+/// `commit_txn(lsn, pos)` records both watermarks atomically; `resume_pos`
+/// reads the change-stream position back; `start_fresh` clears it.
+#[test]
+fn pos_watermark_roundtrip_and_start_fresh() {
+    let dir = std::env::temp_dir().join(format!("orbit_sqlite_pos_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    {
+        let mut replica = SqliteReplica::durable(&dir);
+        replica.add_table("t", item_cols(), vec!["id".into()]);
+        replica.begin_txn();
+        replica.apply(LogicalEvent::Insert { table: "t".into(), row: row(&[("id", "x".into()), ("n", 1.0.into())]) });
+        replica.commit_txn(42, 777);
+    }
+
+    let mut replica = SqliteReplica::durable(&dir);
+    replica.add_table("t", item_cols(), vec!["id".into()]);
+    assert_eq!(replica.resume_watermark(), Some(42));
+    assert_eq!(replica.resume_pos(), Some(777));
+
+    replica.start_fresh();
+    assert_eq!(replica.resume_pos(), None, "start_fresh clears pos too");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `backup_to` (VACUUM INTO) takes a consistent copy while the source
+/// connection stays open: single file, passes quick_check, carries rows and
+/// the (lsn, pos) watermark.
+#[tokio::test]
+async fn backup_to_copies_rows_and_watermark_while_open() {
+    let dir = std::env::temp_dir().join(format!("orbit_sqlite_backup_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dest = std::env::temp_dir().join(format!("orbit_sqlite_backup_out_{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&dest);
+
+    let mut replica = SqliteReplica::durable(&dir);
+    replica.add_table("t", item_cols(), vec!["id".into()]);
+    replica.begin_txn();
+    for i in 0..50 {
+        replica.apply(LogicalEvent::Insert {
+            table: "t".into(),
+            row: row(&[("id", format!("r{i}").as_str().into()), ("n", (i as f64).into())]),
+        });
+    }
+    replica.commit_txn(9, 123);
+
+    // Source connection still open (replica alive) during the backup.
+    SqliteReplica::backup_to(replica.db_path().unwrap().to_owned(), dest.clone()).await.unwrap();
+
+    let copy = rusqlite::Connection::open(&dest).unwrap();
+    let ok: String = copy.query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap();
+    assert_eq!(ok, "ok");
+    let count: i64 = copy.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 50);
+    let (lsn, pos): (i64, i64) = copy
+        .query_row("SELECT lsn, pos FROM orbit_replication_state WHERE id = 1", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((lsn, pos), (9, 123), "watermark travels with the snapshot");
+    assert!(!dest.with_extension("db-wal").exists(), "single-file output");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&dest);
+}
+
+/// A replica file created before the `pos` column existed migrates in place.
+#[test]
+fn pre_pos_schema_migrates_in_place() {
+    let dir = std::env::temp_dir().join(format!("orbit_sqlite_migrate_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Old-format file: replication state without `pos`.
+    {
+        let conn = rusqlite::Connection::open(dir.join("replica.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE orbit_replication_state (
+                 id  INTEGER PRIMARY KEY CHECK (id = 1),
+                 lsn INTEGER NOT NULL
+             );
+             INSERT INTO orbit_replication_state (id, lsn) VALUES (1, 55);",
+        )
+        .unwrap();
+    }
+
+    let mut replica = SqliteReplica::durable(&dir);
+    replica.add_table("t", item_cols(), vec!["id".into()]);
+    assert_eq!(replica.resume_watermark(), Some(55), "old lsn survives migration");
+    assert_eq!(replica.resume_pos(), None, "migrated pos defaults to 0 (= None)");
+    replica.begin_txn();
+    replica.commit_txn(56, 900);
+    assert_eq!(replica.resume_pos(), Some(900));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `Relation` event (upstream DDL) reconciles the physical SQLite table:
+/// dropped columns disappear from stored rows — even when a fetch has lazily
+/// created a secondary index over the doomed column (SQLite refuses to drop an
+/// indexed column, so the reconcile must drop indexes first). Added columns
+/// appear in subsequently-replicated rows. Mirrors the in-memory `Replica`.
+#[test]
+fn relation_event_reconciles_sqlite_table() {
+    let mut replica = SqliteReplica::in_memory();
+    let src = replica.add_table(
+        "gadget",
+        vec![
+            ("id".to_string(), ColumnType::String),
+            ("a".to_string(), ColumnType::String),
+            ("b".to_string(), ColumnType::String),
+        ],
+        vec!["id".into()],
+    );
+
+    replica.apply(LogicalEvent::Insert {
+        table: "gadget".into(),
+        row: row(&[("id", "g1".into()), ("a", "x".into()), ("b", "y".into())]),
+    });
+
+    // A filtered query over `b` — its connect lazily creates an index on `b`,
+    // which would block DROP COLUMN without the reconcile's index sweep.
+    {
+        let mut provider = SqliteProvider::new();
+        provider.add(src.clone());
+        let ast = Query::table("gadget")
+            .where_("b", SimpleOperator::Eq, "y")
+            .order_by("id", Direction::Asc)
+            .build();
+        let top = build_pipeline(&ast, &provider);
+        let catch = Catch::new(top.input.clone());
+        let link: Link = catch.clone();
+        top.set_output(link);
+        assert_eq!(catch.borrow().fetch().len(), 1);
+    }
+
+    // Upstream DDL: DROP COLUMN b, ADD COLUMN c.
+    replica.apply(LogicalEvent::Relation {
+        table: "gadget".into(),
+        columns: vec![
+            ("id".to_string(), ColumnType::String),
+            ("a".to_string(), ColumnType::String),
+            ("c".to_string(), ColumnType::String),
+        ],
+    });
+
+    // A row using the new shape replicates cleanly.
+    replica.apply(LogicalEvent::Insert {
+        table: "gadget".into(),
+        row: row(&[("id", "g2".into()), ("a", "z".into()), ("c", "new".into())]),
+    });
+
+    let rows = src.borrow().all_rows();
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        assert!(r.get("b").is_none(), "column b dropped from {:?}", r.get("id"));
+        assert!(r.get("a").is_some());
+    }
+    let g2 = rows.iter().find(|r| r["id"] == "g2".into()).unwrap();
+    assert_eq!(g2.get("c"), Some(&Value::String("new".into())));
 }

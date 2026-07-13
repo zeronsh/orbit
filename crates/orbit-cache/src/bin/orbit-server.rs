@@ -9,13 +9,21 @@
 //!   ORBIT_PG_SSLMODE (or PGSSLMODE) — disable (default) | require | verify-full,
 //!   ORBIT_LISTEN (127.0.0.1:4848),
 //!   ORBIT_TABLES — comma-separated `table:pkcol` specs (columns are discovered
-//!     as text; e.g. `issue:id,comment:id`).
+//!     as text; e.g. `issue:id,comment:id`),
+//!   ORBIT_METRICS_LISTEN — metrics/health HTTP bind (default 0.0.0.0:9090; set
+//!     empty or `off` to disable): GET /metrics /ready /live.
 //!
 //! For richer column typing, embed and configure [`orbit_cache::ServerConfig`]
 //! directly. This binary keeps every column as text/JSON-friendly by default.
 
 use oql::ivm::ColumnType;
 use orbit_cache::{run_server, run_server_sqlite, MutatorRegistry, ServerConfig, TableConfig};
+
+// mimalloc: glibc malloc never returns a freed hydration working set to the
+// OS (arena retention pins RSS at peak), which matters in memory-limited
+// containers. mimalloc purges freed pages back to the OS.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -29,6 +37,11 @@ async fn main() -> anyhow::Result<()> {
         orbit_cache::pg::tls::PgConnInfo::from_env(5433, "orbit", "orbit")?;
     let listen_addr = env("ORBIT_LISTEN", "127.0.0.1:4848");
     let tables_spec = env("ORBIT_TABLES", "");
+    // Metrics/readiness on 9090 unless explicitly disabled (the library serves
+    // it only when this env var is set).
+    if std::env::var("ORBIT_METRICS_LISTEN").is_err() {
+        std::env::set_var("ORBIT_METRICS_LISTEN", "0.0.0.0:9090");
+    }
 
     // Discover columns at runtime from information_schema for each configured
     // table (typed String/Number/Boolean/Json) before starting.
@@ -80,11 +93,16 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ORBIT_REPLICA=sqlite (+ optional ORBIT_REPLICA_DIR for durability) selects
-    // the SQLite-backed replica; default is in-memory.
+    // the SQLite-backed replica; default is in-memory. ORBIT_REPLICA_CACHE_MB /
+    // ORBIT_REPLICA_MMAP_MB tune the SQLite page cache / mmap budget.
     match env("ORBIT_REPLICA", "memory").as_str() {
         "sqlite" => {
             let dir = std::env::var("ORBIT_REPLICA_DIR").ok().map(std::path::PathBuf::from);
-            run_server_sqlite(cfg, MutatorRegistry::new(), dir).await
+            let opts = orbit_cache::SqliteReplicaOpts {
+                cache_mb: std::env::var("ORBIT_REPLICA_CACHE_MB").ok().and_then(|v| v.parse().ok()),
+                mmap_mb: std::env::var("ORBIT_REPLICA_MMAP_MB").ok().and_then(|v| v.parse().ok()),
+            };
+            run_server_sqlite(cfg, MutatorRegistry::new(), dir, opts).await
         }
         _ => run_server(cfg, MutatorRegistry::new()).await,
     }

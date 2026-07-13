@@ -330,8 +330,82 @@ fn crud_to_change(op: &CrudOp, replica: &Replica) -> Option<(String, SourceChang
     }
 }
 
-/// Send one poke (`pokeStart`/`pokePart`/`pokeEnd`) carrying `rows`, optionally
+thread_local! {
+    /// Per-node hydration admission gate (one serving thread per node, so a
+    /// thread-local is node-scoped — same reasoning as `metrics::NODE_METRICS`).
+    ///
+    /// A fresh hydration materializes its full result (`fetch()` node tree +
+    /// `RowsPatch`) before the chunked sends bound the WIRE memory — the
+    /// PATCH is still O(result set), and on a SQLite replica those rows are
+    /// fresh allocations, not shared `Rc`s. N concurrent full-history
+    /// hydrations therefore hold N × result-set bytes at once; this gate
+    /// bounds peak memory to `ORBIT_MAX_CONCURRENT_HYDRATIONS` × result
+    /// (default 1). Queued clients hydrate as soon as a permit frees — they
+    /// wait, they don't fail.
+    static HYDRATION_GATE: Rc<tokio::sync::Semaphore> = Rc::new(tokio::sync::Semaphore::new(
+        std::env::var("ORBIT_MAX_CONCURRENT_HYDRATIONS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1),
+    ));
+}
+
+fn hydration_gate() -> Rc<tokio::sync::Semaphore> {
+    HYDRATION_GATE.with(Rc::clone)
+}
+
+/// Serialized-size cap per `pokePart` frame. `ORBIT_POKE_PART_BYTES`
+/// (default 512 KiB, floor 4 KiB). Bounds the peak transient allocation of a
+/// poke to O(cap) instead of O(result set): a large hydration becomes many
+/// small frames, each awaited onto the socket (real TCP backpressure) before
+/// the next is serialized. A single op larger than the cap still travels alone
+/// in its own part (the WebSocket `max_message_size` is the hard ceiling).
+fn poke_part_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("ORBIT_POKE_PART_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(512 * 1024)
+            .max(4 * 1024)
+    })
+}
+
+/// Rough serialized JSON size of a row (delegates to the byte-footprint
+/// estimator in `oql` — close enough for greedy packing).
+fn estimate_row_bytes(row: &oql::value::Row) -> usize {
+    row.estimated_bytes()
+}
+
+/// Rough serialized size of one row-patch op, JSON overhead included.
+fn estimate_op_bytes(op: &RowPatchOp) -> usize {
+    const OP_OVERHEAD: usize = 48; // {"op":"…","tableName":"…", …} scaffolding
+    match op {
+        RowPatchOp::Put { table_name, value } => {
+            OP_OVERHEAD + table_name.len() + estimate_row_bytes(value)
+        }
+        RowPatchOp::Update { table_name, id, merge, .. } => {
+            OP_OVERHEAD
+                + table_name.len()
+                + estimate_row_bytes(id)
+                + merge.as_ref().map_or(0, |m| m.to_string().len())
+        }
+        RowPatchOp::Del { table_name, id } => {
+            OP_OVERHEAD + table_name.len() + estimate_row_bytes(id)
+        }
+        RowPatchOp::Clear => OP_OVERHEAD,
+    }
+}
+
+/// Send one poke (`pokeStart`/`pokePart`s/`pokeEnd`) carrying `rows`, optionally
 /// announcing a newly-got query `hash` and/or `lastMutationID` changes.
+///
+/// `rows` is greedily packed into byte-capped `pokePart` frames (see
+/// [`poke_part_cap`]); the first part carries the query/lmid metadata. One
+/// `pokeStart`/`pokeEnd` wraps them all — the client accumulates parts and
+/// applies atomically at `pokeEnd`, so chunking is invisible to it, and a
+/// mid-poke disconnect discards cleanly.
 async fn poke<S>(
     tx: &mut SplitSink<WebSocketStream<S>, Message>,
     version: &mut u64,
@@ -346,43 +420,141 @@ where
     *version += 1;
     let cookie = format!("{:08}", *version);
     let poke_id = format!("poke-{}", *version);
+    let cap = poke_part_cap();
+    let metrics = crate::metrics::node_metrics();
+    let is_hydration = got_query.is_some();
+    let mut sent_bytes = 0usize;
+    let mut sent_parts = 0u64;
 
-    send(tx, &Downstream::PokeStart(PokeStartBody {
+    sent_bytes += send(tx, &Downstream::PokeStart(PokeStartBody {
         poke_id: poke_id.clone(),
         base_cookie: base_cookie.clone(),
         schema_versions: None,
         timestamp: None,
     }))
     .await?;
-    send(tx, &Downstream::PokePart(PokePartBody {
-        poke_id: poke_id.clone(),
-        last_mutation_id_changes: last_mutation_ids,
-        got_queries_patch: got_query.map(|hash| {
+
+    // Metadata (got-query + lmid changes) rides only on the FIRST part —
+    // which is sent even when `rows` is empty (lmid-only pokes must ack).
+    let mut meta = Some((
+        last_mutation_ids,
+        got_query.map(|hash| {
             vec![QueriesPatchOp::Put { hash, ttl: None, ast: None, name: None, args: None }]
         }),
-        rows_patch: Some(rows),
-        ..Default::default()
-    }))
-    .await?;
-    send(tx, &Downstream::PokeEnd(PokeEndBody {
+    ));
+
+    // Greedy byte-capped packing. Consuming `rows` by value lets each sent
+    // chunk's ops (table-name Strings, Rc bumps) drop as we go.
+    let mut it = rows.into_iter().peekable();
+    loop {
+        let mut chunk: RowsPatch = Vec::new();
+        let mut chunk_bytes = 0usize;
+        while let Some(op) = it.peek() {
+            // ~15% fudge for JSON syntax the estimator can't see.
+            let est = estimate_op_bytes(op) * 115 / 100;
+            if !chunk.is_empty() && chunk_bytes + est > cap {
+                break;
+            }
+            chunk_bytes += est;
+            chunk.push(it.next().unwrap());
+        }
+        let (lmids, got) = meta.take().unwrap_or((None, None));
+        sent_bytes += send(tx, &Downstream::PokePart(PokePartBody {
+            poke_id: poke_id.clone(),
+            last_mutation_id_changes: lmids,
+            got_queries_patch: got,
+            rows_patch: Some(chunk),
+            ..Default::default()
+        }))
+        .await?;
+        sent_parts += 1;
+        // `send` awaits the socket flush (backpressure); yield anyway so a
+        // fast socket can't let one giant hydration monopolize the LocalSet.
+        tokio::task::yield_now().await;
+        if it.peek().is_none() {
+            break;
+        }
+    }
+
+    sent_bytes += send(tx, &Downstream::PokeEnd(PokeEndBody {
         poke_id,
         cookie: cookie.clone(),
         cancel: None,
     }))
     .await?;
     *base_cookie = Some(cookie);
+    if let Some(m) = &metrics {
+        use std::sync::atomic::Ordering::Relaxed;
+        m.pokes_total.fetch_add(1, Relaxed);
+        m.poke_parts_total.fetch_add(sent_parts, Relaxed);
+        m.poke_bytes_total.fetch_add(sent_bytes as u64, Relaxed);
+        if is_hydration {
+            m.hydration_bytes_total.fetch_add(sent_bytes as u64, Relaxed);
+        }
+    }
     Ok(())
 }
 
+/// Serialize + send one frame; returns its serialized byte length (metrics).
 async fn send<S>(
     tx: &mut SplitSink<WebSocketStream<S>, Message>,
     msg: &Downstream,
-) -> anyhow::Result<()>
+) -> anyhow::Result<usize>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    tx.send(Message::Text(serde_json::to_string(msg)?)).await?;
-    Ok(())
+    let s = serde_json::to_string(msg)?;
+    let n = s.len();
+    tx.send(Message::Text(s)).await?;
+    Ok(n)
+}
+
+/// RAII connection gauges: increments `connected_clients` on connect and
+/// unwinds this connection's contribution to every gauge on ANY exit path.
+struct ConnGauges {
+    m: Option<std::sync::Arc<crate::metrics::Metrics>>,
+    active: u64,
+    matched: u64,
+}
+
+impl ConnGauges {
+    fn new() -> Self {
+        let m = crate::metrics::node_metrics();
+        if let Some(m) = &m {
+            m.connected_clients.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        ConnGauges { m, active: 0, matched: 0 }
+    }
+
+    /// Reconcile the global gauges with this connection's current counts.
+    fn update(&mut self, active: usize, matched: usize) {
+        let Some(m) = &self.m else { return };
+        use std::sync::atomic::Ordering::Relaxed;
+        let (active, matched) = (active as u64, matched as u64);
+        if active >= self.active {
+            m.active_queries.fetch_add(active - self.active, Relaxed);
+        } else {
+            m.active_queries.fetch_sub(self.active - active, Relaxed);
+        }
+        if matched >= self.matched {
+            m.matched_rows.fetch_add(matched - self.matched, Relaxed);
+        } else {
+            m.matched_rows.fetch_sub(self.matched - matched, Relaxed);
+        }
+        self.active = active;
+        self.matched = matched;
+    }
+}
+
+impl Drop for ConnGauges {
+    fn drop(&mut self) {
+        if let Some(m) = &self.m {
+            use std::sync::atomic::Ordering::Relaxed;
+            m.connected_clients.fetch_sub(1, Relaxed);
+            m.active_queries.fetch_sub(self.active, Relaxed);
+            m.matched_rows.fetch_sub(self.matched, Relaxed);
+        }
+    }
 }
 
 /// Serve a connection in a **multi-client** deployment.
@@ -426,6 +598,7 @@ where
     let mut version: u64 = 0;
     let mut base_cookie: Option<String> = None;
     let mut row_refs = RowRefs::new();
+    let mut gauges = ConnGauges::new();
 
     // Shared-CVR cross-node resume: if the client identifies itself and we have a
     // Postgres handle, load the view it last held (persisted by whatever node it was
@@ -493,6 +666,7 @@ where
         let resume = resume_prior.take();
         subscribe(initial_queries, provider, queries, forwarder, auth, &mut tx, &mut active, &mut version, &mut base_cookie, &mut row_refs, resume.as_ref()).await?;
         cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version, replica_pos.as_ref().map(|p| p.get()).unwrap_or(0)).await?;
+        gauges.update(active.len(), row_refs.len());
     }
 
     loop {
@@ -505,7 +679,9 @@ where
                     Message::Text(text) if !text.trim().is_empty() => {
                         let up: Upstream = serde_json::from_str(&text)?;
                         match up {
-                            Upstream::Ping => send(&mut tx, &Downstream::Pong).await?,
+                            Upstream::Ping => {
+                                send(&mut tx, &Downstream::Pong).await?;
+                            }
                             Upstream::Push(push) => {
                                 // The lastMutationID is NOT acked here. It's advanced by the app's
                                 // PushProcessor (or the direct-write path below) in `orbit_client_mutations`
@@ -584,11 +760,13 @@ where
                                 let resume = resume_prior.take();
                                 subscribe(b.desired_queries_patch, provider, queries, forwarder, auth, &mut tx, &mut active, &mut version, &mut base_cookie, &mut row_refs, resume.as_ref()).await?;
                                 cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version, replica_pos.as_ref().map(|p| p.get()).unwrap_or(0)).await?;
+                                gauges.update(active.len(), row_refs.len());
                             }
                             Upstream::ChangeDesiredQueries(b) => {
                                 let resume = resume_prior.take();
                                 subscribe(b.desired_queries_patch, provider, queries, forwarder, auth, &mut tx, &mut active, &mut version, &mut base_cookie, &mut row_refs, resume.as_ref()).await?;
                                 cvr_checkpoint(pg, &client_id, &mut checkpoint, &row_refs, version, replica_pos.as_ref().map(|p| p.get()).unwrap_or(0)).await?;
+                                gauges.update(active.len(), row_refs.len());
                             }
                         }
                     }
@@ -614,6 +792,7 @@ where
                     None => HashMap::new(),
                 };
                 flush_active(&active, &mut tx, &mut version, &mut base_cookie, &mut row_refs, ack).await?;
+                gauges.update(active.len(), row_refs.len());
                 // Throttled CVR checkpoint (off the per-mutation hot path) so a
                 // reconnect to another node resumes from a recent view.
                 if cvr_on && last_ckpt.elapsed() >= std::time::Duration::from_secs(1) {
@@ -695,6 +874,12 @@ where
                     },
                 };
                 let Some(ast) = ast else { continue };
+                // Admission control: the fetch + patch below materialize the
+                // full result, and the permit is held through the chunked
+                // sends — peak node memory stays at (gate width) × result
+                // instead of (connected hydrating clients) × result.
+                let gate = hydration_gate();
+                let _hydrating = gate.acquire().await.expect("hydration gate closed");
                 let top = build_pipeline(&ast, provider);
                 let catch = Catch::new(top.input.clone());
                 let link: Link = catch.clone();
@@ -705,6 +890,10 @@ where
                     Some(prior) => resume_patches_dedup(&nodes, &schema, row_refs, prior),
                     None => initial_patches_dedup(&nodes, &schema, row_refs),
                 };
+                // The patches share the nodes' `Rc<Row>`s, so dropping the node
+                // tree here frees only its scaffolding — but do it before the
+                // (chunked, potentially slow-socket) poke holds it alive.
+                drop(nodes);
                 // Prepend the replacement Clear to the first query's poke so its rows
                 // clear+rebuild atomically (no flash of an empty result).
                 if pending_clear {

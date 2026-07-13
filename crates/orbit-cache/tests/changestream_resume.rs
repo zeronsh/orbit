@@ -28,7 +28,7 @@ async fn change_stream_resume_survives_restart() {
 
     // A change after the restart gets the *next* position (63), not 1. (The lsn arg
     // only matters when a durable log is attached; this server has none.)
-    server.publish(1000, LogicalEvent::Commit);
+    server.publish(1000, LogicalEvent::Commit).await;
 
     // (a) Resuming exactly at the snapshot watermark receives the new change — no
     //     reset, no dropped update. This is the path that used to lose everything.

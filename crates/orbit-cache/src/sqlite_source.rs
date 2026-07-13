@@ -116,6 +116,58 @@ impl SqliteSource {
         &self.primary_key
     }
 
+    /// Reconcile the physical table to an upstream column set (DDL surfaced by
+    /// a Relation message). Added columns are `ALTER TABLE … ADD COLUMN`
+    /// (NULL-filled, matching the in-memory backend where they appear only in
+    /// subsequently-replicated rows). Removed columns are dropped — after
+    /// dropping any lazily-created secondary indexes (SQLite refuses to drop an
+    /// indexed column); primary-key columns are never dropped (warn instead).
+    pub fn reconcile_columns(&mut self, new_columns: &[(String, ColumnType)]) {
+        let added: Vec<&(String, ColumnType)> =
+            new_columns.iter().filter(|(n, _)| !self.columns.contains_key(n)).collect();
+        let removed: Vec<String> = self
+            .columns
+            .keys()
+            .filter(|c| !new_columns.iter().any(|(n, _)| n == *c))
+            .cloned()
+            .collect();
+        if added.is_empty() && removed.is_empty() {
+            return;
+        }
+        for (name, _) in &added {
+            let sql = format!("ALTER TABLE {} ADD COLUMN {}", ident(&self.table), ident(name));
+            if let Err(e) = self.db.execute_batch(&sql) {
+                eprintln!("replica DDL: add column {name} to {} failed: {e}", self.table);
+            }
+        }
+        if !removed.is_empty() {
+            // Secondary indexes may cover a doomed column; drop them all (they
+            // are lazily re-created per fetch shape).
+            for idx in self.created_indexes.borrow_mut().drain() {
+                let _ = self.db.execute_batch(&format!("DROP INDEX IF EXISTS {}", ident(&idx)));
+            }
+        }
+        for name in &removed {
+            if self.primary_key.iter().any(|k| k == name) {
+                eprintln!(
+                    "replica DDL: refusing to drop primary-key column {name} of {}",
+                    self.table
+                );
+                continue;
+            }
+            let sql = format!("ALTER TABLE {} DROP COLUMN {}", ident(&self.table), ident(name));
+            if let Err(e) = self.db.execute_batch(&sql) {
+                eprintln!("replica DDL: drop column {name} from {} failed: {e}", self.table);
+            }
+        }
+        self.columns = new_columns.iter().map(|(n, t)| (n.clone(), *t)).collect();
+        // PK columns must stay known even if upstream stopped reporting them
+        // (we refused to drop them above).
+        for k in &self.primary_key {
+            self.columns.entry(k.clone()).or_insert(ColumnType::String);
+        }
+    }
+
     /// Number of live query connections attached to this source.
     pub fn connection_count(&self) -> usize {
         self.active_connections.len()
@@ -500,6 +552,13 @@ pub fn source_push(src: &Rc<RefCell<SqliteSource>>, change: SourceChange) {
         e
     };
     let n = src.borrow().active_connections.len();
+    // Convert ONCE and share: a `Node`'s row is an `Rc<Row>`, so cloning the
+    // template per connection bumps a refcount instead of deep-copying the
+    // row (mirrors `MemorySource::source_push`'s OverlayChange sharing).
+    // Deep-copying per connection made every replicated row cost
+    // O(connected clients) heap while it sat in their Catch buffers awaiting
+    // the next flush — a 130 MB replication burst × 6 clients was ~800 MB.
+    let template = base_change(&change);
     for active_pos in 0..n {
         let output = {
             let mut s = src.borrow_mut();
@@ -509,7 +568,7 @@ pub fn source_push(src: &Rc<RefCell<SqliteSource>>, change: SourceChange) {
             conn.output.as_ref().and_then(std::rc::Weak::upgrade)
         };
         if let Some(output) = output {
-            deliver(&output, base_change(&change));
+            deliver(&output, template.clone());
         }
     }
     let mut s = src.borrow_mut();
@@ -610,40 +669,122 @@ pub struct SqliteReplica {
     sources: std::collections::HashMap<String, Rc<RefCell<SqliteSource>>>,
     columns: std::collections::HashMap<String, Vec<(String, ColumnType)>>,
     conn: Rc<Connection>,
+    /// The database file path (`None` for in-memory replicas).
+    path: Option<std::path::PathBuf>,
+}
+
+/// Tuning knobs for a [`SqliteReplica`]'s connection. Defaults leave SQLite's
+/// own defaults in place (~2 MB page cache, no mmap).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SqliteReplicaOpts {
+    /// Page-cache size in MiB (`PRAGMA cache_size = -(mb * 1024)`, the
+    /// negative-KiB form). This is THE steady-state memory knob for a
+    /// SQLite-backed node: resident base-row memory becomes O(page cache),
+    /// not O(dataset).
+    pub cache_mb: Option<u64>,
+    /// Memory-map budget in MiB (`PRAGMA mmap_size`). Mapped pages are
+    /// page-cache-backed file mappings the OS can reclaim under pressure —
+    /// they don't count against a cgroup the way anonymous memory does.
+    pub mmap_mb: Option<u64>,
 }
 
 impl SqliteReplica {
     /// An in-memory replica (all tables in one in-memory database).
     pub fn in_memory() -> Self {
-        Self::with_connection(Connection::open_in_memory().expect("open sqlite"))
+        Self::in_memory_with(&SqliteReplicaOpts::default())
+    }
+
+    /// [`in_memory`](Self::in_memory) with connection tuning.
+    pub fn in_memory_with(opts: &SqliteReplicaOpts) -> Self {
+        Self::with_connection(Connection::open_in_memory().expect("open sqlite"), None, opts)
     }
 
     /// A durable replica: one database file at `dir/replica.db`.
     pub fn durable(dir: impl Into<std::path::PathBuf>) -> Self {
-        let dir = dir.into();
-        std::fs::create_dir_all(&dir).ok();
-        Self::with_connection(Connection::open(dir.join("replica.db")).expect("open sqlite file"))
+        Self::durable_with(dir, &SqliteReplicaOpts::default())
     }
 
-    fn with_connection(conn: Connection) -> Self {
+    /// [`durable`](Self::durable) with connection tuning.
+    pub fn durable_with(dir: impl Into<std::path::PathBuf>, opts: &SqliteReplicaOpts) -> Self {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("replica.db");
+        Self::with_connection(
+            Connection::open(&path).expect("open sqlite file"),
+            Some(path),
+            opts,
+        )
+    }
+
+    /// The database file path (`None` for in-memory replicas). Snapshot
+    /// backups ([`backup_to`](Self::backup_to)) need this.
+    pub fn db_path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
+    fn with_connection(
+        conn: Connection,
+        path: Option<std::path::PathBuf>,
+        opts: &SqliteReplicaOpts,
+    ) -> Self {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        if let Some(mb) = opts.cache_mb {
+            // Negative value = KiB (page-count form depends on page size).
+            let _ = conn.pragma_update(None, "cache_size", -((mb as i64) * 1024));
+        }
+        if let Some(mb) = opts.mmap_mb {
+            let _ = conn.pragma_update(None, "mmap_size", (mb as i64) << 20);
+        }
         conn.set_prepared_statement_cache_capacity(128);
         // The replication watermark: the commit LSN of the last upstream
-        // transaction fully applied to THIS database, written inside that same
-        // transaction (see `commit_txn`) so it can never disagree with the rows.
+        // transaction fully applied to THIS database plus the change-stream
+        // position of that commit, written inside that same transaction (see
+        // `commit_txn`) so they can never disagree with the rows. `pos` makes a
+        // copied snapshot file self-describing (the restore point travels WITH
+        // the data) and lets a durable view-syncer resume by delta.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS orbit_replication_state (
                  id  INTEGER PRIMARY KEY CHECK (id = 1),
-                 lsn INTEGER NOT NULL
+                 lsn INTEGER NOT NULL,
+                 pos INTEGER NOT NULL DEFAULT 0
              )",
         )
         .expect("create replication state table");
+        // Migrate pre-`pos` files in place (ignore "duplicate column name").
+        let _ = conn.execute_batch(
+            "ALTER TABLE orbit_replication_state ADD COLUMN pos INTEGER NOT NULL DEFAULT 0",
+        );
         SqliteReplica {
             sources: std::collections::HashMap::new(),
             columns: std::collections::HashMap::new(),
             conn: Rc::new(conn),
+            path,
         }
+    }
+
+    /// Take a consistent point-in-time copy of the database at `src` into the
+    /// file at `dest` using `VACUUM INTO` on a fresh connection. Under WAL
+    /// this does not block the writer; the output is a single compacted file
+    /// (no `-wal`/`-shm` sidecars) carrying `orbit_replication_state`
+    /// (`lsn`, `pos`) — i.e. a self-describing snapshot. Runs on a blocking
+    /// thread so the serving `LocalSet` isn't stalled.
+    ///
+    /// An associated fn (not `&self`) because `SqliteReplica` is `!Send`.
+    pub async fn backup_to(src: std::path::PathBuf, dest: std::path::PathBuf) -> anyhow::Result<()> {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let _ = std::fs::remove_file(&dest); // VACUUM INTO refuses to overwrite
+            let conn = Connection::open_with_flags(
+                &src,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            let dest_str = dest.to_str().ok_or_else(|| anyhow::anyhow!("non-utf8 dest path"))?;
+            conn.execute("VACUUM INTO ?1", [dest_str])?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("backup task panicked: {e}"))?
     }
 
     pub fn add_table(
@@ -704,10 +845,17 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
                     }
                 }
             }
-            // SQLite tables have a fixed schema created up front; a dropped
-            // column simply stops being written/selected. (ALTER of the SQLite
-            // replica table on DDL is a future refinement.)
-            E::Relation { .. } | E::Begin | E::Commit | E::Other => {}
+            E::Relation { table, columns } => {
+                // Mirror the in-memory replica: reconcile the physical table to
+                // the upstream column set (DDL). `self.columns` stays at the
+                // boot-time declaration — exact parity with the in-memory
+                // backend, whose `Replica.columns` also goes stale; it is only
+                // used for the initial-sync SELECT.
+                if let Some(src) = self.sources.get(&table) {
+                    src.borrow_mut().reconcile_columns(&columns);
+                }
+            }
+            E::Begin | E::Commit | E::Other => {}
         }
     }
     fn seed(&self, table: &str, row: Row) {
@@ -731,15 +879,15 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
         let _ = self.conn.execute_batch("BEGIN IMMEDIATE");
     }
 
-    fn commit_txn(&self, lsn: u64) {
+    fn commit_txn(&self, lsn: u64, pos: u64) {
         // The watermark commits atomically WITH the rows it describes.
         let _ = self
             .conn
             .prepare_cached(
-                "INSERT INTO orbit_replication_state (id, lsn) VALUES (1, ?1)
-                 ON CONFLICT (id) DO UPDATE SET lsn = excluded.lsn",
+                "INSERT INTO orbit_replication_state (id, lsn, pos) VALUES (1, ?1, ?2)
+                 ON CONFLICT (id) DO UPDATE SET lsn = excluded.lsn, pos = excluded.pos",
             )
-            .and_then(|mut st| st.execute([lsn as i64]));
+            .and_then(|mut st| st.execute([lsn as i64, pos as i64]));
         let _ = self.conn.execute_batch("COMMIT");
     }
 
@@ -751,6 +899,38 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
             .ok()
             .filter(|l| *l > 0)
             .map(|l| l as u64)
+    }
+
+    fn resume_pos(&self) -> Option<u64> {
+        self.conn
+            .query_row("SELECT pos FROM orbit_replication_state WHERE id = 1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .ok()
+            .filter(|p| *p > 0)
+            .map(|p| p as u64)
+    }
+
+    fn metrics_sample(&self) -> crate::replica::ReplicaSample {
+        let mut s = crate::replica::ReplicaSample::default();
+        // File size (incl. WAL) — the disk footprint. Page stats would need a
+        // query per sample; the file is the operative number for capacity.
+        if let Some(path) = self.db_path() {
+            for suffix in ["", "-wal"] {
+                let mut p = path.to_path_buf().into_os_string();
+                p.push(suffix);
+                if let Ok(md) = std::fs::metadata(std::path::PathBuf::from(p)) {
+                    s.file_bytes += md.len();
+                }
+            }
+        } else if let Ok((page_count, page_size)) =
+            self.conn.query_row("SELECT * FROM pragma_page_count(), pragma_page_size()", [], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })
+        {
+            s.file_bytes = (page_count * page_size) as u64;
+        }
+        s
     }
 
     fn start_fresh(&self) {

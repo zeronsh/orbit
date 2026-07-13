@@ -104,7 +104,25 @@ where
         g.3 = query_param(q, "baseCookie");
         Ok(resp)
     };
-    let ws = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+    // Explicit limits (previously tungstenite's implicit defaults):
+    // - max_message_size 64 MiB — the TS client's 1009-close poison-mutation
+    //   handling depends on oversized INBOUND messages being rejected; override
+    //   with ORBIT_MAX_MESSAGE_BYTES.
+    // - max_frame_size 16 MiB — a single op can't exceed this on the wire.
+    // - max_write_buffer_size stays unbounded: every pokePart is awaited to the
+    //   socket before the next is built, so the writer never accumulates more
+    //   than one part (a finite cap would error the sink instead).
+    let cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(
+            std::env::var("ORBIT_MAX_MESSAGE_BYTES")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(64 << 20),
+        ),
+        max_frame_size: Some(16 << 20),
+        ..Default::default()
+    };
+    let ws = tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(cfg)).await?;
     let (proto, cookie, client_id, base_cookie) = {
         let mut g = captured.lock().unwrap();
         (g.0.take(), g.1.take(), g.2.take(), g.3.take())

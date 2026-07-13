@@ -7,15 +7,70 @@
 //! deployments; an S3/Tigris impl lives behind the `s3` feature.
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
+use futures_util::StreamExt;
+use futures_util::TryStreamExt;
 use oql::value::Row;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// A fallible stream of byte chunks (streaming put/get payloads).
+pub type ByteStream = futures_util::stream::BoxStream<'static, Result<Bytes>>;
 
 /// A key/value blob store. Implemented by a local filesystem and (with the `s3`
 /// feature) any S3-compatible service such as Tigris.
+///
+/// `put`/`get` buffer whole objects — fine for small metadata. Large objects
+/// (SQLite-file snapshots) go through `put_stream`/`get_stream`, which bound
+/// memory to O(part_size) regardless of object size.
 #[allow(async_fn_in_trait)]
 pub trait ObjectStore {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()>;
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    /// Stream `data` into `key` with bounded memory. `part_size` bounds
+    /// per-part buffering (S3 multipart parts; local write chunks) — peak
+    /// memory is ~2× `part_size` (the part being filled + one in flight).
+    async fn put_stream(&self, key: &str, data: ByteStream, part_size: usize) -> Result<()>;
+    /// Stream the object at `key` (`None` if absent).
+    async fn get_stream(&self, key: &str) -> Result<Option<ByteStream>>;
+}
+
+/// Upload the file at `path` to `key`, streamed with `part_size` read buffers.
+pub async fn put_file<O: ObjectStore>(
+    store: &O,
+    key: &str,
+    path: &Path,
+    part_size: usize,
+) -> Result<()> {
+    let file = tokio::fs::File::open(path).await.with_context(|| format!("open {path:?}"))?;
+    let stream = tokio_util::io::ReaderStream::with_capacity(file, part_size.clamp(64 * 1024, 8 << 20))
+        .map_err(anyhow::Error::from)
+        .boxed();
+    store.put_stream(key, stream, part_size).await
+}
+
+/// Download `key` into the file at `dest`, chunk by chunk, then fsync.
+/// `Ok(false)` when the key doesn't exist. On any error the partial file is
+/// removed (callers may also write to a tmp path and rename).
+pub async fn get_to_file<O: ObjectStore>(store: &O, key: &str, dest: &Path) -> Result<bool> {
+    let Some(mut stream) = store.get_stream(key).await? else {
+        return Ok(false);
+    };
+    if let Some(p) = dest.parent() {
+        tokio::fs::create_dir_all(p).await.ok();
+    }
+    let result: Result<()> = async {
+        let mut f = tokio::fs::File::create(dest).await.with_context(|| format!("create {dest:?}"))?;
+        while let Some(chunk) = stream.try_next().await? {
+            tokio::io::AsyncWriteExt::write_all(&mut f, &chunk).await?;
+        }
+        f.sync_all().await?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(dest).await;
+    }
+    result.map(|_| true)
 }
 
 /// A full snapshot of the replica plus the change-stream position it reflects.
@@ -51,17 +106,18 @@ impl LocalObjectStore {
     }
 }
 
-impl ObjectStore for LocalObjectStore {
-    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+impl LocalObjectStore {
+    /// Stream `data` into `key` via the temp-file + fsync + rename dance:
+    /// readers never see a torn snapshot, and a power loss can't rename a
+    /// not-yet-flushed file into place (rename is only atomic for data the
+    /// filesystem has persisted). Unique tmp name: two writers (deploy
+    /// overlap — the departing and the new replicator both snapshot) must not
+    /// interleave into one tmp file.
+    async fn put_stream_impl(&self, key: &str, mut data: ByteStream) -> Result<()> {
         let path = self.root.join(key);
         if let Some(p) = path.parent() {
             tokio::fs::create_dir_all(p).await.ok();
         }
-        // Write to a temp file, fsync, then rename: readers never see a torn
-        // snapshot, and a power loss can't rename a not-yet-flushed file into
-        // place (rename is only atomic for data the filesystem has persisted).
-        // Unique tmp name: two writers (deploy overlap — the departing and the
-        // new replicator both snapshot) must not interleave into one tmp file.
         let unique = format!(
             "writing.{}.{}",
             std::process::id(),
@@ -71,15 +127,30 @@ impl ObjectStore for LocalObjectStore {
                 .unwrap_or(0)
         );
         let tmp = path.with_extension(unique);
-        {
+        let write = async {
             let mut f = tokio::fs::File::create(&tmp).await.with_context(|| format!("create {tmp:?}"))?;
-            tokio::io::AsyncWriteExt::write_all(&mut f, &bytes)
-                .await
-                .with_context(|| format!("write {tmp:?}"))?;
+            while let Some(chunk) = data.try_next().await? {
+                tokio::io::AsyncWriteExt::write_all(&mut f, &chunk)
+                    .await
+                    .with_context(|| format!("write {tmp:?}"))?;
+            }
             f.sync_all().await.with_context(|| format!("fsync {tmp:?}"))?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if write.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return write;
         }
         tokio::fs::rename(&tmp, &path).await.with_context(|| format!("rename into {path:?}"))?;
         Ok(())
+    }
+}
+
+impl ObjectStore for LocalObjectStore {
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+        let one = futures_util::stream::once(async move { Ok(Bytes::from(bytes)) }).boxed();
+        self.put_stream_impl(key, one).await
     }
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -87,6 +158,22 @@ impl ObjectStore for LocalObjectStore {
             Ok(b) => Ok(Some(b)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).context("read object"),
+        }
+    }
+
+    async fn put_stream(&self, key: &str, data: ByteStream, _part_size: usize) -> Result<()> {
+        self.put_stream_impl(key, data).await
+    }
+
+    async fn get_stream(&self, key: &str) -> Result<Option<ByteStream>> {
+        match tokio::fs::File::open(self.root.join(key)).await {
+            Ok(f) => Ok(Some(
+                tokio_util::io::ReaderStream::with_capacity(f, 1 << 20)
+                    .map_err(anyhow::Error::from)
+                    .boxed(),
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context("open object"),
         }
     }
 }
@@ -149,6 +236,44 @@ impl ObjectStore for S3ObjectStore {
         use object_store::ObjectStore as _;
         match self.inner.get(&object_store::path::Path::from(key)).await {
             Ok(r) => Ok(Some(r.bytes().await.context("s3 read body")?.to_vec())),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e).context("s3 get"),
+        }
+    }
+
+    async fn put_stream(&self, key: &str, mut data: ByteStream, part_size: usize) -> Result<()> {
+        use object_store::ObjectStore as _;
+        // S3 multipart parts must be ≥ 5 MiB (except the last).
+        let part_size = part_size.max(5 << 20);
+        let upload = self
+            .inner
+            .put_multipart(&object_store::path::Path::from(key))
+            .await
+            .context("s3 start multipart")?;
+        let mut w = object_store::WriteMultipart::new_with_chunk_size(upload, part_size);
+        let result: Result<()> = async {
+            while let Some(chunk) = data.try_next().await? {
+                // Bound in-flight parts to 1: peak memory ≈ the part being
+                // filled + one part uploading (~2 × part_size).
+                w.wait_for_capacity(1).await.context("s3 multipart backpressure")?;
+                w.write(&chunk);
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            // Best effort: dropping the writer abandons the multipart upload;
+            // incomplete uploads are reaped by bucket lifecycle rules.
+            return Err(e);
+        }
+        w.finish().await.context("s3 finish multipart")?;
+        Ok(())
+    }
+
+    async fn get_stream(&self, key: &str) -> Result<Option<ByteStream>> {
+        use object_store::ObjectStore as _;
+        match self.inner.get(&object_store::path::Path::from(key)).await {
+            Ok(r) => Ok(Some(r.into_stream().map_err(anyhow::Error::from).boxed())),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e).context("s3 get"),
         }

@@ -201,6 +201,12 @@ impl MemorySource {
         self.data.values().map(|rc| (**rc).clone()).collect()
     }
 
+    /// `(rows, estimated bytes)` held by this source — for memory metrics.
+    /// Walks without cloning; see [`Row::estimated_bytes`] for the approximation.
+    pub fn estimated_bytes(&self) -> (usize, usize) {
+        (self.data.len(), self.data.values().map(|rc| rc.estimated_bytes()).sum())
+    }
+
     /// Number of stored rows.
     pub fn len(&self) -> usize {
         self.data.len()

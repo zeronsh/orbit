@@ -13,6 +13,7 @@
 
 pub mod changelog;
 pub mod changestream;
+pub mod metrics;
 pub mod cvr;
 pub mod forward;
 pub mod handshake;
@@ -28,7 +29,8 @@ pub mod sharded;
 pub mod sqlite_source;
 pub mod view_sync;
 
-pub use changestream::{ChangeMsg, ChangeStreamClient, ChangeStreamServer};
+pub use changestream::{ChangeMsg, ChangeStreamClient, ChangeStreamConfig, ChangeStreamServer};
+pub use metrics::{Metrics, ReadyComponent, Role};
 pub use objectstore::{LocalObjectStore, ObjectStore, ReplicaSnapshot};
 #[cfg(feature = "s3")]
 pub use objectstore::S3ObjectStore;
@@ -42,10 +44,11 @@ pub use pg::{initial_sync, PgTlsMode, ReplicationStream};
 pub use replica::Replica;
 pub use replica::ReplicaBackend;
 pub use run::{
-    run_replicator, run_server, run_server_full, run_server_sharded, run_server_sqlite,
-    run_server_with, run_view_syncer, ServerConfig, TableConfig,
+    run_replicator, run_replicator_sqlite, run_server, run_server_full, run_server_sharded,
+    run_server_sqlite, run_server_with, run_view_syncer, run_view_syncer_sqlite, JsonSnapshots,
+    ServerConfig, SnapshotStrategy, SqliteClusterConfig, SqliteSnapshots, TableConfig,
 };
-pub use sqlite_source::{SqliteProvider, SqliteReplica, SqliteSource};
+pub use sqlite_source::{SqliteProvider, SqliteReplica, SqliteReplicaOpts, SqliteSource};
 pub use server::{serve_client, serve_connection, serve_connection_with_mutators, LmidMap};
 pub use sharded::{ShardTable, ShardedServer};
 pub use view_sync::{changes_to_patches, initial_patches};
