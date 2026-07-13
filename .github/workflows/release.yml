@@ -13,6 +13,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      republish_image_version:
+        description: "Published version whose GHCR image should be rebuilt (for example, 0.3.12)"
+        type: string
+        required: false
 
 jobs:
   release:
@@ -71,6 +76,39 @@ jobs:
           images: ghcr.io/zeronsh/orbit-server
           tags: |
             type=raw,value=v${{ needs.release.outputs.version }}
+            type=raw,value=latest
+      - uses: useblacksmith/build-push-action@v1
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # A package publish can succeed before a transient GitHub/tag push failure.
+  # In that state Changesets correctly refuses to republish npm, so the normal
+  # `published` output stays false and the Docker job above remains skipped.
+  # This manual path rebuilds the matching immutable image without minting a
+  # duplicate package version.
+  docker-recovery:
+    if: github.event_name == 'workflow_dispatch' && inputs.republish_image_version != ''
+    runs-on: blacksmith
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/zeronsh/orbit-server
+          tags: |
+            type=raw,value=v${{ inputs.republish_image_version }}
             type=raw,value=latest
       - uses: useblacksmith/build-push-action@v1
         with:
