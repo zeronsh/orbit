@@ -330,8 +330,57 @@ fn crud_to_change(op: &CrudOp, replica: &Replica) -> Option<(String, SourceChang
     }
 }
 
-/// Send one poke (`pokeStart`/`pokePart`/`pokeEnd`) carrying `rows`, optionally
+/// Serialized-size cap per `pokePart` frame. `ORBIT_POKE_PART_BYTES`
+/// (default 512 KiB, floor 4 KiB). Bounds the peak transient allocation of a
+/// poke to O(cap) instead of O(result set): a large hydration becomes many
+/// small frames, each awaited onto the socket (real TCP backpressure) before
+/// the next is serialized. A single op larger than the cap still travels alone
+/// in its own part (the WebSocket `max_message_size` is the hard ceiling).
+fn poke_part_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("ORBIT_POKE_PART_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(512 * 1024)
+            .max(4 * 1024)
+    })
+}
+
+/// Rough serialized JSON size of a row (delegates to the byte-footprint
+/// estimator in `oql` — close enough for greedy packing).
+fn estimate_row_bytes(row: &oql::value::Row) -> usize {
+    row.estimated_bytes()
+}
+
+/// Rough serialized size of one row-patch op, JSON overhead included.
+fn estimate_op_bytes(op: &RowPatchOp) -> usize {
+    const OP_OVERHEAD: usize = 48; // {"op":"…","tableName":"…", …} scaffolding
+    match op {
+        RowPatchOp::Put { table_name, value } => {
+            OP_OVERHEAD + table_name.len() + estimate_row_bytes(value)
+        }
+        RowPatchOp::Update { table_name, id, merge, .. } => {
+            OP_OVERHEAD
+                + table_name.len()
+                + estimate_row_bytes(id)
+                + merge.as_ref().map_or(0, |m| m.to_string().len())
+        }
+        RowPatchOp::Del { table_name, id } => {
+            OP_OVERHEAD + table_name.len() + estimate_row_bytes(id)
+        }
+        RowPatchOp::Clear => OP_OVERHEAD,
+    }
+}
+
+/// Send one poke (`pokeStart`/`pokePart`s/`pokeEnd`) carrying `rows`, optionally
 /// announcing a newly-got query `hash` and/or `lastMutationID` changes.
+///
+/// `rows` is greedily packed into byte-capped `pokePart` frames (see
+/// [`poke_part_cap`]); the first part carries the query/lmid metadata. One
+/// `pokeStart`/`pokeEnd` wraps them all — the client accumulates parts and
+/// applies atomically at `pokeEnd`, so chunking is invisible to it, and a
+/// mid-poke disconnect discards cleanly.
 async fn poke<S>(
     tx: &mut SplitSink<WebSocketStream<S>, Message>,
     version: &mut u64,
@@ -346,6 +395,7 @@ where
     *version += 1;
     let cookie = format!("{:08}", *version);
     let poke_id = format!("poke-{}", *version);
+    let cap = poke_part_cap();
 
     send(tx, &Downstream::PokeStart(PokeStartBody {
         poke_id: poke_id.clone(),
@@ -354,16 +404,48 @@ where
         timestamp: None,
     }))
     .await?;
-    send(tx, &Downstream::PokePart(PokePartBody {
-        poke_id: poke_id.clone(),
-        last_mutation_id_changes: last_mutation_ids,
-        got_queries_patch: got_query.map(|hash| {
+
+    // Metadata (got-query + lmid changes) rides only on the FIRST part —
+    // which is sent even when `rows` is empty (lmid-only pokes must ack).
+    let mut meta = Some((
+        last_mutation_ids,
+        got_query.map(|hash| {
             vec![QueriesPatchOp::Put { hash, ttl: None, ast: None, name: None, args: None }]
         }),
-        rows_patch: Some(rows),
-        ..Default::default()
-    }))
-    .await?;
+    ));
+
+    // Greedy byte-capped packing. Consuming `rows` by value lets each sent
+    // chunk's ops (table-name Strings, Rc bumps) drop as we go.
+    let mut it = rows.into_iter().peekable();
+    loop {
+        let mut chunk: RowsPatch = Vec::new();
+        let mut chunk_bytes = 0usize;
+        while let Some(op) = it.peek() {
+            // ~15% fudge for JSON syntax the estimator can't see.
+            let est = estimate_op_bytes(op) * 115 / 100;
+            if !chunk.is_empty() && chunk_bytes + est > cap {
+                break;
+            }
+            chunk_bytes += est;
+            chunk.push(it.next().unwrap());
+        }
+        let (lmids, got) = meta.take().unwrap_or((None, None));
+        send(tx, &Downstream::PokePart(PokePartBody {
+            poke_id: poke_id.clone(),
+            last_mutation_id_changes: lmids,
+            got_queries_patch: got,
+            rows_patch: Some(chunk),
+            ..Default::default()
+        }))
+        .await?;
+        // `send` awaits the socket flush (backpressure); yield anyway so a
+        // fast socket can't let one giant hydration monopolize the LocalSet.
+        tokio::task::yield_now().await;
+        if it.peek().is_none() {
+            break;
+        }
+    }
+
     send(tx, &Downstream::PokeEnd(PokeEndBody {
         poke_id,
         cookie: cookie.clone(),
@@ -705,6 +787,10 @@ where
                     Some(prior) => resume_patches_dedup(&nodes, &schema, row_refs, prior),
                     None => initial_patches_dedup(&nodes, &schema, row_refs),
                 };
+                // The patches share the nodes' `Rc<Row>`s, so dropping the node
+                // tree here frees only its scaffolding — but do it before the
+                // (chunked, potentially slow-socket) poke holds it alive.
+                drop(nodes);
                 // Prepend the replacement Clear to the first query's poke so its rows
                 // clear+rebuild atomically (no flash of an empty result).
                 if pending_clear {
