@@ -41,6 +41,35 @@ pub enum LogicalEvent {
     Other,
 }
 
+impl LogicalEvent {
+    /// Approximate in-memory footprint in bytes: the inline enum size plus the
+    /// heap owned by table names and rows (see [`Row::estimated_bytes`]).
+    /// Used to byte-bound the change ring, the durable-log queue, and write
+    /// batches — an approximation, not exact accounting.
+    pub fn estimated_bytes(&self) -> usize {
+        let base = std::mem::size_of::<LogicalEvent>();
+        match self {
+            LogicalEvent::Begin | LogicalEvent::Commit | LogicalEvent::Other => base,
+            LogicalEvent::Insert { table, row } => base + table.len() + row.estimated_bytes(),
+            LogicalEvent::Update { table, row, old_row } => {
+                base + table.len()
+                    + row.estimated_bytes()
+                    + old_row.as_ref().map_or(0, Row::estimated_bytes)
+            }
+            LogicalEvent::Delete { table, old_row } => {
+                base + table.len() + old_row.estimated_bytes()
+            }
+            LogicalEvent::Relation { table, columns } => {
+                base + table.len()
+                    + columns
+                        .iter()
+                        .map(|(name, _)| name.len() + std::mem::size_of::<(String, ColumnType)>())
+                        .sum::<usize>()
+            }
+        }
+    }
+}
+
 /// Map a Postgres type OID to an Orbit column type.
 pub fn column_type_for_oid(oid: u32) -> ColumnType {
     match oid {
@@ -244,5 +273,22 @@ impl<'a> Cursor<'a> {
         let s = String::from_utf8_lossy(&self.buf[start..self.pos]).into_owned();
         self.pos += 1; // skip NUL
         Ok(s)
+    }
+}
+
+#[cfg(test)]
+mod estimate_tests {
+    use super::*;
+
+    #[test]
+    fn estimated_bytes_tracks_row_payload() {
+        let mut row = Row::new();
+        row.insert("id", oql::value::Value::Number(1.0));
+        row.insert("body", oql::value::Value::String("y".repeat(50_000)));
+        let ev = LogicalEvent::Insert { table: "t".into(), row };
+        let est = ev.estimated_bytes();
+        assert!(est >= 50_000, "est {est} < payload");
+        assert!(est < 55_000, "est {est} unexpectedly large");
+        assert!(LogicalEvent::Commit.estimated_bytes() < 200);
     }
 }

@@ -61,6 +61,42 @@ impl Value {
     }
 }
 
+/// Approximate footprint of a `serde_json::Value` tree: fixed per-node
+/// overhead plus string/key payloads. Deliberately rough — it exists to bound
+/// memory, not to account it exactly.
+fn json_estimated_bytes(j: &serde_json::Value) -> usize {
+    const NODE: usize = 48; // enum + typical container bookkeeping per node
+    match j {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => NODE,
+        serde_json::Value::String(s) => NODE + s.len(),
+        serde_json::Value::Array(a) => {
+            NODE + a.iter().map(json_estimated_bytes).sum::<usize>()
+        }
+        serde_json::Value::Object(o) => {
+            NODE + o
+                .iter()
+                .map(|(k, v)| k.len() + json_estimated_bytes(v))
+                .sum::<usize>()
+        }
+    }
+}
+
+impl Value {
+    /// Approximate in-memory footprint in bytes: the inline enum size plus any
+    /// heap payload. Approximations: `String` counts `len()` (not capacity);
+    /// `Json` is a recursive walk with a fixed per-node overhead. Good enough
+    /// for byte-bounding rings, queues, and message chunks — not exact
+    /// accounting.
+    pub fn estimated_bytes(&self) -> usize {
+        let base = std::mem::size_of::<Value>();
+        match self {
+            Value::Null | Value::Bool(_) | Value::Number(_) => base,
+            Value::String(s) => base + s.len(),
+            Value::Json(j) => base + json_estimated_bytes(j),
+        }
+    }
+}
+
 impl Serialize for Value {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
@@ -323,6 +359,25 @@ impl Row {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.cols.iter().map(|(k, v)| (k.as_ref(), v))
     }
+
+    /// Approximate in-memory footprint in bytes: the `Row` header, one
+    /// `(ColName, Value)` slot per column, and each value's heap payload.
+    /// Interned `Arc<str>` column names count only their pointer slot — the
+    /// string bytes are shared across every row that uses the column, so
+    /// charging them per-row would wildly over-count. See
+    /// [`Value::estimated_bytes`] for the per-value approximation.
+    pub fn estimated_bytes(&self) -> usize {
+        // size_of::<Value>() is already included in the slot size; subtract it
+        // from each value's estimate to avoid double-counting the inline part.
+        let inline_value = std::mem::size_of::<Value>();
+        std::mem::size_of::<Row>()
+            + self.cols.len() * std::mem::size_of::<(ColName, Value)>()
+            + self
+                .cols
+                .iter()
+                .map(|(_, v)| v.estimated_bytes() - inline_value)
+                .sum::<usize>()
+    }
 }
 
 impl std::ops::Index<&str> for Row {
@@ -467,6 +522,36 @@ mod tests {
     fn compare_values_strings_utf8() {
         assert_eq!(compare_values(&"a".into(), &"b".into()), Ordering::Less);
         assert_eq!(compare_values(&"abc".into(), &"abd".into()), Ordering::Less);
+    }
+
+    #[test]
+    fn estimated_bytes_string_heavy_row_dominated_by_payload() {
+        let payload = "x".repeat(10_000);
+        let r = row(&[("id", 1.into()), ("body", Value::String(payload))]);
+        // The estimate must be at least the string payload, and within a small
+        // constant factor of it (headers + slots, not another copy).
+        let est = r.estimated_bytes();
+        assert!(est >= 10_000, "est {est} < payload");
+        assert!(est < 11_000, "est {est} unexpectedly large");
+    }
+
+    #[test]
+    fn estimated_bytes_interned_columns_not_multiply_counted() {
+        // Many rows sharing one long column name: per-row cost must not scale
+        // with the column-name length (only the pointer slot is charged).
+        let long_col = "extremely_long_shared_column_name_".repeat(8); // 272 bytes
+        let r1 = row(&[(long_col.as_str(), 1.into())]);
+        let r2 = row(&[("id", 1.into())]);
+        // Same shape (1 col, numeric value) → same estimate despite the name.
+        assert_eq!(r1.estimated_bytes(), r2.estimated_bytes());
+    }
+
+    #[test]
+    fn estimated_bytes_json_counts_nested_payload() {
+        let j: serde_json::Value =
+            serde_json::json!({ "k": "v".repeat(1000), "arr": [1, 2, 3] });
+        let v = Value::Json(j);
+        assert!(v.estimated_bytes() >= 1000);
     }
 
     #[test]
