@@ -80,11 +80,16 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ORBIT_REPLICA=sqlite (+ optional ORBIT_REPLICA_DIR for durability) selects
-    // the SQLite-backed replica; default is in-memory.
+    // the SQLite-backed replica; default is in-memory. ORBIT_REPLICA_CACHE_MB /
+    // ORBIT_REPLICA_MMAP_MB tune the SQLite page cache / mmap budget.
     match env("ORBIT_REPLICA", "memory").as_str() {
         "sqlite" => {
             let dir = std::env::var("ORBIT_REPLICA_DIR").ok().map(std::path::PathBuf::from);
-            run_server_sqlite(cfg, MutatorRegistry::new(), dir).await
+            let opts = orbit_cache::SqliteReplicaOpts {
+                cache_mb: std::env::var("ORBIT_REPLICA_CACHE_MB").ok().and_then(|v| v.parse().ok()),
+                mmap_mb: std::env::var("ORBIT_REPLICA_MMAP_MB").ok().and_then(|v| v.parse().ok()),
+            };
+            run_server_sqlite(cfg, MutatorRegistry::new(), dir, opts).await
         }
         _ => run_server(cfg, MutatorRegistry::new()).await,
     }

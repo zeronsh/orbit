@@ -15,13 +15,26 @@
 //!   ORBIT_MUTATE_URL/QUERY_URL  app push/query endpoints (view-syncer)
 //!   ORBIT_SNAPSHOT_INTERVAL     replicator snapshot cadence, seconds (default 30)
 //!   ORBIT_BUCKET, AWS_ENDPOINT_URL, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+//!   ORBIT_REPLICA               sqlite | memory (default sqlite). SQLite bounds
+//!                               steady memory to the page cache and snapshots as a
+//!                               streamed database file; `memory` is the legacy
+//!                               whole-dataset-in-RAM / JSON-snapshot mode. The
+//!                               snapshot object keys differ, so run the WHOLE
+//!                               cluster on one value (flip it everywhere at once).
+//!   ORBIT_REPLICA_DIR           sqlite: replica.db + snapshot staging dir
+//!                               (default ./orbit-replica; give each node a volume)
+//!   ORBIT_REPLICA_CACHE_MB      sqlite: page-cache size (PRAGMA cache_size)
+//!   ORBIT_REPLICA_MMAP_MB       sqlite: mmap budget (PRAGMA mmap_size)
+//!   ORBIT_SNAPSHOT_PART_MB      sqlite: snapshot upload/download buffer (default 8;
+//!                               transfer memory ceiling ≈ 2× this)
 
 use std::time::Duration;
 
 use oql::ivm::ColumnType;
 use orbit_cache::{
-    run_replicator, run_view_syncer, MutatorRegistry, QueryRegistry, S3ObjectStore, ServerConfig,
-    TableConfig,
+    run_replicator, run_replicator_sqlite, run_view_syncer, run_view_syncer_sqlite,
+    MutatorRegistry, QueryRegistry, S3ObjectStore, ServerConfig, SqliteClusterConfig,
+    SqliteReplicaOpts, TableConfig,
 };
 
 fn env(key: &str, default: &str) -> String {
@@ -94,15 +107,38 @@ async fn main() -> anyhow::Result<()> {
     let store = S3ObjectStore::from_env()?;
     let cs_addr = env("ORBIT_CHANGE_STREAM_ADDR", "[::]:4000");
 
-    match role.as_str() {
-        "replicator" => {
+    // Default is the bounded-memory SQLite replica; `memory` is the legacy
+    // whole-dataset-in-RAM mode with JSON snapshots.
+    let replica_kind = env("ORBIT_REPLICA", "sqlite");
+    let sqlite_cfg = || {
+        let mut c = SqliteClusterConfig::new(env("ORBIT_REPLICA_DIR", "./orbit-replica"));
+        c.opts = SqliteReplicaOpts {
+            cache_mb: std::env::var("ORBIT_REPLICA_CACHE_MB").ok().and_then(|v| v.parse().ok()),
+            mmap_mb: std::env::var("ORBIT_REPLICA_MMAP_MB").ok().and_then(|v| v.parse().ok()),
+        };
+        let part_mb: usize = env("ORBIT_SNAPSHOT_PART_MB", "8").parse().unwrap_or(8);
+        c.snapshot_part_size = part_mb.max(1) << 20;
+        c
+    };
+
+    match (role.as_str(), replica_kind.as_str()) {
+        ("replicator", "memory") => {
             let secs: u64 = env("ORBIT_SNAPSHOT_INTERVAL", "30").parse().unwrap_or(30);
-            eprintln!("orbit-node: REPLICATOR, change-stream on {cs_addr}, snapshot every {secs}s");
+            eprintln!("orbit-node: REPLICATOR (memory), change-stream on {cs_addr}, snapshot every {secs}s");
             run_replicator(cfg, store, cs_addr, Duration::from_secs(secs)).await
         }
-        _ => {
-            eprintln!("orbit-node: VIEW-SYNCER, following {cs_addr}, serving WS on {}", cfg.listen_addr);
+        ("replicator", _) => {
+            let secs: u64 = env("ORBIT_SNAPSHOT_INTERVAL", "30").parse().unwrap_or(30);
+            eprintln!("orbit-node: REPLICATOR (sqlite), change-stream on {cs_addr}, snapshot every {secs}s");
+            run_replicator_sqlite(cfg, store, cs_addr, Duration::from_secs(secs), sqlite_cfg()).await
+        }
+        (_, "memory") => {
+            eprintln!("orbit-node: VIEW-SYNCER (memory), following {cs_addr}, serving WS on {}", cfg.listen_addr);
             run_view_syncer(cfg, store, cs_addr, MutatorRegistry::new(), QueryRegistry::new()).await
+        }
+        _ => {
+            eprintln!("orbit-node: VIEW-SYNCER (sqlite), following {cs_addr}, serving WS on {}", cfg.listen_addr);
+            run_view_syncer_sqlite(cfg, store, cs_addr, MutatorRegistry::new(), QueryRegistry::new(), sqlite_cfg()).await
         }
     }
 }

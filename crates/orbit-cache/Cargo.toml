@@ -19,6 +19,7 @@ postgres-protocol = "0.6"
 postgres-types = "0.2"
 futures-util = "0.3"
 bytes = "1"
+tokio-util = { version = "0.7", features = ["io"] }
 tokio-tungstenite = "0.24"
 base64 = { workspace = true }
 percent-encoding = { workspace = true }

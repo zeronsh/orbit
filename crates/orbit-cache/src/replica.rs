@@ -33,14 +33,21 @@ pub trait ReplicaBackend: oql::SourceProvider {
     /// transaction so the whole upstream transaction commits atomically (a
     /// crash mid-transaction rolls back instead of persisting a torn half).
     fn begin_txn(&self) {}
-    /// End of a replication transaction with its commit LSN. A durable backend
-    /// records `lsn` as its resume watermark **inside** the same storage
-    /// transaction, then commits — so the watermark can never disagree with the
-    /// data it describes.
-    fn commit_txn(&self, _lsn: u64) {}
+    /// End of a replication transaction. `lsn` is the upstream position this
+    /// replica follows (the WAL commit LSN; 0 for a view-syncer applying the
+    /// change-stream), `pos` the replicator change-stream sequence of the
+    /// commit (0 outside cluster mode). A durable backend records both as its
+    /// resume watermark **inside** the same storage transaction, then commits —
+    /// so the watermark can never disagree with the data it describes.
+    fn commit_txn(&self, _lsn: u64, _pos: u64) {}
     /// The durably-recorded resume point from a previous run, if any. `Some`
     /// lets the server skip the full initial sync and resume from the slot.
     fn resume_watermark(&self) -> Option<u64> {
+        None
+    }
+    /// The durably-recorded change-stream position from a previous run, if any
+    /// (cluster resume: replicator seq continuity / view-syncer delta resume).
+    fn resume_pos(&self) -> Option<u64> {
         None
     }
     /// Reset all replicated data before a fresh initial sync. A durable backend

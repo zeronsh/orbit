@@ -102,10 +102,11 @@ pub async fn run_server_sqlite(
     cfg: ServerConfig,
     mutators: MutatorRegistry,
     dir: Option<std::path::PathBuf>,
+    opts: crate::sqlite_source::SqliteReplicaOpts,
 ) -> Result<()> {
     let mut replica = match dir {
-        Some(d) => crate::sqlite_source::SqliteReplica::durable(d),
-        None => crate::sqlite_source::SqliteReplica::in_memory(),
+        Some(d) => crate::sqlite_source::SqliteReplica::durable_with(d, &opts),
+        None => crate::sqlite_source::SqliteReplica::in_memory_with(&opts),
     };
     for t in &cfg.tables {
         replica.add_table(&t.name, t.columns.clone(), t.primary_key.clone());
@@ -279,7 +280,7 @@ async fn run_inner<B: ReplicaBackend + 'static>(
                     .with_context(|| format!("initial sync of table {}", t.name))?;
                 eprintln!("initial sync: {} rows from {}", n, t.name);
             }
-            replica.commit_txn(0);
+            replica.commit_txn(0, 0);
         }
     }
     let mutators = Rc::new(mutators);
@@ -343,7 +344,7 @@ async fn run_inner<B: ReplicaBackend + 'static>(
                                 replica.apply(ev);
                             }
                             replica.apply(LogicalEvent::Commit);
-                            replica.commit_txn(lsn);
+                            replica.commit_txn(lsn, 0);
                             dedup_lsn = lsn;
                             if dirty {
                                 let _ = ticks_tx.send(());
@@ -429,39 +430,261 @@ async fn accept_ws_clients<B: ReplicaBackend + 'static>(
     }
 }
 
-/// Take a snapshot of `replica` at change-stream position `pos` and write it to
-/// the object store.
-async fn write_snapshot<O: ObjectStore>(store: &O, replica: &Replica, pos: u64) -> Result<()> {
-    let snap = ReplicaSnapshot { pos, tables: replica.snapshot() }; // sync gather (no await)
-    store.put(ReplicaSnapshot::KEY, snap.to_bytes()).await
+/// How the cluster roles persist and restore replica snapshots. Two
+/// strategies: whole-dataset JSON blobs for the in-memory replica (legacy) and
+/// streamed SQLite files for the durable replica (bounded memory). Static
+/// dispatch — everything runs on the `LocalSet`, no `Send` bounds.
+#[allow(async_fn_in_trait)]
+pub trait SnapshotStrategy {
+    type Backend: ReplicaBackend + 'static;
+    /// Persist a snapshot of `replica` reflecting change-stream position `pos`.
+    async fn write<O: ObjectStore>(&self, store: &O, replica: &Self::Backend, pos: u64) -> Result<()>;
+    /// The position of the latest stored snapshot, if any. The replicator reads
+    /// this on startup (last-resort fallback) so its change-stream sequence
+    /// continues from where the last instance left off rather than resetting to 0.
+    async fn stored_pos<O: ObjectStore>(&self, store: &O) -> Result<Option<u64>>;
+    /// Build the backend restored from the latest snapshot (waiting if none
+    /// exists yet), returning `(backend, position)`.
+    async fn restore<O: ObjectStore>(&self, store: &O, cfg: &ServerConfig) -> Result<(Self::Backend, u64)>;
+    /// Drop any local restore state so the next boot re-downloads (called on a
+    /// change-stream `Reset` before the crash-only exit — otherwise a durable
+    /// node whose position fell out of retention would resume back to the same
+    /// stale point forever).
+    fn invalidate_local(&self) {}
 }
 
-/// The watermark of the latest persisted snapshot, if any. The replicator reads
-/// this on startup so its change-stream sequence continues from where the last
-/// instance left off (continuity across restarts), rather than resetting to 0.
-async fn snapshot_watermark<O: ObjectStore>(store: &O) -> Result<Option<u64>> {
-    match store.get(ReplicaSnapshot::KEY).await? {
-        Some(bytes) => Ok(Some(ReplicaSnapshot::from_bytes(&bytes)?.pos)),
-        None => Ok(None),
+/// Whole-dataset JSON snapshots for the in-memory [`Replica`] (legacy cluster
+/// mode). O(dataset) memory on both ends — prefer [`SqliteSnapshots`].
+pub struct JsonSnapshots;
+
+impl SnapshotStrategy for JsonSnapshots {
+    type Backend = Replica;
+
+    async fn write<O: ObjectStore>(&self, store: &O, replica: &Replica, pos: u64) -> Result<()> {
+        let snap = ReplicaSnapshot { pos, tables: replica.snapshot() }; // sync gather (no await)
+        store.put(ReplicaSnapshot::KEY, snap.to_bytes()).await
+    }
+
+    async fn stored_pos<O: ObjectStore>(&self, store: &O) -> Result<Option<u64>> {
+        match store.get(ReplicaSnapshot::KEY).await? {
+            Some(bytes) => Ok(Some(ReplicaSnapshot::from_bytes(&bytes)?.pos)),
+            None => Ok(None),
+        }
+    }
+
+    async fn restore<O: ObjectStore>(&self, store: &O, cfg: &ServerConfig) -> Result<(Replica, u64)> {
+        let mut replica = Replica::new();
+        for t in &cfg.tables {
+            replica.add_table(&t.name, t.columns.iter().cloned().collect(), t.primary_key.clone());
+        }
+        loop {
+            if let Some(bytes) = store.get(ReplicaSnapshot::KEY).await? {
+                let snap = ReplicaSnapshot::from_bytes(&bytes)?;
+                for (table, rows) in snap.tables {
+                    for row in rows {
+                        replica.seed(&table, row);
+                    }
+                }
+                eprintln!("view-syncer restored snapshot @ pos {}", snap.pos);
+                return Ok((replica, snap.pos));
+            }
+            eprintln!("view-syncer: waiting for replicator snapshot…");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 }
 
-/// Restore the latest snapshot from the object store into `replica`, returning
-/// the change-stream position it reflects. Waits for a snapshot if none exists yet.
-async fn restore_snapshot<O: ObjectStore>(store: &O, replica: &Replica) -> Result<u64> {
-    loop {
-        if let Some(bytes) = store.get(ReplicaSnapshot::KEY).await? {
-            let snap = ReplicaSnapshot::from_bytes(&bytes)?;
-            for (table, rows) in snap.tables {
-                for row in rows {
-                    replica.seed(&table, row);
+/// SQLite cluster-node options: replica placement + connection tuning +
+/// snapshot upload buffering.
+#[derive(Clone, Debug)]
+pub struct SqliteClusterConfig {
+    /// Home of `replica.db` and snapshot staging files (a per-node volume).
+    pub dir: std::path::PathBuf,
+    /// Page-cache / mmap tuning (`ORBIT_REPLICA_CACHE_MB` / `ORBIT_REPLICA_MMAP_MB`).
+    pub opts: crate::sqlite_source::SqliteReplicaOpts,
+    /// Multipart part & buffer size for snapshot upload/download — the memory
+    /// ceiling of a snapshot transfer is ~2× this. Default 8 MiB.
+    pub snapshot_part_size: usize,
+}
+
+impl SqliteClusterConfig {
+    pub fn new(dir: impl Into<std::path::PathBuf>) -> Self {
+        SqliteClusterConfig {
+            dir: dir.into(),
+            opts: crate::sqlite_source::SqliteReplicaOpts::default(),
+            snapshot_part_size: 8 << 20,
+        }
+    }
+}
+
+/// Streamed SQLite-file snapshots for the durable [`SqliteReplica`]. The
+/// snapshot is a `VACUUM INTO` copy of the replica file — self-describing: its
+/// `orbit_replication_state.pos` is transaction-atomic with its rows — uploaded
+/// multipart with O(part_size) memory and restored straight to disk.
+pub struct SqliteSnapshots {
+    pub cfg: SqliteClusterConfig,
+}
+
+/// The object key holding the latest SQLite snapshot file…
+const SQLITE_SNAPSHOT_KEY: &str = "snapshot/latest.db";
+/// …and a tiny advisory copy of its position (only consulted when a replicator
+/// restarts with neither a changelog checkpoint nor a local replica file).
+const SQLITE_SNAPSHOT_POS_KEY: &str = "snapshot/latest.pos";
+
+impl SqliteSnapshots {
+    fn build_replica(&self, cfg: &ServerConfig) -> crate::sqlite_source::SqliteReplica {
+        let mut replica =
+            crate::sqlite_source::SqliteReplica::durable_with(&self.cfg.dir, &self.cfg.opts);
+        for t in &cfg.tables {
+            replica.add_table(&t.name, t.columns.clone(), t.primary_key.clone());
+        }
+        replica
+    }
+
+    fn replica_db(&self) -> std::path::PathBuf {
+        self.cfg.dir.join("replica.db")
+    }
+
+    /// Remove stale snapshot staging files from a previous run (crash /
+    /// deploy-overlap leftovers).
+    fn sweep_staging(&self) {
+        if let Ok(entries) = std::fs::read_dir(&self.cfg.dir) {
+            for e in entries.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("snapshot.") && name.ends_with(".db") {
+                    let _ = std::fs::remove_file(e.path());
                 }
             }
-            eprintln!("view-syncer restored snapshot @ pos {}", snap.pos);
-            return Ok(snap.pos);
         }
-        eprintln!("view-syncer: waiting for replicator snapshot…");
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Open the SQLite file at `path` read-only and verify it is a usable
+/// snapshot: passes `PRAGMA quick_check` and carries a replication-state row.
+/// Returns the snapshot's change-stream position. Blocking work runs off the
+/// `LocalSet`.
+async fn validate_sqlite_snapshot(path: std::path::PathBuf) -> Result<u64> {
+    tokio::task::spawn_blocking(move || -> Result<u64> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .context("open snapshot for validation")?;
+        let ok: String = conn
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .context("quick_check")?;
+        anyhow::ensure!(ok == "ok", "snapshot failed quick_check: {ok}");
+        let pos: i64 = conn
+            .query_row("SELECT pos FROM orbit_replication_state WHERE id = 1", [], |r| r.get(0))
+            .context("snapshot has no replication-state row")?;
+        Ok(pos as u64)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("validation task panicked: {e}"))?
+}
+
+impl SnapshotStrategy for SqliteSnapshots {
+    type Backend = crate::sqlite_source::SqliteReplica;
+
+    async fn write<O: ObjectStore>(
+        &self,
+        store: &O,
+        replica: &crate::sqlite_source::SqliteReplica,
+        pos: u64,
+    ) -> Result<()> {
+        let src = replica
+            .db_path()
+            .context("file snapshots need a durable (file-backed) replica")?
+            .to_owned();
+        // Unique staging name: deploy overlap means two replicators may
+        // snapshot concurrently into the same volume.
+        let tmp = self.cfg.dir.join(format!(
+            "snapshot.{}.{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let result: Result<()> = async {
+            crate::sqlite_source::SqliteReplica::backup_to(src, tmp.clone()).await?;
+            crate::objectstore::put_file(store, SQLITE_SNAPSHOT_KEY, &tmp, self.cfg.snapshot_part_size)
+                .await?;
+            // Advisory pos, written AFTER the db object so it never over-claims.
+            // (The authoritative pos rides inside the file itself.)
+            store.put(SQLITE_SNAPSHOT_POS_KEY, pos.to_string().into_bytes()).await?;
+            Ok(())
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        result
+    }
+
+    async fn stored_pos<O: ObjectStore>(&self, store: &O) -> Result<Option<u64>> {
+        Ok(store
+            .get(SQLITE_SNAPSHOT_POS_KEY)
+            .await?
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| s.trim().parse().ok()))
+    }
+
+    async fn restore<O: ObjectStore>(
+        &self,
+        store: &O,
+        cfg: &ServerConfig,
+    ) -> Result<(crate::sqlite_source::SqliteReplica, u64)> {
+        std::fs::create_dir_all(&self.cfg.dir).ok();
+        self.sweep_staging();
+        // Local short-circuit: a durable view-syncer that recorded its applied
+        // position resumes by DELTA from its own replica file — no download.
+        if self.replica_db().exists() {
+            let replica = self.build_replica(cfg);
+            if let Some(p) = replica.resume_pos() {
+                eprintln!(
+                    "view-syncer: resuming from local replica.db @ pos {p} (skipping snapshot download)"
+                );
+                return Ok((replica, p));
+            }
+            // Foreign or half-built file: close the connection, then clear it.
+            drop(replica);
+            self.invalidate_local();
+        }
+        let tmp = self.cfg.dir.join(format!("replica.db.tmp.{}", std::process::id()));
+        loop {
+            match crate::objectstore::get_to_file(store, SQLITE_SNAPSHOT_KEY, &tmp).await {
+                Ok(true) => match validate_sqlite_snapshot(tmp.clone()).await {
+                    Ok(pos) => {
+                        self.invalidate_local();
+                        std::fs::rename(&tmp, self.replica_db())
+                            .context("rename snapshot into place")?;
+                        let replica = self.build_replica(cfg);
+                        eprintln!("view-syncer restored snapshot @ pos {pos}");
+                        return Ok((replica, pos));
+                    }
+                    Err(e) => {
+                        // Corrupt / torn / garbage object: never rename it into
+                        // place; retry with a fresh GET.
+                        eprintln!("downloaded snapshot invalid ({e:#}); retrying");
+                        let _ = tokio::fs::remove_file(&tmp).await;
+                    }
+                },
+                Ok(false) => eprintln!(
+                    "view-syncer: waiting for replicator snapshot at {SQLITE_SNAPSHOT_KEY} — is the replicator running ORBIT_REPLICA=sqlite too?"
+                ),
+                Err(e) => eprintln!("snapshot download failed: {e:#}; retrying"),
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    fn invalidate_local(&self) {
+        let db = self.replica_db();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = db.clone().into_os_string();
+            p.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+        }
     }
 }
 
@@ -476,17 +699,57 @@ pub async fn run_replicator<O: ObjectStore + 'static>(
     change_stream_addr: String,
     snapshot_interval: Duration,
 ) -> Result<()> {
+    let mut replica = Replica::new();
+    for t in &cfg.tables {
+        replica.add_table(&t.name, t.columns.iter().cloned().collect(), t.primary_key.clone());
+    }
     let local = LocalSet::new();
     local
-        .run_until(run_replicator_inner(cfg, store, change_stream_addr, snapshot_interval))
+        .run_until(run_replicator_inner(
+            cfg,
+            store,
+            change_stream_addr,
+            snapshot_interval,
+            Rc::new(JsonSnapshots),
+            replica,
+        ))
         .await
 }
 
-async fn run_replicator_inner<O: ObjectStore + 'static>(
+/// [`run_replicator`] over a durable SQLite replica with streamed SQLite-file
+/// snapshots: steady memory is O(page cache), snapshot transfer memory is
+/// O(part size), and a restart resumes from the local file (no re-sync).
+pub async fn run_replicator_sqlite<O: ObjectStore + 'static>(
     cfg: ServerConfig,
     store: O,
     change_stream_addr: String,
     snapshot_interval: Duration,
+    sqlite: SqliteClusterConfig,
+) -> Result<()> {
+    let mut replica = crate::sqlite_source::SqliteReplica::durable_with(&sqlite.dir, &sqlite.opts);
+    for t in &cfg.tables {
+        replica.add_table(&t.name, t.columns.clone(), t.primary_key.clone());
+    }
+    let local = LocalSet::new();
+    local
+        .run_until(run_replicator_inner(
+            cfg,
+            store,
+            change_stream_addr,
+            snapshot_interval,
+            Rc::new(SqliteSnapshots { cfg: sqlite }),
+            replica,
+        ))
+        .await
+}
+
+async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 'static>(
+    cfg: ServerConfig,
+    store: O,
+    change_stream_addr: String,
+    snapshot_interval: Duration,
+    snap: Rc<S>,
+    replica: S::Backend,
 ) -> Result<()> {
     let (pg, driver) = tls::connect(&cfg.conn_str(), cfg.tls).await?;
     tokio::spawn(driver);
@@ -497,15 +760,7 @@ async fn run_replicator_inner<O: ObjectStore + 'static>(
         .await
         .context("creating logical replication slot — is wal_level=logical?")?;
 
-    let mut replica = Replica::new();
-    for t in &cfg.tables {
-        replica.add_table(&t.name, t.columns.iter().cloned().collect(), t.primary_key.clone());
-    }
     let replica = Rc::new(replica);
-    for t in &cfg.tables {
-        let n = initial_sync_backend(&pg, replica.as_ref(), &t.name).await?;
-        eprintln!("initial sync: {} rows from {}", n, t.name);
-    }
     let store = Rc::new(store);
 
     // Durable change-log: lets view-syncers resume by *delta* across a restart
@@ -536,11 +791,38 @@ async fn run_replicator_inner<O: ObjectStore + 'static>(
         Some(l) => l.checkpoint().await?,
         None => None,
     };
+    // Resume seq: changelog checkpoint → the durable replica's own recorded
+    // position → the stored snapshot's advisory position → 0.
     let start_seq = match checkpoint {
         Some((pos, _)) => pos,
-        None => snapshot_watermark(store.as_ref()).await?.unwrap_or(0),
+        None => match replica.resume_pos() {
+            Some(pos) => pos,
+            None => snap.stored_pos(store.as_ref()).await?.unwrap_or(0),
+        },
     };
     let mut dedup_lsn = checkpoint.map(|(_, lsn)| lsn).unwrap_or(0);
+
+    // A durable backend that recorded a watermark resumes from the slot instead
+    // of re-syncing; a fresh sync first CLEARS the backend (initial sync only
+    // upserts, so rows deleted upstream while offline would otherwise survive
+    // as phantoms). Recording `start_seq` with the fresh sync keeps the
+    // snapshot file's position aligned with the continued stream.
+    let mut apply_watermark = replica.resume_watermark().unwrap_or(0);
+    if apply_watermark > 0 {
+        eprintln!(
+            "durable replica: resuming from watermark {apply_watermark} (skipping initial sync)"
+        );
+    } else {
+        replica.start_fresh();
+        replica.begin_txn();
+        for t in &cfg.tables {
+            let n = initial_sync_backend(&pg, replica.as_ref(), &t.name)
+                .await
+                .with_context(|| format!("initial sync of table {}", t.name))?;
+            eprintln!("initial sync: {} rows from {}", n, t.name);
+        }
+        replica.commit_txn(0, start_seq);
+    }
 
     // Ring/broadcast tuning from ORBIT_CHANGE_RING_BYTES / ORBIT_CHANGE_RING_CAPACITY /
     // ORBIT_BROADCAST_CAP; the struct defaults match CHANGE_RING_CAPACITY + 64 MiB.
@@ -561,7 +843,7 @@ async fn run_replicator_inner<O: ObjectStore + 'static>(
 
     // Refresh the snapshot with the freshly-synced replica at the continued
     // watermark, so view-syncers restore current data aligned with `start_seq`.
-    write_snapshot(store.as_ref(), replica.as_ref(), start_seq).await?;
+    snap.write(store.as_ref(), replica.as_ref(), start_seq).await?;
     eprintln!("replicator change-stream resuming at seq {start_seq} (dedup lsn {dedup_lsn})");
 
     // Retention: prune log entries well past the in-memory ring window. A
@@ -589,11 +871,12 @@ async fn run_replicator_inner<O: ObjectStore + 'static>(
         let store = store.clone();
         let replica = replica.clone();
         let server = server.clone();
+        let snap = snap.clone();
         spawn_local(async move {
             loop {
                 tokio::time::sleep(snapshot_interval).await;
                 let pos = server.current_seq();
-                if let Err(e) = write_snapshot(store.as_ref(), replica.as_ref(), pos).await {
+                if let Err(e) = snap.write(store.as_ref(), replica.as_ref(), pos).await {
                     eprintln!("snapshot failed: {e:#}");
                 }
             }
@@ -610,6 +893,9 @@ async fn run_replicator_inner<O: ObjectStore + 'static>(
     let (slot, publication) = (cfg.slot.clone(), cfg.publication.clone());
     let (password, tls_mode) = (cfg.password.clone(), cfg.tls);
     let mut txn_buf: Vec<(u64, LogicalEvent)> = Vec::new();
+    // The stream position recorded with the replica's last committed txn —
+    // carried forward across publish-skipped (already-logged) replays.
+    let mut last_committed_pos: u64 = start_seq;
     loop {
         // Retry START_REPLICATION while the slot is held by a departing instance
         // (redeploy overlap). The loser waits instead of fighting — see create_slot.
@@ -636,19 +922,45 @@ async fn run_replicator_inner<O: ObjectStore + 'static>(
         loop {
             match stream.next_event().await {
                 Ok((lsn, LogicalEvent::Commit)) => {
-                    if lsn > dedup_lsn {
-                        for (l, e) in txn_buf.drain(..) {
+                    // With a durable replica, "already applied" (its recorded
+                    // watermark) and "already published/durably logged"
+                    // (`dedup_lsn`, the changelog checkpoint) can diverge after
+                    // a crash. Invariant: the replica commits synchronously
+                    // BEFORE the changelog's async flush, so
+                    // `apply_watermark >= dedup_lsn` — a re-delivered txn may
+                    // need publishing (to fill the log) without re-applying
+                    // over newer state.
+                    let publish = lsn > dedup_lsn;
+                    let apply = lsn > apply_watermark;
+                    if apply {
+                        replica.begin_txn();
+                    }
+                    for (l, e) in txn_buf.drain(..) {
+                        if apply {
                             replica.apply(e.clone());
+                        }
+                        if publish {
                             // Awaits only when the durable log's byte budget is
                             // full — the intended backpressure point that parks
                             // WAL consumption (see changelog module doc).
                             server.publish(l, e).await;
                         }
-                        replica.apply(LogicalEvent::Commit);
+                    }
+                    if publish {
                         server.publish(lsn, LogicalEvent::Commit).await;
                         dedup_lsn = lsn;
-                    } else {
-                        txn_buf.clear(); // already logged (re-delivered) → skip the txn
+                    }
+                    if apply {
+                        replica.apply(LogicalEvent::Commit);
+                        // The pump is single-threaded, so right after
+                        // publishing, `current_seq()` is exactly this commit's
+                        // stream position. On a publish-skip replay, carry the
+                        // previous position (a safe, idempotent resume point).
+                        let pos =
+                            if publish { server.current_seq() } else { last_committed_pos };
+                        replica.commit_txn(lsn, pos);
+                        apply_watermark = lsn;
+                        last_committed_pos = pos;
                     }
                     // Ack only durably-logged WAL: with a durable log, the
                     // writer's flushed watermark; without one (ring-only mode,
@@ -684,23 +996,51 @@ pub async fn run_view_syncer<O: ObjectStore + 'static>(
 ) -> Result<()> {
     let local = LocalSet::new();
     local
-        .run_until(run_view_syncer_inner(cfg, store, change_stream_addr, mutators, queries))
+        .run_until(run_view_syncer_inner(
+            cfg,
+            store,
+            change_stream_addr,
+            mutators,
+            queries,
+            Rc::new(JsonSnapshots),
+        ))
         .await
 }
 
-async fn run_view_syncer_inner<O: ObjectStore + 'static>(
+/// [`run_view_syncer`] over a durable SQLite replica restored from streamed
+/// SQLite-file snapshots. A restart with an intact local `replica.db` resumes
+/// by delta — no snapshot download at all.
+pub async fn run_view_syncer_sqlite<O: ObjectStore + 'static>(
     cfg: ServerConfig,
     store: O,
     change_stream_addr: String,
     mutators: MutatorRegistry,
     queries: QueryRegistry,
+    sqlite: SqliteClusterConfig,
 ) -> Result<()> {
-    let mut replica = Replica::new();
-    for t in &cfg.tables {
-        replica.add_table(&t.name, t.columns.iter().cloned().collect(), t.primary_key.clone());
-    }
+    let local = LocalSet::new();
+    local
+        .run_until(run_view_syncer_inner(
+            cfg,
+            store,
+            change_stream_addr,
+            mutators,
+            queries,
+            Rc::new(SqliteSnapshots { cfg: sqlite }),
+        ))
+        .await
+}
+
+async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 'static>(
+    cfg: ServerConfig,
+    store: O,
+    change_stream_addr: String,
+    mutators: MutatorRegistry,
+    queries: QueryRegistry,
+    snap: Rc<S>,
+) -> Result<()> {
+    let (replica, watermark) = snap.restore(&store, &cfg).await?;
     let replica = Rc::new(replica);
-    let watermark = restore_snapshot(&store, replica.as_ref()).await?;
 
     // Postgres connection only for client mutation write-through (no slot here);
     // those writes flow back through the replicator's change-stream.
@@ -744,6 +1084,7 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
         let lmids = lmids.clone();
         let addr = change_stream_addr.clone();
         let replica_pos = replica_pos.clone();
+        let snap = snap.clone();
         spawn_local(async move {
             let mut watermark = watermark;
             replica_pos.set(watermark);
@@ -779,6 +1120,11 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
                             if !is_commit {
                                 continue;
                             }
+                            // One storage transaction per upstream transaction:
+                            // a durable backend records its applied position
+                            // (`commit_txn(0, watermark)`) atomically with the
+                            // rows, enabling delta resume from the local file.
+                            replica.begin_txn();
                             for (p, ev) in txn_buf.drain(..) {
                                 if matches!(
                                     ev,
@@ -790,6 +1136,7 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
                                 replica.apply(ev);
                                 watermark = p;
                             }
+                            replica.commit_txn(0, watermark);
                             replica_pos.set(watermark);
                             stuck_failures = 0;
                             if dirty {
@@ -803,6 +1150,10 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
                             // restarts us and we re-restore the latest snapshot — a
                             // bare `return` would only kill this task and leave the
                             // WS server happily serving stale data forever.
+                            // Invalidate local restore state first: a durable
+                            // replica would otherwise short-circuit right back
+                            // to the same stale position on every restart.
+                            snap.invalidate_local();
                             eprintln!("change-stream Reset (stale resume point, e.g. replicator restarted); exiting to re-restore snapshot");
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             std::process::exit(1);
@@ -812,6 +1163,11 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static>(
                             if watermark == reconnect_watermark {
                                 stuck_failures += 1;
                                 if stuck_failures >= 5 {
+                                    // Same rationale as Reset: without this, a
+                                    // durable replica resumes at the same stuck
+                                    // watermark (and the same decode failure)
+                                    // on every restart.
+                                    snap.invalidate_local();
                                     eprintln!("change-stream read failed {stuck_failures}x at watermark {watermark} ({e:#}); exiting to re-restore snapshot");
                                     tokio::time::sleep(Duration::from_secs(1)).await;
                                     std::process::exit(1);

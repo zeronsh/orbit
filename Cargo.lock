@@ -1066,6 +1066,7 @@ dependencies = [
  "tokio-postgres-rustls",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tokio-util",
  "tracing",
  "url",
  "webpki-roots",
