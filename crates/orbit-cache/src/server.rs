@@ -94,6 +94,14 @@ struct ActiveQuery {
     tables: std::collections::HashSet<String>,
 }
 
+impl Drop for ActiveQuery {
+    fn drop(&mut self) {
+        // Covers every teardown path — explicit Del, clean close, AND error
+        // disconnects — so /statz active counts can't drift.
+        crate::metrics::record_query_active(&self.hash, -1);
+    }
+}
+
 /// A replication tick: the tables the committed transaction touched. An empty
 /// list means "unknown" — every client conservatively drains. Carrying the
 /// table set suppresses no-op wakeups: previously EVERY transaction woke EVERY
@@ -285,7 +293,9 @@ where
         if changes.is_empty() {
             continue;
         }
+        let before = patches.len();
         patches.extend(changes_to_patches_dedup(&changes, &q.schema, row_refs));
+        crate::metrics::record_query_advance(&q.hash, (patches.len() - before) as u64);
     }
     drop(consistent);
     // Advancement circuit-breaker signal: a giant upstream transaction turns
@@ -1115,6 +1125,8 @@ where
                     rows.len() as u64,
                     hydrate_took > slow_hydration_budget(),
                 );
+                crate::metrics::record_query_hydration(&hash, hydrate_took, rows.len() as u64);
+                crate::metrics::record_query_active(&hash, 1);
                 // Let queued work (other clients' sends, ticks) interleave
                 // between one query's heavy synchronous fetch and the next.
                 tokio::task::yield_now().await;

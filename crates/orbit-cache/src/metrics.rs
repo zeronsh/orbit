@@ -1,5 +1,5 @@
 //! Observability: a per-node metrics registry, a Prometheus text renderer, and
-//! a tiny hand-rolled HTTP responder serving `/metrics`, `/ready`, and `/live`.
+//! a tiny hand-rolled HTTP responder serving `/metrics`, `/ready`, `/live`, and `/statz` (per-query costs).
 //!
 //! Zero dependencies by design — this repo already hand-rolls its TCP change
 //! stream and WebSocket handshake, everything runs on a current-thread
@@ -291,6 +291,7 @@ async fn handle_http(sock: tokio::net::TcpStream, m: &Metrics) -> anyhow::Result
             }
         }
         "/live" => ("200 OK", "text/plain", "live\n".to_string()),
+        "/statz" => ("200 OK", "application/json", render_statz()),
         _ => ("404 Not Found", "text/plain", "not found\n".to_string()),
     };
     let resp = format!(
@@ -397,4 +398,75 @@ pub fn observe_advance(took: std::time::Duration, slow: bool) {
     if let Some(m) = node_metrics() {
         m.observe_advance_on(took, slow);
     }
+}
+
+// --- Per-query observability (audit: "which query is expensive?" was
+// unanswerable — ~20 node-level gauges, no per-query dimension). Zero's
+// analog is /statz. Keyed by the client-supplied query hash; global (not
+// per-connection) so identical subscriptions aggregate.
+
+#[derive(Default, Clone, serde::Serialize)]
+pub struct QueryStat {
+    /// Live subscriptions of this query across all connections.
+    pub active: i64,
+    /// Hydrations served and their cumulative materialize cost.
+    pub hydrations: u64,
+    pub hydrate_ms: u64,
+    pub hydrate_rows: u64,
+    /// Incremental advances that produced ops for this query.
+    pub advances: u64,
+    pub advance_ops: u64,
+}
+
+fn query_stats() -> &'static std::sync::Mutex<std::collections::HashMap<String, QueryStat>> {
+    static STATS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, QueryStat>>,
+    > = std::sync::OnceLock::new();
+    STATS.get_or_init(Default::default)
+}
+
+pub fn record_query_hydration(hash: &str, took: std::time::Duration, rows: u64) {
+    if let Ok(mut m) = query_stats().lock() {
+        let e = m.entry(hash.to_string()).or_default();
+        e.hydrations += 1;
+        e.hydrate_ms += took.as_millis() as u64;
+        e.hydrate_rows += rows;
+    }
+}
+
+pub fn record_query_advance(hash: &str, ops: u64) {
+    if ops == 0 {
+        return;
+    }
+    if let Ok(mut m) = query_stats().lock() {
+        let e = m.entry(hash.to_string()).or_default();
+        e.advances += 1;
+        e.advance_ops += ops;
+    }
+}
+
+pub fn record_query_active(hash: &str, delta: i64) {
+    if let Ok(mut m) = query_stats().lock() {
+        let e = m.entry(hash.to_string()).or_default();
+        e.active += delta;
+    }
+}
+
+/// Render `/statz`: per-query stats as JSON, most expensive (cumulative
+/// hydrate ms, then advance ops) first, capped at 200 entries.
+pub fn render_statz() -> String {
+    let m = match query_stats().lock() {
+        Ok(m) => m,
+        Err(_) => return "{}".into(),
+    };
+    let mut entries: Vec<(&String, &QueryStat)> = m.iter().collect();
+    entries.sort_by(|a, b| {
+        (b.1.hydrate_ms, b.1.advance_ops).cmp(&(a.1.hydrate_ms, a.1.advance_ops))
+    });
+    entries.truncate(200);
+    let obj: serde_json::Map<String, serde_json::Value> = entries
+        .into_iter()
+        .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or(serde_json::Value::Null)))
+        .collect();
+    serde_json::to_string_pretty(&serde_json::Value::Object(obj)).unwrap_or_else(|_| "{}".into())
 }
