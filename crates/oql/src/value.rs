@@ -39,10 +39,14 @@ pub enum Value {
     Json(serde_json::Value),
 }
 
-/// Whether `i` survives an i64 → f64 → i64 round trip exactly.
+/// Whether `i` survives an i64 → f64 → i64 round trip exactly. The `f < 2^63`
+/// bound guards the saturation trap: `(i64::MAX as f64) as i64` saturates back
+/// to `i64::MAX` even though the f64 is 2^63 (≠ i64::MAX).
 #[inline]
 pub fn i64_fits_f64(i: i64) -> bool {
-    (i as f64) as i64 == i && (i as f64).is_finite()
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    let f = i as f64;
+    (-TWO_63..TWO_63).contains(&f) && (f as i64) == i
 }
 
 impl Value {
@@ -723,5 +727,78 @@ mod tests {
         let r2 = row(&[("a", 1.into()), ("b", 2.into())]);
         // a equal, b desc => r2 (b=2) sorts before r1 (b=1)
         assert_eq!(cmp.compare(&r1, &r2), Ordering::Greater);
+    }
+}
+
+#[cfg(test)]
+mod int_tests {
+    use super::*;
+
+    #[test]
+    fn int_constructor_normalizes() {
+        // Representable integers stay Number (JS-compatible fast path).
+        assert!(matches!(Value::int(42), Value::Number(n) if n == 42.0));
+        assert!(matches!(Value::int(1 << 53), Value::Number(_)));
+        // The unrepresentable tail keeps all 64 bits.
+        assert!(matches!(Value::int((1 << 53) + 1), Value::Int(9007199254740993)));
+        assert!(matches!(Value::int(i64::MAX), Value::Int(i64::MAX)));
+        assert!(matches!(Value::int(i64::MIN), Value::Number(_))); // -2^63 is exact in f64
+    }
+
+    #[test]
+    fn adjacent_big_ints_stay_distinct() {
+        // The exact failure Zero's f64 model has: two adjacent snowflake ids
+        // collapse into one row key.
+        let a = Value::int(9007199254740993);
+        let b = Value::int(9007199254740994);
+        assert!(!values_identical(&a, &b));
+        assert_eq!(compare_values(&a, &b), Ordering::Less);
+    }
+
+    #[test]
+    fn int_number_cross_comparison_is_exact() {
+        let big = Value::Int(9007199254740993); // 2^53 + 1
+        let f = Value::Number(9007199254740992.0); // 2^53
+        assert_eq!(compare_values(&big, &f), Ordering::Greater);
+        assert_eq!(compare_values(&f, &big), Ordering::Less);
+        // NaN-safe like the Number/Number path.
+        assert_eq!(compare_values(&big, &Value::Number(f64::NAN)), Ordering::Equal);
+        assert_eq!(compare_values(&big, &Value::Number(f64::INFINITY)), Ordering::Less);
+        assert_eq!(compare_values(&big, &Value::Number(f64::NEG_INFINITY)), Ordering::Greater);
+        // Fractional straddle: 2^53 + 1 vs a float just above it.
+        assert_eq!(
+            compare_values(&big, &Value::Number(9007199254740994.0)),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn int_serializes_exactly_and_round_trips() {
+        let v = Value::Int(9007199254740993);
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(json, "9007199254740993");
+        let back: Value = serde_json::from_str(&json).unwrap();
+        assert!(values_identical(&v, &back), "round trip through JSON must be exact");
+        // And a representable integer round-trips to Number.
+        let n: Value = serde_json::from_str("42").unwrap();
+        assert!(matches!(n, Value::Number(x) if x == 42.0));
+    }
+
+    #[test]
+    fn merge_missing_from_fills_only_absent_columns() {
+        let mut new_row: Row = [("id", Value::from("k")), ("n", 2.into())].into_iter().collect();
+        let old: Row = [
+            ("id", Value::from("k")),
+            ("n", 1.into()),
+            ("big", Value::from("payload")),
+            ("nullable", Value::Null),
+        ]
+        .into_iter()
+        .collect();
+        new_row.merge_missing_from(&old);
+        assert_eq!(new_row.get("n"), Some(&Value::Number(2.0)), "present columns unchanged");
+        assert_eq!(new_row.get("big"), Some(&Value::String("payload".into())), "absent filled");
+        assert_eq!(new_row.get("nullable"), Some(&Value::Null), "explicit old NULL carried");
+        assert_eq!(new_row.len(), 4);
     }
 }
