@@ -391,6 +391,7 @@ fn relation_event_reconciles_sqlite_table() {
             ("a".to_string(), ColumnType::String),
             ("c".to_string(), ColumnType::String),
         ],
+            renamed_from: None,
     }).unwrap();
 
     // A row using the new shape replicates cleanly.
@@ -429,6 +430,7 @@ fn relation_type_change_converts_stored_sqlite_values() {
         .apply(LogicalEvent::Relation {
             table: "rt".into(),
             columns: vec![("id".into(), ColumnType::String), ("n".into(), ColumnType::Number)],
+            renamed_from: None,
         })
         .unwrap();
     let rows = replica.source("rt").unwrap().borrow().all_rows();
@@ -439,6 +441,7 @@ fn relation_type_change_converts_stored_sqlite_values() {
         .apply(LogicalEvent::Relation {
             table: "rt".into(),
             columns: vec![("id".into(), ColumnType::String), ("n".into(), ColumnType::String)],
+            renamed_from: None,
         })
         .unwrap();
     let rows = replica.source("rt").unwrap().borrow().all_rows();
@@ -452,6 +455,7 @@ fn relation_type_change_converts_stored_sqlite_values() {
         .apply(LogicalEvent::Relation {
             table: "rt".into(),
             columns: vec![("id".into(), ColumnType::String), ("n".into(), ColumnType::Json)],
+            renamed_from: None,
         })
         .unwrap();
     let rows = replica.source("rt").unwrap().borrow().all_rows();

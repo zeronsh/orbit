@@ -40,7 +40,17 @@ pub enum LogicalEvent {
     /// every replica forever.)
     Truncate { tables: Vec<String> },
     /// A table's column set (Relation message) — surfaces DDL schema changes.
-    Relation { table: String, columns: Vec<(String, ColumnType)> },
+    /// `renamed_from` is set when the same relation OID previously carried a
+    /// different name (an upstream `ALTER TABLE … RENAME TO`): the replica
+    /// aliases the new upstream name onto the existing source so replication
+    /// keeps flowing to clients subscribed under the old name (previously the
+    /// renamed table's events were silently dropped — data loss).
+    Relation {
+        table: String,
+        columns: Vec<(String, ColumnType)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        renamed_from: Option<String>,
+    },
     /// Type / Origin / Message — ignored.
     Other,
 }
@@ -66,8 +76,9 @@ impl LogicalEvent {
             LogicalEvent::Truncate { tables } => {
                 base + tables.iter().map(String::len).sum::<usize>()
             }
-            LogicalEvent::Relation { table, columns } => {
+            LogicalEvent::Relation { table, columns, renamed_from } => {
                 base + table.len()
+                    + renamed_from.as_ref().map_or(0, String::len)
                     + columns
                         .iter()
                         .map(|(name, _)| name.len() + std::mem::size_of::<(String, ColumnType)>())
@@ -215,8 +226,14 @@ impl Decoder {
             .iter()
             .map(|col| (col.name.clone(), column_type_for_oid(col.type_oid)))
             .collect();
+        // The same relation OID under a NEW name = ALTER TABLE … RENAME TO.
+        let renamed_from = self
+            .relations
+            .get(&rel_id)
+            .filter(|prev| prev.name != name)
+            .map(|prev| prev.name.clone());
         self.relations.insert(rel_id, Relation { name: name.clone(), columns });
-        Ok(LogicalEvent::Relation { table: name, columns: typed })
+        Ok(LogicalEvent::Relation { table: name, columns: typed, renamed_from })
     }
 
     fn relation(&self, rel_id: u32) -> Result<&Relation> {

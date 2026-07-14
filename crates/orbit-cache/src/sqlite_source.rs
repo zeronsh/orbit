@@ -123,14 +123,39 @@ impl SqliteSource {
     /// dropping any lazily-created secondary indexes (SQLite refuses to drop an
     /// indexed column); primary-key columns are never dropped (warn instead).
     pub fn reconcile_columns(&mut self, new_columns: &[(String, ColumnType)]) {
-        let added: Vec<&(String, ColumnType)> =
+        let mut added: Vec<&(String, ColumnType)> =
             new_columns.iter().filter(|(n, _)| !self.columns.contains_key(n)).collect();
-        let removed: Vec<String> = self
+        let mut removed: Vec<String> = self
             .columns
             .keys()
             .filter(|c| !new_columns.iter().any(|(n, _)| n == *c))
             .cloned()
             .collect();
+        // RENAME pairing (see the in-memory reconcile): one out + one in of
+        // the same type → ALTER TABLE … RENAME COLUMN, values preserved.
+        if removed.len() == 1
+            && added.len() == 1
+            && self.columns.get(&removed[0]) == Some(&added[0].1)
+            && !self.primary_key.iter().any(|k| *k == removed[0])
+        {
+            let (from, to) = (removed[0].clone(), added[0].0.clone());
+            eprintln!("replica DDL: treating column {from} -> {to} as a RENAME (values preserved)");
+            for idx in self.created_indexes.borrow_mut().drain() {
+                let _ = self.db.execute_batch(&format!("DROP INDEX IF EXISTS {}", ident(&idx)));
+            }
+            let sql = format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                ident(&self.table),
+                ident(&from),
+                ident(&to)
+            );
+            if let Err(e) = self.db.execute_batch(&sql) {
+                eprintln!("replica DDL: rename column {from} -> {to} failed: {e}");
+            } else {
+                added.clear();
+                removed.clear();
+            }
+        }
         // Columns whose TYPE changed while keeping the name: Postgres rewrites
         // the table on `ALTER COLUMN … TYPE` but never re-sends the rows, so
         // the stored values must be converted in place (audit Tier 0.4 —
@@ -729,6 +754,9 @@ pub struct SqliteReplica {
     conn: Rc<Connection>,
     /// The database file path (`None` for in-memory replicas).
     path: Option<std::path::PathBuf>,
+    /// Upstream-name → source-key aliases created by upstream
+    /// `ALTER TABLE … RENAME TO` (see the in-memory replica's field).
+    aliases: RefCell<std::collections::HashMap<String, String>>,
 }
 
 /// Tuning knobs for a [`SqliteReplica`]'s connection. Defaults leave SQLite's
@@ -866,6 +894,7 @@ impl SqliteReplica {
             columns: std::collections::HashMap::new(),
             conn: Rc::new(conn),
             path,
+            aliases: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -909,6 +938,15 @@ impl SqliteReplica {
     pub fn source(&self, name: &str) -> Option<Rc<RefCell<SqliteSource>>> {
         self.sources.get(name).cloned()
     }
+
+    /// Resolve an upstream table name to its source key (following a RENAME
+    /// alias when the name isn't a source itself).
+    fn resolve_key(&self, table: &str) -> String {
+        if self.sources.contains_key(table) {
+            return table.to_string();
+        }
+        self.aliases.borrow().get(table).cloned().unwrap_or_else(|| table.to_string())
+    }
 }
 
 impl SourceProvider for SqliteReplica {
@@ -925,7 +963,7 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
         use crate::LogicalEvent as E;
         match event {
             E::Insert { table, row } => {
-                if let Some(src) = self.sources.get(&table) {
+                if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                     let existing = src.borrow().lookup(&row);
                     match existing {
                         None => source_push(src, SourceChange::Add(row))?,
@@ -934,7 +972,7 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
                 }
             }
             E::Delete { table, old_row } => {
-                if let Some(src) = self.sources.get(&table) {
+                if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                     let stored = src.borrow().lookup(&old_row);
                     if let Some(stored) = stored {
                         source_push(src, SourceChange::Remove(stored))?;
@@ -942,7 +980,7 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
                 }
             }
             E::Update { table, mut row, old_row } => {
-                if let Some(src) = self.sources.get(&table) {
+                if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                     let key = old_row.as_ref().unwrap_or(&row);
                     let existing = src.borrow().lookup(key);
                     match existing {
@@ -960,7 +998,7 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
             }
             E::Truncate { tables } => {
                 for table in tables {
-                    if let Some(src) = self.sources.get(&table) {
+                    if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                         // Remove every row THROUGH the pipelines so subscribed
                         // queries and client caches converge (not just storage).
                         let rows = src.borrow().all_rows();
@@ -970,13 +1008,22 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
                     }
                 }
             }
-            E::Relation { table, columns } => {
+            E::Relation { table, columns, renamed_from } => {
+                if let Some(from) = renamed_from {
+                    let key = self.resolve_key(&from);
+                    if !self.sources.contains_key(&table) && self.sources.contains_key(&key) {
+                        eprintln!(
+                            "upstream renamed table {from} -> {table}; aliasing so clients subscribed to {key} keep receiving changes"
+                        );
+                        self.aliases.borrow_mut().insert(table.clone(), key);
+                    }
+                }
                 // Mirror the in-memory replica: reconcile the physical table to
                 // the upstream column set (DDL). `self.columns` stays at the
                 // boot-time declaration — exact parity with the in-memory
                 // backend, whose `Replica.columns` also goes stale; it is only
                 // used for the initial-sync SELECT.
-                if let Some(src) = self.sources.get(&table) {
+                if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                     src.borrow_mut().reconcile_columns(&columns);
                 }
             }

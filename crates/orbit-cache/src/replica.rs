@@ -113,6 +113,10 @@ pub struct ReplicaSample {
 pub struct Replica {
     sources: HashMap<String, Rc<RefCell<MemorySource>>>,
     columns: HashMap<String, Vec<(String, ColumnType)>>,
+    /// Upstream-name → source-key aliases created by upstream
+    /// `ALTER TABLE … RENAME TO`: replication keeps flowing to the source
+    /// clients subscribed under the ORIGINAL name.
+    aliases: RefCell<HashMap<String, String>>,
 }
 
 impl Replica {
@@ -138,6 +142,15 @@ impl Replica {
         self.sources.get(name).map(Rc::clone)
     }
 
+    /// Resolve an upstream table name to its source key (following a RENAME
+    /// alias when the name isn't a source itself).
+    fn resolve_key(&self, table: &str) -> String {
+        if self.sources.contains_key(table) {
+            return table.to_string();
+        }
+        self.aliases.borrow().get(table).cloned().unwrap_or_else(|| table.to_string())
+    }
+
     /// Apply a decoded replication event to the corresponding source, pushing it
     /// through the IVM pipelines. Events for unregistered tables are ignored.
     ///
@@ -154,7 +167,7 @@ impl Replica {
     fn apply_event(&self, event: LogicalEvent) {
         match event {
             LogicalEvent::Insert { table, row } => {
-                if let Some(src) = self.sources.get(&table) {
+                if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                     let existing = src.borrow().lookup(&row);
                     match existing {
                         None => source_push(src, SourceChange::Add(row)),
@@ -163,7 +176,7 @@ impl Replica {
                 }
             }
             LogicalEvent::Delete { table, old_row } => {
-                if let Some(src) = self.sources.get(&table) {
+                if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                     // Bind in its own statement so the `borrow()` is released
                     // before `source_push` re-borrows.
                     let stored = src.borrow().lookup(&old_row);
@@ -173,7 +186,7 @@ impl Replica {
                 }
             }
             LogicalEvent::Update { table, mut row, old_row } => {
-                if let Some(src) = self.sources.get(&table) {
+                if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                     // Use the actually-stored row as the edit's old row (handles
                     // missing REPLICA IDENTITY and snapshot overlap).
                     let key = old_row.as_ref().unwrap_or(&row);
@@ -194,7 +207,7 @@ impl Replica {
             }
             LogicalEvent::Truncate { tables } => {
                 for table in tables {
-                    if let Some(src) = self.sources.get(&table) {
+                    if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                         // Remove every row THROUGH the pipelines so subscribed
                         // queries and client caches converge (not just storage).
                         let rows = src.borrow().all_rows();
@@ -204,8 +217,17 @@ impl Replica {
                     }
                 }
             }
-            LogicalEvent::Relation { table, columns } => {
-                if let Some(src) = self.sources.get(&table) {
+            LogicalEvent::Relation { table, columns, renamed_from } => {
+                if let Some(from) = renamed_from {
+                    let key = self.resolve_key(&from);
+                    if !self.sources.contains_key(&table) && self.sources.contains_key(&key) {
+                        eprintln!(
+                            "upstream renamed table {from} -> {table}; aliasing so clients subscribed to {key} keep receiving changes"
+                        );
+                        self.aliases.borrow_mut().insert(table.clone(), key);
+                    }
+                }
+                if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                     src.borrow_mut().reconcile_columns(&columns);
                 }
             }

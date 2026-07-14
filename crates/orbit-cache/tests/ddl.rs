@@ -260,3 +260,156 @@ async fn alter_column_type_mid_stream_converts_stored_values() {
         .await
         .ok();
 }
+
+/// `ALTER TABLE … RENAME TO` mid-stream: the relation OID keeps flowing under
+/// a new name — the replica aliases it so clients subscribed under the
+/// ORIGINAL name keep receiving changes (previously: silent data loss).
+#[tokio::test]
+async fn rename_table_mid_stream_keeps_replicating() {
+    let host = std::env::var("ORBIT_PG_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let port: u16 = std::env::var("ORBIT_PG_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5433);
+    let conn_str = format!("host={host} port={port} user=orbit dbname=orbit");
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .batch_execute(
+            "DROP TABLE IF EXISTS widget; DROP TABLE IF EXISTS widget_renamed;
+             CREATE TABLE widget (id text PRIMARY KEY, a text);
+             ALTER TABLE widget REPLICA IDENTITY FULL;",
+        )
+        .await
+        .unwrap();
+    client
+        .batch_execute("SELECT pg_drop_replication_slot('orbit_slot_ren') FROM pg_replication_slots WHERE slot_name='orbit_slot_ren'")
+        .await
+        .ok();
+    create_publication(&client, "orbit_pub_ren", &["widget"]).await.unwrap();
+    let start_lsn = create_slot(&client, "orbit_slot_ren").await.unwrap();
+    let mut stream = orbit_cache::ReplicationStream::start(
+        &host, port, "orbit", "orbit", "orbit_slot_ren", "orbit_pub_ren", start_lsn,
+    )
+    .await
+    .unwrap();
+
+    let mut replica = Replica::new();
+    let mut cols = BTreeMap::new();
+    cols.insert("id".to_string(), ColumnType::String);
+    cols.insert("a".to_string(), ColumnType::String);
+    let _ = replica.add_table("widget", cols, vec!["id".into()]);
+
+    client
+        .batch_execute(
+            "INSERT INTO widget VALUES ('w1', 'before');
+             ALTER TABLE widget RENAME TO widget_renamed;
+             INSERT INTO widget_renamed VALUES ('w2', 'after');",
+        )
+        .await
+        .unwrap();
+
+    let mut inserts = 0;
+    while inserts < 2 {
+        let (_lsn, ev) = tokio::time::timeout(Duration::from_secs(10), stream.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(ev, LogicalEvent::Insert { .. }) {
+            inserts += 1;
+        }
+        replica.apply(ev);
+    }
+
+    // Both rows landed in the source clients know as "widget".
+    let rows = replica.source("widget").unwrap().borrow().all_rows();
+    let ids: Vec<String> = rows
+        .iter()
+        .map(|r| match r.get("id") {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("bad id {other:?}"),
+        })
+        .collect();
+    assert_eq!(ids, vec!["w1", "w2"], "post-rename inserts must keep flowing to the aliased source");
+
+    client
+        .batch_execute("SELECT pg_drop_replication_slot('orbit_slot_ren') FROM pg_replication_slots WHERE slot_name='orbit_slot_ren'")
+        .await
+        .ok();
+    client.batch_execute("DROP TABLE IF EXISTS widget_renamed").await.ok();
+}
+
+/// `ALTER TABLE … RENAME COLUMN` mid-stream: values survive under the new
+/// column name (previously reconciled as drop+add → values lost).
+#[tokio::test]
+async fn rename_column_mid_stream_preserves_values() {
+    let host = std::env::var("ORBIT_PG_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let port: u16 = std::env::var("ORBIT_PG_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5433);
+    let conn_str = format!("host={host} port={port} user=orbit dbname=orbit");
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .batch_execute(
+            "DROP TABLE IF EXISTS relabel;
+             CREATE TABLE relabel (id text PRIMARY KEY, old_name text);
+             ALTER TABLE relabel REPLICA IDENTITY FULL;",
+        )
+        .await
+        .unwrap();
+    client
+        .batch_execute("SELECT pg_drop_replication_slot('orbit_slot_relabel') FROM pg_replication_slots WHERE slot_name='orbit_slot_relabel'")
+        .await
+        .ok();
+    create_publication(&client, "orbit_pub_relabel", &["relabel"]).await.unwrap();
+    let start_lsn = create_slot(&client, "orbit_slot_relabel").await.unwrap();
+    let mut stream = orbit_cache::ReplicationStream::start(
+        &host, port, "orbit", "orbit", "orbit_slot_relabel", "orbit_pub_relabel", start_lsn,
+    )
+    .await
+    .unwrap();
+
+    let mut replica = Replica::new();
+    let mut cols = BTreeMap::new();
+    cols.insert("id".to_string(), ColumnType::String);
+    cols.insert("old_name".to_string(), ColumnType::String);
+    let _ = replica.add_table("relabel", cols, vec!["id".into()]);
+
+    client
+        .batch_execute(
+            "INSERT INTO relabel VALUES ('r1', 'precious');
+             ALTER TABLE relabel RENAME COLUMN old_name TO new_name;
+             INSERT INTO relabel (id, new_name) VALUES ('r2', 'fresh');",
+        )
+        .await
+        .unwrap();
+
+    let mut inserts = 0;
+    while inserts < 2 {
+        let (_lsn, ev) = tokio::time::timeout(Duration::from_secs(10), stream.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(ev, LogicalEvent::Insert { .. }) {
+            inserts += 1;
+        }
+        replica.apply(ev);
+    }
+
+    let rows = replica.source("relabel").unwrap().borrow().all_rows();
+    assert_eq!(rows.len(), 2);
+    let r1 = rows.iter().find(|r| r.get("id") == Some(&Value::String("r1".into()))).unwrap();
+    assert_eq!(
+        r1.get("new_name"),
+        Some(&Value::String("precious".into())),
+        "pre-rename value must survive under the new column name"
+    );
+    assert!(r1.get("old_name").is_none());
+
+    client
+        .batch_execute("SELECT pg_drop_replication_slot('orbit_slot_relabel') FROM pg_replication_slots WHERE slot_name='orbit_slot_relabel'")
+        .await
+        .ok();
+}
