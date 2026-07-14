@@ -35,6 +35,23 @@ pub trait SourceProvider {
         self.get_source(table).map(|s| s.borrow().primary_key().to_vec())
     }
 
+    /// Like [`connect`](Self::connect), with the query's WHERE condition
+    /// offered for pushdown: a SQL-backed provider may pre-filter its FETCHES
+    /// with (a superset-safe subset of) the condition, so hydrations scan
+    /// matching rows inside the database instead of materializing the whole
+    /// table into RAM (audit Tier 2: "WHERE not pushed into SQLite"). The
+    /// in-pipeline Filter always re-applies the full predicate, so a provider
+    /// is free to push any weaker approximation — or ignore this entirely
+    /// (the default).
+    fn connect_filtered(
+        &self,
+        table: &str,
+        sort: crate::ast::Ordering,
+        _cond: Option<&Condition>,
+    ) -> Option<OpHandle> {
+        self.connect(table, sort)
+    }
+
     /// Connect a fresh consumer to `table` ordered by `sort`, returning its
     /// operator handle.
     fn connect(&self, table: &str, sort: crate::ast::Ordering) -> Option<OpHandle> {
@@ -63,7 +80,7 @@ fn build_pipeline_partitioned(
     let order = complete_ordering(ast.order_by.as_ref(), &pk);
 
     let mut current = provider
-        .connect(&ast.table, order)
+        .connect_filtered(&ast.table, order, ast.where_.as_ref())
         .unwrap_or_else(|| panic!("no source registered for table {:?}", ast.table));
 
     // `start` cursor: keep only rows at/after the bound in the query's sort
@@ -265,12 +282,17 @@ pub fn eval_condition(cond: &Condition, row: &Row) -> bool {
 fn eval_simple(op: SimpleOperator, left: &ValuePosition, right: &ValuePosition, row: &Row) -> bool {
     let lhs = value_at(left, row);
 
-    // IS / IS NOT operate even on null and use strict identity.
+    // IS / IS NOT operate even on null and use strict identity. An ABSENT
+    // column reads as null (Zero's data model normalizes undefined → null,
+    // and the SQLite backend materializes every declared column as NULL) —
+    // without this, `IS NULL` missed rows predating a DDL column-add on the
+    // in-memory backend while matching them on SQLite.
     if matches!(op, SimpleOperator::Is | SimpleOperator::IsNot) {
+        let lhs = lhs.unwrap_or(Value::Null);
         let rhs = scalar_literal(right);
-        let identical = match (&lhs, &rhs) {
-            (Some(l), Some(r)) => values_identical(l, r),
-            _ => false,
+        let identical = match &rhs {
+            Some(r) => values_identical(&lhs, r),
+            None => false,
         };
         return match op {
             SimpleOperator::Is => identical,

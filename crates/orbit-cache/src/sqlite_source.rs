@@ -22,6 +22,10 @@ use std::rc::Rc;
 
 struct Conn {
     sort: AstOrdering,
+    /// Superset-safe pushable subset of the query's WHERE condition — applied
+    /// to FETCH SQL only (pushes still flow unfiltered; the pipeline's Filter
+    /// re-applies the full predicate). See `pushable_subset`.
+    filter: Option<oql::ast::Condition>,
     /// Weak (see the memory source): dead downstream pipelines are pruned by
     /// the push loop instead of receiving every future change forever.
     output: Option<oql::ivm::operator::WeakLink>,
@@ -472,6 +476,14 @@ impl SqliteSource {
             let conv = |col: &str, v: Value| self.param(col, v);
             wheres.push(start_bound_sql(&eff, &start.row, start.basis, &mut params, &conv));
         }
+        // WHERE pushdown: filter inside SQLite instead of materializing the
+        // whole table into RAM and filtering above (audit Tier 2). Superset-
+        // safe by construction, and the pipeline Filter re-checks every row.
+        if let Some(cond) = &conn.filter {
+            if let Some(sql) = pushed_where_sql(cond, &mut params, &|col, v| self.param(col, v)) {
+                wheres.push(sql);
+            }
+        }
         let order = eff
             .iter()
             .map(|(c, d)| format!("{} {}", ident(c), if matches!(d, Direction::Asc) { "ASC" } else { "DESC" }))
@@ -602,12 +614,23 @@ impl SqliteSource {
 /// Connect a new consumer; returns a handle usable as both [`Input`] and
 /// [`Operator`].
 pub fn connect(src: &Rc<RefCell<SqliteSource>>, sort: AstOrdering) -> Rc<RefCell<SqliteConnection>> {
+    connect_filtered(src, sort, None)
+}
+
+/// [`connect`] with a WHERE condition offered for fetch pushdown.
+pub fn connect_filtered(
+    src: &Rc<RefCell<SqliteSource>>,
+    sort: AstOrdering,
+    cond: Option<&oql::ast::Condition>,
+) -> Rc<RefCell<SqliteConnection>> {
     let conn_idx;
     {
         let mut s = src.borrow_mut();
         let schema = s.build_schema(&sort);
+        let filter = cond.and_then(|c| pushable_subset(c, &s.columns));
         let connection = Conn {
             sort,
+            filter,
             output: None,
             active_pos: s.active_connections.len(),
             last_pushed_epoch: 0,
@@ -746,6 +769,14 @@ impl SourceProvider for SqliteProvider {
     }
     fn connect(&self, table: &str, sort: AstOrdering) -> Option<OpHandle> {
         self.sources.get(table).map(|s| OpHandle::new(connect(s, sort)))
+    }
+    fn connect_filtered(
+        &self,
+        table: &str,
+        sort: AstOrdering,
+        cond: Option<&oql::ast::Condition>,
+    ) -> Option<OpHandle> {
+        self.sources.get(table).map(|s| OpHandle::new(connect_filtered(s, sort, cond)))
     }
 }
 
@@ -962,6 +993,14 @@ impl SourceProvider for SqliteReplica {
     fn connect(&self, table: &str, sort: AstOrdering) -> Option<OpHandle> {
         self.sources.get(table).map(|s| OpHandle::new(connect(s, sort)))
     }
+    fn connect_filtered(
+        &self,
+        table: &str,
+        sort: AstOrdering,
+        cond: Option<&oql::ast::Condition>,
+    ) -> Option<OpHandle> {
+        self.sources.get(table).map(|s| OpHandle::new(connect_filtered(s, sort, cond)))
+    }
 }
 
 impl crate::replica::ReplicaBackend for SqliteReplica {
@@ -1159,6 +1198,171 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
         let _ = self.conn.execute_batch("DELETE FROM orbit_replication_state");
         let _ = self.conn.execute_batch("DELETE FROM orbit_synced_tables");
         let _ = self.conn.execute_batch("COMMIT");
+    }
+}
+
+/// Reduce a WHERE condition to the subset that can be pushed into SQLite
+/// SQL **without ever excluding a row the OQL predicate would admit** (the
+/// superset rule — the pipeline Filter re-applies the full predicate, so SQL
+/// may only ever admit MORE):
+/// * simple `col <op> literal` for `=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`,
+///   `NOT IN`, and `IS` — on columns whose declared type is not `Json`
+///   (JSON's TEXT encoding differs from literal bindings) and with non-null
+///   literals (OQL: any non-`IS` op vs NULL is constant false; SQL agrees,
+///   but we simply skip). `IS NOT` is skipped: OQL admits absent-column rows
+///   that SQL's `IS NOT NULL` would exclude.
+/// * `LIKE`/`ILIKE` are skipped (SQLite LIKE is ASCII-case-insensitive).
+/// * `AND`: any pushable subset of its children (dropping a child widens).
+/// * `OR`: only when EVERY child is fully pushable (dropping one would
+///   narrow the union — an exclusion violation).
+/// * `EXISTS` subqueries: never pushed.
+fn pushable_subset(
+    cond: &oql::ast::Condition,
+    columns: &BTreeMap<String, ColumnType>,
+) -> Option<oql::ast::Condition> {
+    use oql::ast::{Condition as C, LiteralValue, SimpleOperator as Op, ValuePosition as VP};
+    match cond {
+        C::Simple { op, left, right } => {
+            let VP::Column { name } = left else { return None };
+            match columns.get(name) {
+                None | Some(ColumnType::Json) => return None,
+                _ => {}
+            }
+            let VP::Literal { value } = right else { return None };
+            match op {
+                Op::Like | Op::NotLike | Op::ILike | Op::NotILike | Op::IsNot => None,
+                Op::Is => match value {
+                    // `IS NULL` is safe: SQL admits absent-column rows OQL
+                    // rejects (superset), never the reverse.
+                    _ => Some(cond.clone()),
+                },
+                _ => match value {
+                    LiteralValue::Null => None, // OQL: constant false; skip
+                    LiteralValue::Array(_) if matches!(op, Op::In | Op::NotIn) => {
+                        Some(cond.clone())
+                    }
+                    LiteralValue::Array(_) => None,
+                    _ => Some(cond.clone()),
+                },
+            }
+        }
+        C::And { conditions } => {
+            let kept: Vec<oql::ast::Condition> =
+                conditions.iter().filter_map(|c| pushable_subset(c, columns)).collect();
+            if kept.is_empty() {
+                None
+            } else {
+                Some(C::And { conditions: kept })
+            }
+        }
+        C::Or { conditions } => {
+            let kept: Vec<oql::ast::Condition> =
+                conditions.iter().filter_map(|c| pushable_subset(c, columns)).collect();
+            if kept.len() == conditions.len() {
+                Some(C::Or { conditions: kept })
+            } else {
+                None
+            }
+        }
+        C::CorrelatedSubquery { .. } => None,
+    }
+}
+
+fn literal_to_value(v: &oql::ast::LiteralValue) -> Value {
+    use oql::ast::LiteralValue as LV;
+    match v {
+        LV::Null => Value::Null,
+        LV::Bool(b) => Value::Bool(*b),
+        LV::Number(n) => Value::Number(*n),
+        LV::String(s) => Value::String(s.clone()),
+        LV::Array(_) => Value::Null, // handled by the IN path
+    }
+}
+
+fn literal_prim_to_value(v: &oql::ast::LiteralPrimitive) -> Value {
+    use oql::ast::LiteralPrimitive as LP;
+    match v {
+        LP::Bool(b) => Value::Bool(*b),
+        LP::Number(n) => Value::Number(*n),
+        LP::String(s) => Value::String(s.clone()),
+    }
+}
+
+/// Render a pushable condition (from [`pushable_subset`]) as SQL, appending
+/// its bindings to `params`.
+fn pushed_where_sql(
+    cond: &oql::ast::Condition,
+    params: &mut Vec<SqlVal>,
+    conv: &dyn Fn(&str, Value) -> SqlVal,
+) -> Option<String> {
+    use oql::ast::{Condition as C, LiteralValue, SimpleOperator as Op, ValuePosition as VP};
+    match cond {
+        C::Simple { op, left, right } => {
+            let VP::Column { name } = left else { return None };
+            let VP::Literal { value } = right else { return None };
+            let col = ident(name);
+            match op {
+                Op::In | Op::NotIn => {
+                    let LiteralValue::Array(items) = value else { return None };
+                    if items.is_empty() {
+                        // IN () is invalid SQL; OQL: IN [] = false, NOT IN [] =
+                        // true for non-null lhs. Render equivalents.
+                        return Some(if matches!(op, Op::In) {
+                            "0".to_string()
+                        } else {
+                            format!("{col} IS NOT NULL")
+                        });
+                    }
+                    let mut holes = Vec::with_capacity(items.len());
+                    for item in items {
+                        params.push(conv(name, literal_prim_to_value(item)));
+                        holes.push(format!("?{}", params.len()));
+                    }
+                    let not = if matches!(op, Op::NotIn) { " NOT" } else { "" };
+                    Some(format!("{col}{not} IN ({})", holes.join(", ")))
+                }
+                Op::Is => {
+                    if matches!(value, LiteralValue::Null) {
+                        Some(format!("{col} IS NULL"))
+                    } else {
+                        params.push(conv(name, literal_to_value(value)));
+                        Some(format!("{col} IS ?{}", params.len()))
+                    }
+                }
+                Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+                    let sql_op = match op {
+                        Op::Eq => "=",
+                        Op::Ne => "<>",
+                        Op::Lt => "<",
+                        Op::Le => "<=",
+                        Op::Gt => ">",
+                        Op::Ge => ">=",
+                        _ => unreachable!(),
+                    };
+                    params.push(conv(name, literal_to_value(value)));
+                    Some(format!("{col} {sql_op} ?{}", params.len()))
+                }
+                _ => None,
+            }
+        }
+        C::And { conditions } => {
+            let parts: Vec<String> =
+                conditions.iter().filter_map(|c| pushed_where_sql(c, params, conv)).collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(format!("({})", parts.join(" AND ")))
+            }
+        }
+        C::Or { conditions } => {
+            let mut parts = Vec::with_capacity(conditions.len());
+            for c in conditions {
+                // All-or-nothing (guaranteed by pushable_subset).
+                parts.push(pushed_where_sql(c, params, conv)?);
+            }
+            Some(format!("({})", parts.join(" OR ")))
+        }
+        C::CorrelatedSubquery { .. } => None,
     }
 }
 

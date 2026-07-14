@@ -462,3 +462,116 @@ fn relation_type_change_converts_stored_sqlite_values() {
     let j = rows.iter().find(|r| r.get("id") == Some(&Value::String("j".into()))).unwrap();
     assert_eq!(j.get("n"), Some(&Value::Json(serde_json::json!({"a": 1}))));
 }
+
+/// WHERE pushdown equivalence: for a battery of conditions — including the
+/// semantic corners (NULLs, absent columns, IN/NOT IN, OR, IS) — the
+/// SQLite-backed pipeline (with pushdown) must return EXACTLY what the
+/// in-memory pipeline (no pushdown) returns. The pushed SQL may only ever be
+/// a superset; the pipeline Filter does the rest.
+#[test]
+fn where_pushdown_matches_memory_source() {
+    use oql::ast::{Condition, LiteralPrimitive, LiteralValue, ValuePosition};
+
+    let columns = vec![
+        ("id".to_string(), ColumnType::String),
+        ("n".to_string(), ColumnType::Number),
+        ("s".to_string(), ColumnType::String),
+        ("f".to_string(), ColumnType::Boolean),
+    ];
+    // Tricky rows: nulls, absent columns (row predating a DDL add), negatives.
+    let rows: Vec<oql::value::Row> = vec![
+        row(&[("id", "a".into()), ("n", 1.into()), ("s", "x".into()), ("f", true.into())]),
+        row(&[("id", "b".into()), ("n", 2.into()), ("s", Value::Null), ("f", false.into())]),
+        row(&[("id", "c".into()), ("n", Value::Null), ("s", "y".into()), ("f", true.into())]),
+        row(&[("id", "d".into()), ("n", (-3).into()), ("s", "".into()), ("f", false.into())]),
+        row(&[("id", "e".into())]), // absent n, s, f entirely
+        row(&[("id", "f".into()), ("n", 2.5.into()), ("s", "x".into()), ("f", true.into())]),
+    ];
+
+    let col = |name: &str| ValuePosition::Column { name: name.into() };
+    let lit = |v: LiteralValue| ValuePosition::Literal { value: v };
+    let simple = |op, l: ValuePosition, r: ValuePosition| Condition::Simple { op, left: l, right: r };
+
+    let conditions: Vec<Condition> = vec![
+        simple(SimpleOperator::Eq, col("s"), lit(LiteralValue::String("x".into()))),
+        simple(SimpleOperator::Ne, col("s"), lit(LiteralValue::String("x".into()))),
+        simple(SimpleOperator::Gt, col("n"), lit(LiteralValue::Number(1.5))),
+        simple(SimpleOperator::Le, col("n"), lit(LiteralValue::Number(2.0))),
+        simple(SimpleOperator::Eq, col("f"), lit(LiteralValue::Bool(true))),
+        simple(SimpleOperator::Is, col("s"), lit(LiteralValue::Null)),
+        simple(SimpleOperator::Eq, col("n"), lit(LiteralValue::Null)), // constant false
+        simple(
+            SimpleOperator::In,
+            col("s"),
+            lit(LiteralValue::Array(vec![
+                LiteralPrimitive::String("x".into()),
+                LiteralPrimitive::String("y".into()),
+            ])),
+        ),
+        simple(
+            SimpleOperator::NotIn,
+            col("s"),
+            lit(LiteralValue::Array(vec![LiteralPrimitive::String("x".into())])),
+        ),
+        simple(SimpleOperator::In, col("n"), lit(LiteralValue::Array(vec![]))),
+        Condition::And {
+            conditions: vec![
+                simple(SimpleOperator::Gt, col("n"), lit(LiteralValue::Number(0.0))),
+                simple(SimpleOperator::Eq, col("f"), lit(LiteralValue::Bool(true))),
+            ],
+        },
+        Condition::Or {
+            conditions: vec![
+                simple(SimpleOperator::Eq, col("s"), lit(LiteralValue::String("y".into()))),
+                simple(SimpleOperator::Lt, col("n"), lit(LiteralValue::Number(0.0))),
+            ],
+        },
+    ];
+
+    for cond in conditions {
+        // Memory pipeline (reference).
+        let mem = oql::ivm::MemorySource::new(
+            "t",
+            columns.iter().cloned().collect::<BTreeMap<_, _>>(),
+            vec!["id".into()],
+        );
+        for r in &rows {
+            mem.borrow_mut().insert_initial(r.clone());
+        }
+        struct MemP(std::rc::Rc<std::cell::RefCell<oql::ivm::MemorySource>>);
+        impl oql::SourceProvider for MemP {
+            fn get_source(&self, _t: &str) -> Option<std::rc::Rc<std::cell::RefCell<oql::ivm::MemorySource>>> {
+                Some(self.0.clone())
+            }
+        }
+        // SQLite pipeline (pushdown active).
+        let sq = SqliteSource::new("t", columns.iter().cloned().collect(), vec!["id".into()]);
+        for r in &rows {
+            sq.borrow().insert_initial(r).expect("insert");
+        }
+        let mut sqp = SqliteProvider::new();
+        sqp.add(sq.clone());
+
+        let mut ast = Query::table("t").order_by("id", Direction::Asc).build();
+        ast.where_ = Some(cond.clone());
+
+        let fetch_ids = |provider: &dyn oql::SourceProvider| -> Vec<String> {
+            let top = build_pipeline(&ast, provider);
+            let catch = Catch::new(top.input.clone());
+            let link: Link = catch.clone();
+            top.set_output(link);
+            let nodes = catch.borrow().fetch();
+            nodes
+                .iter()
+                .map(|n| match n.row.get("id") {
+                    Some(Value::String(s)) => s.clone(),
+                    other => panic!("bad id {other:?}"),
+                })
+                .collect()
+        };
+
+        let want = fetch_ids(&MemP(mem));
+        let got = fetch_ids(&sqp);
+        assert_eq!(got, want, "pushdown diverged for condition {cond:?}");
+    }
+}
