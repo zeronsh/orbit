@@ -388,7 +388,7 @@ thread_local! {
     /// bounds peak memory to `ORBIT_MAX_CONCURRENT_HYDRATIONS` × result
     /// (default 1). Queued clients hydrate as soon as a permit frees — they
     /// wait, they don't fail.
-    static HYDRATION_GATE: Rc<tokio::sync::Semaphore> = Rc::new(tokio::sync::Semaphore::new(
+    static HYDRATION_GATE: std::sync::Arc<tokio::sync::Semaphore> = std::sync::Arc::new(tokio::sync::Semaphore::new(
         std::env::var("ORBIT_MAX_CONCURRENT_HYDRATIONS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
@@ -397,8 +397,54 @@ thread_local! {
     ));
 }
 
-fn hydration_gate() -> Rc<tokio::sync::Semaphore> {
-    HYDRATION_GATE.with(Rc::clone)
+fn hydration_gate() -> std::sync::Arc<tokio::sync::Semaphore> {
+    HYDRATION_GATE.with(std::sync::Arc::clone)
+}
+
+thread_local! {
+    /// Node-wide hydration RESULT-MEMORY budget, in 4 KiB permits
+    /// (`ORBIT_HYDRATION_BUDGET_BYTES`, default 64 MiB). The admission gate
+    /// bounds how many results MATERIALIZE at once; this bounds how many stay
+    /// RESIDENT through their (possibly slow-socket) pokes. Without it,
+    /// releasing the admission permit before the poke un-bounded peak memory
+    /// to (connected clients) × result — the 512 MB acceptance harness OOMs.
+    /// A result larger than the whole budget clamps to it (serializing giant
+    /// hydrations, the pre-release behavior).
+    static HYDRATION_BYTES: std::sync::Arc<tokio::sync::Semaphore> = {
+        let bytes: usize = std::env::var("ORBIT_HYDRATION_BUDGET_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(64 << 20)
+            .max(1 << 20);
+        std::sync::Arc::new(tokio::sync::Semaphore::new(bytes / 4096))
+    };
+}
+
+/// Try to reserve `bytes` of the hydration result budget WITHOUT waiting.
+/// `None` means the result may not overlap other pokes — the caller keeps the
+/// admission permit through its poke instead (bounding residency to one
+/// result, exactly the pre-overlap behavior). Waiting here would be wrong:
+/// the caller has ALREADY materialized its result, so blocking would leave it
+/// resident on top of whoever holds the budget.
+fn try_reserve_hydration_bytes(bytes: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let sem = HYDRATION_BYTES.with(std::sync::Arc::clone);
+    let want = ((bytes / 4096).max(1) as u32).min(hydration_budget_permits());
+    if want >= hydration_budget_permits() {
+        return None; // oversized result: never overlaps
+    }
+    sem.try_acquire_many_owned(want).ok()
+}
+
+fn hydration_budget_permits() -> u32 {
+    static PERMITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PERMITS.get_or_init(|| {
+        let bytes: usize = std::env::var("ORBIT_HYDRATION_BUDGET_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(64 << 20)
+            .max(1 << 20);
+        (bytes / 4096) as u32
+    })
 }
 
 thread_local! {
@@ -1069,7 +1115,8 @@ where
                 // poke drains an already-materialized patch under its own TCP
                 // backpressure and needs no admission slot.
                 let gate = hydration_gate();
-                let hydrating = gate.acquire().await.expect("hydration gate closed");
+                let mut hydrating =
+                    Some(gate.acquire_owned().await.expect("hydration gate closed"));
                 // Consistency: wait out any in-progress streamed transaction
                 // (held only while a pump streams an oversized txn — free
                 // otherwise). Released with `hydrating` before the poke.
@@ -1109,8 +1156,22 @@ where
                 // tree here frees only its scaffolding — but do it before the
                 // (chunked, potentially slow-socket) poke holds it alive.
                 drop(nodes);
+                // Overlap policy: a result that fits the free hydration byte
+                // budget reserves it and RELEASES the admission permit before
+                // the poke (a stalled socket then can't head-of-line block the
+                // queue). Otherwise — oversized result or budget exhausted —
+                // the admission permit is HELD through the poke, so at most
+                // one such result is resident (the 512 MB acceptance harness
+                // OOMs under any policy that lets full-history results stack).
+                let result_bytes: usize = rows.iter().map(estimate_op_bytes).sum();
+                let _resident = match try_reserve_hydration_bytes(result_bytes) {
+                    Some(permit) => {
+                        hydrating.take();
+                        Some(permit)
+                    }
+                    None => None, // keep `hydrating` until the poke completes
+                };
                 drop(consistent);
-                drop(hydrating);
                 let hydrate_took = started.elapsed();
                 if hydrate_took > slow_hydration_budget() {
                     eprintln!(
