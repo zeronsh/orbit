@@ -152,6 +152,12 @@ impl SqliteSource {
             if let Err(e) = self.db.execute_batch(&sql) {
                 eprintln!("replica DDL: rename column {from} -> {to} failed: {e}");
             } else {
+                // Keep the logical column map in step with the physical rename
+                // NOW — the shared early-return below fires when the rename was
+                // the only change.
+                if let Some(ty) = self.columns.remove(&from) {
+                    self.columns.insert(to.clone(), ty);
+                }
                 added.clear();
                 removed.clear();
             }
