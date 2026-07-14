@@ -89,7 +89,16 @@ struct ActiveQuery {
     hash: String,
     catch: Rc<RefCell<Catch>>,
     schema: Rc<oql::ivm::Schema>,
+    /// Tables this query reads (incl. subqueries) — a tick that touched none
+    /// of them cannot change the result, so the drain is skipped.
+    tables: std::collections::HashSet<String>,
 }
+
+/// A replication tick: the tables the committed transaction touched. An empty
+/// list means "unknown" — every client conservatively drains. Carrying the
+/// table set suppresses no-op wakeups: previously EVERY transaction woke EVERY
+/// client task to drain all of its queries (audit Tier 2).
+pub type Tick = std::sync::Arc<Vec<String>>;
 
 /// Serve a single WebSocket connection until it closes.
 ///
@@ -401,6 +410,42 @@ pub fn replica_apply_lock() -> std::sync::Arc<tokio::sync::RwLock<()>> {
     REPLICA_APPLY_LOCK.with(std::sync::Arc::clone)
 }
 
+/// Per-client serving limits (audit Tier 2 — Zero has targetClientRowCount /
+/// maxRowsPerTable / perUserMutationLimit; Orbit previously had none).
+pub struct ServeLimits {
+    /// Max concurrently-active queries per connection
+    /// (`ORBIT_MAX_QUERIES_PER_CLIENT`, default 200; 0 = unlimited).
+    pub max_queries_per_client: usize,
+    /// Max rows one query may materialize (`ORBIT_MAX_ROWS_PER_QUERY`,
+    /// default 100_000; 0 = unlimited). Checked before any client state is
+    /// touched; an over-limit query is rejected with an error message.
+    pub max_rows_per_query: usize,
+    /// Sliding-window per-client mutation rate limit
+    /// (`ORBIT_MUTATIONS_PER_MINUTE`, default 0 = unlimited).
+    pub mutations_per_minute: usize,
+    /// Eviction timeout for a poke send onto a stalled socket
+    /// (`ORBIT_POKE_TIMEOUT_SECS`, default 120). A client that stops reading
+    /// otherwise parks its task (and its view memory) forever.
+    pub poke_timeout: std::time::Duration,
+}
+
+pub fn serve_limits() -> &'static ServeLimits {
+    static LIMITS: std::sync::OnceLock<ServeLimits> = std::sync::OnceLock::new();
+    LIMITS.get_or_init(|| {
+        let num = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d)
+        };
+        ServeLimits {
+            max_queries_per_client: num("ORBIT_MAX_QUERIES_PER_CLIENT", 200),
+            max_rows_per_query: num("ORBIT_MAX_ROWS_PER_QUERY", 100_000),
+            mutations_per_minute: num("ORBIT_MUTATIONS_PER_MINUTE", 0),
+            poke_timeout: std::time::Duration::from_secs(
+                num("ORBIT_POKE_TIMEOUT_SECS", 120) as u64
+            ),
+        }
+    })
+}
+
 /// Wall-clock budget for one query's synchronous materialize phase before it
 /// is reported as a shard-stalling slow hydration (`ORBIT_SLOW_HYDRATION_MS`,
 /// default 500ms). The IVM fetch cannot yield mid-walk, so detection +
@@ -567,7 +612,17 @@ where
 {
     let s = serde_json::to_string(msg)?;
     let n = s.len();
-    tx.send(Message::Text(s)).await?;
+    // Slow-client eviction: a stalled socket (TCP backpressure never
+    // draining) would otherwise park this task — and everything its view
+    // holds — forever. Time out and drop the connection instead; the client
+    // reconnects and resumes from its CVR.
+    match tokio::time::timeout(serve_limits().poke_timeout, tx.send(Message::Text(s))).await {
+        Ok(res) => res?,
+        Err(_) => anyhow::bail!(
+            "client socket stalled for {:?}; evicting slow client",
+            serve_limits().poke_timeout
+        ),
+    }
     Ok(n)
 }
 
@@ -640,7 +695,7 @@ pub async fn serve_client<S, P>(
     // The last cookie the client successfully applied (from the connect URL); used
     // to prove it's safe to resume as a delta. `None` (or a mismatch) → full resync.
     client_base_cookie: Option<u64>,
-    mut ticks: tokio::sync::broadcast::Receiver<()>,
+    mut ticks: tokio::sync::broadcast::Receiver<Tick>,
     // Per-client lastMutationIDs, advanced by the replication apply loop from
     // replicated `orbit_client_mutations` rows (see [`capture_lmid`]).
     lmids: &LmidMap,
@@ -722,6 +777,11 @@ where
     // commit as the rows), so the ack rides atomically with the rows — and a tick
     // caused by ANOTHER client's write never carries this client's ack.
     let mut last_sent_lmid: u64 = 0;
+    // Sliding-window per-client mutation rate limiter (Zero's
+    // perUserMutationLimit analog). Timestamps of accepted pushes in the
+    // last minute; disabled when the env knob is 0.
+    let mut mutation_window: std::collections::VecDeque<std::time::Instant> =
+        std::collections::VecDeque::new();
 
     // Queries supplied during the handshake (Zero client `initConnection`).
     if !initial_queries.is_empty() {
@@ -745,6 +805,32 @@ where
                                 send(&mut tx, &Downstream::Pong).await?;
                             }
                             Upstream::Push(push) => {
+                                let limit = serve_limits().mutations_per_minute;
+                                if limit > 0 {
+                                    let now = std::time::Instant::now();
+                                    while mutation_window
+                                        .front()
+                                        .is_some_and(|t| now.duration_since(*t).as_secs() >= 60)
+                                    {
+                                        mutation_window.pop_front();
+                                    }
+                                    if mutation_window.len() + push.mutations.len() > limit {
+                                        // Rejected, not consumed: the lastMutationID
+                                        // does NOT advance, so the client re-sends
+                                        // later — nothing is lost, just deferred.
+                                        send(&mut tx, &Downstream::Error(orbit_protocol::ErrorBody {
+                                            kind: orbit_protocol::ErrorKind::MutationRateLimited,
+                                            message: format!(
+                                                "mutation rate limit: {limit}/min per client"
+                                            ),
+                                        }))
+                                        .await?;
+                                        continue;
+                                    }
+                                    for _ in 0..push.mutations.len() {
+                                        mutation_window.push_back(now);
+                                    }
+                                }
                                 // The lastMutationID is NOT acked here. It's advanced by the app's
                                 // PushProcessor (or the direct-write path below) in `orbit_client_mutations`
                                 // — in the same Postgres transaction as the data — and returns via
@@ -836,8 +922,9 @@ where
                 }
             }
             tick = ticks.recv() => {
-                // Lagged or closed: still attempt a flush.
-                let _ = tick;
+                // Which tables the transaction touched. Lagged/closed (or an
+                // empty set) → conservative: drain everything.
+                let touched: Option<Tick> = tick.ok();
                 // Ack this client's mutations up to the id replication has confirmed
                 // (advanced from the same commit as this tick's rows). A tick from
                 // another client's write leaves our id unchanged → no ack for us.
@@ -853,6 +940,18 @@ where
                     }
                     None => HashMap::new(),
                 };
+                // No-op wake suppression: if the transaction touched none of
+                // this client's tables and there is nothing to ack, skip the
+                // drain (and the checkpoint clock) entirely.
+                let relevant = match &touched {
+                    Some(t) if !t.is_empty() => {
+                        active.iter().any(|q| t.iter().any(|tb| q.tables.contains(tb)))
+                    }
+                    _ => true,
+                };
+                if !relevant && ack.is_empty() {
+                    continue;
+                }
                 flush_active(&active, &mut tx, &mut version, &mut base_cookie, &mut row_refs, ack).await?;
                 gauges.update(active.len(), row_refs.len());
                 // Throttled CVR checkpoint (off the per-mutation hot path) so a
@@ -936,6 +1035,21 @@ where
                     },
                 };
                 let Some(ast) = ast else { continue };
+                let limits = serve_limits();
+                if limits.max_queries_per_client > 0
+                    && active.len() >= limits.max_queries_per_client
+                {
+                    send(tx, &Downstream::Error(orbit_protocol::ErrorBody {
+                        kind: orbit_protocol::ErrorKind::ServerOverloaded,
+                        message: format!(
+                            "query {hash} rejected: max {} active queries per client",
+                            limits.max_queries_per_client
+                        ),
+                    }))
+                    .await?;
+                    continue;
+                }
+                let ast_tables = ast.tables();
                 // Admission control: the fetch + patch below materialize the
                 // full result — the permit bounds peak node memory during the
                 // MATERIALIZE phase to (gate width) × result. The permit is
@@ -958,6 +1072,25 @@ where
                 top.set_output(link);
                 let schema = catch.borrow().get_schema();
                 let nodes = catch.borrow().fetch();
+                if limits.max_rows_per_query > 0 {
+                    let n = crate::view_sync::count_result_rows(&nodes);
+                    if n > limits.max_rows_per_query {
+                        // Reject BEFORE the refcounted patch build touches any
+                        // client state — nothing to unwind.
+                        drop(nodes);
+                        drop(consistent);
+                        drop(hydrating);
+                        send(tx, &Downstream::Error(orbit_protocol::ErrorBody {
+                            kind: orbit_protocol::ErrorKind::ServerOverloaded,
+                            message: format!(
+                                "query {hash} rejected: result has {n} rows (max {})",
+                                limits.max_rows_per_query
+                            ),
+                        }))
+                        .await?;
+                        continue;
+                    }
+                }
                 let mut rows = match resume {
                     Some(prior) => resume_patches_dedup(&nodes, &schema, row_refs, prior),
                     None => initial_patches_dedup(&nodes, &schema, row_refs),
@@ -992,7 +1125,7 @@ where
                     pending_clear = false;
                 }
                 poke(tx, version, base_cookie, Some(hash.clone()), None, rows).await?;
-                active.push(ActiveQuery { hash, catch, schema });
+                active.push(ActiveQuery { hash, catch, schema, tables: ast_tables });
             }
             QueriesPatchOp::Del { hash } => {
                 // Retract the query's rows BEFORE dropping its pipeline: decrement

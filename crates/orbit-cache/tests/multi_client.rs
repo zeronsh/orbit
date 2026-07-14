@@ -84,7 +84,7 @@ async fn two_clients_both_receive_pokes() {
 
             let replica = Rc::new(replica);
             let mutators = Rc::new(MutatorRegistry::new());
-            let (tick_tx, _) = tokio::sync::broadcast::channel::<()>(16);
+            let (tick_tx, _) = tokio::sync::broadcast::channel::<orbit_cache::server::Tick>(16);
 
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -117,7 +117,7 @@ async fn two_clients_both_receive_pokes() {
 
             // Advance the shared replica + notify all clients.
             source_push(&src, SourceChange::Add(row(&[("id", "i2".into())])));
-            tick_tx.send(()).unwrap();
+            tick_tx.send(std::sync::Arc::new(Vec::new())).unwrap();
 
             // Both clients receive the incremental poke (i2).
             assert_eq!(read_poke_ids(&mut c1).await, vec!["i2"]);

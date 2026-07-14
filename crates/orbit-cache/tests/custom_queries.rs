@@ -76,7 +76,7 @@ async fn named_query_resolved_server_side() {
                     .build()
             });
             let queries = Rc::new(q);
-            let (tick_tx, _) = tokio::sync::broadcast::channel::<()>(16);
+            let (tick_tx, _) = tokio::sync::broadcast::channel::<orbit_cache::server::Tick>(16);
 
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();

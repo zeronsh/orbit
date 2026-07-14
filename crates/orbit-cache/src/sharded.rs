@@ -166,7 +166,7 @@ fn shard_main(
             None => None,
         };
 
-        let (tick_tx, _) = broadcast::channel::<()>(1024);
+        let (tick_tx, _) = broadcast::channel::<crate::server::Tick>(1024);
 
         // Per-client lastMutationIDs for this shard, advanced from replicated
         // `orbit_client_mutations` events in the fan-out.
@@ -187,6 +187,7 @@ fn shard_main(
                 // mid-transaction state. The consistency write lock spans
                 // Begin..Commit; memory stays O(one event).
                 let mut txn_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>> = None;
+                let mut touched: std::collections::HashSet<String> = Default::default();
                 while let Some(ev) = events.recv().await {
                     if matches!(ev, LogicalEvent::Begin) && txn_guard.is_none() {
                         txn_guard =
@@ -197,6 +198,19 @@ fn shard_main(
                         LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. } | LogicalEvent::Truncate { .. }
                     );
                     let is_commit = matches!(ev, LogicalEvent::Commit);
+                    if is_data {
+                        match &ev {
+                            LogicalEvent::Insert { table, .. }
+                            | LogicalEvent::Update { table, .. }
+                            | LogicalEvent::Delete { table, .. } => {
+                                touched.insert(table.clone());
+                            }
+                            LogicalEvent::Truncate { tables } => {
+                                touched.extend(tables.iter().cloned());
+                            }
+                            _ => {}
+                        }
+                    }
                     crate::server::capture_lmid(&ev, &lmids);
                     replica.apply(ev);
                     if is_data {
@@ -205,8 +219,12 @@ fn shard_main(
                     if is_commit {
                         txn_guard = None;
                         if dirty {
-                            let _ = tick_tx.send(());
+                            let _ = tick_tx.send(std::sync::Arc::new(
+                                std::mem::take(&mut touched).into_iter().collect(),
+                            ));
                             dirty = false;
+                        } else {
+                            touched.clear();
                         }
                     }
                 }

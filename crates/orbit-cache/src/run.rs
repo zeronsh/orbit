@@ -135,6 +135,25 @@ async fn run_sharded_inner(cfg: ServerConfig, num_shards: usize) -> Result<()> {
     // Shared-CVR tables (per-client view + version), shared across shards.
     crate::cvr::PgCvrStore::ensure_schema(&pg).await?;
 
+    // CVR GC (same sweep as the other serving paths): ephemeral clients leave
+    // their materialized views + lastMutationIDs in Postgres forever otherwise.
+    {
+        let gc_conn = cfg.conn_str();
+        let gc_tls = cfg.tls;
+        spawn_local(async move {
+            let Ok((gc_pg, driver)) = tls::connect(&gc_conn, gc_tls).await else { return };
+            spawn_local(driver);
+            loop {
+                match crate::cvr::PgCvrStore::gc_stale_clients(&gc_pg, 7).await {
+                    Ok(n) if n > 0 => eprintln!("cvr gc: swept {n} stale client rows"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("cvr gc failed (retrying next cycle): {e:#}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
     let table_names: Vec<&str> = cfg.tables.iter().map(|t| t.name.as_str()).collect();
     create_publication(&pg, &cfg.publication, &table_names)
         .await
@@ -270,7 +289,26 @@ struct TxnApply {
     buf_bytes: usize,
     streaming: bool,
     dirty: bool,
+    /// Tables the transaction touched — carried on the tick so client tasks
+    /// whose queries read none of them skip their drain (no-op suppression).
+    tables: std::collections::HashSet<String>,
     guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+/// Record the table(s) `ev` touches into `out`.
+fn add_event_tables(ev: &LogicalEvent, out: &mut std::collections::HashSet<String>) {
+    match ev {
+        LogicalEvent::Insert { table, .. }
+        | LogicalEvent::Update { table, .. }
+        | LogicalEvent::Delete { table, .. }
+        | LogicalEvent::Relation { table, .. } => {
+            out.insert(table.clone());
+        }
+        LogicalEvent::Truncate { tables } => {
+            out.extend(tables.iter().cloned());
+        }
+        LogicalEvent::Begin | LogicalEvent::Commit | LogicalEvent::Other => {}
+    }
 }
 
 fn is_data_event(ev: &LogicalEvent) -> bool {
@@ -291,6 +329,7 @@ impl TxnApply {
             buf_bytes: 0,
             streaming: false,
             dirty: false,
+            tables: std::collections::HashSet::new(),
             guard: None,
         }
     }
@@ -303,6 +342,7 @@ impl TxnApply {
         ev: LogicalEvent,
     ) -> Result<()> {
         self.dirty |= is_data_event(&ev);
+        add_event_tables(&ev, &mut self.tables);
         if self.streaming {
             crate::server::capture_lmid(&ev, lmids);
             return replica.apply(ev);
@@ -329,14 +369,15 @@ impl TxnApply {
         Ok(())
     }
 
-    /// Commit the transaction (returns whether it contained data changes).
+    /// Commit the transaction. Returns the touched tables when it contained
+    /// data changes (the tick payload), `None` when clean.
     fn commit<B: ReplicaBackend>(
         mut self,
         replica: &B,
         lmids: &crate::server::LmidMap,
         lsn: u64,
         pos: u64,
-    ) -> Result<bool> {
+    ) -> Result<Option<crate::server::Tick>> {
         if !self.streaming {
             replica.begin_txn()?;
             for ev in self.buf.drain(..) {
@@ -347,7 +388,11 @@ impl TxnApply {
         replica.apply(LogicalEvent::Commit)?;
         replica.commit_txn(lsn, pos)?;
         self.guard.take(); // release consistency writers after the commit
-        Ok(self.dirty)
+        Ok(if self.dirty {
+            Some(std::sync::Arc::new(self.tables.into_iter().collect()))
+        } else {
+            None
+        })
     }
 
     /// Abandon the transaction. Returns `true` when it had already STREAMED
@@ -484,7 +529,7 @@ async fn run_inner<B: ReplicaBackend + 'static>(
     let queries = Rc::new(queries);
     let forwarder = Rc::new(crate::forward::Forwarder::new(cfg.forward_config()));
 
-    let (ticks_tx, _) = broadcast::channel::<()>(1024);
+    let (ticks_tx, _) = broadcast::channel::<crate::server::Tick>(1024);
 
     // Replication pump: apply each change once, then notify all clients.
     // Per-client lastMutationIDs, advanced from replicated `orbit_client_mutations`.
@@ -500,6 +545,22 @@ async fn run_inner<B: ReplicaBackend + 'static>(
             }
         }
     }
+    // CVR GC: ephemeral clients (each non-persisted tab gets a random clientID)
+    // leave their materialized views in Postgres forever without a sweep.
+    {
+        let gc_pg = Rc::clone(&pg);
+        spawn_local(async move {
+            loop {
+                match crate::cvr::PgCvrStore::gc_stale_clients(&gc_pg, 7).await {
+                    Ok(n) if n > 0 => eprintln!("cvr gc: swept {n} stale client rows"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("cvr gc failed (retrying next cycle): {e:#}"),
+                }
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
     {
         let replica = replica.clone();
         let ticks_tx = ticks_tx.clone();
@@ -554,10 +615,10 @@ async fn run_inner<B: ReplicaBackend + 'static>(
                             // roll back and halt cleanly: never commit a
                             // watermark over a torn apply, never panic.
                             match t.commit(replica.as_ref(), &lmids, final_lsn, 0) {
-                                Ok(dirty) => {
+                                Ok(tick) => {
                                     dedup_lsn = final_lsn;
-                                    if dirty {
-                                        let _ = ticks_tx.send(());
+                                    if let Some(tick) = tick {
+                                        let _ = ticks_tx.send(tick);
                                     }
                                 }
                                 Err(e) => {
@@ -627,10 +688,37 @@ async fn accept_ws_clients<B: ReplicaBackend + 'static>(
     mutators: Rc<MutatorRegistry>,
     queries: Rc<QueryRegistry>,
     forwarder: Rc<crate::forward::Forwarder>,
-    ticks_tx: broadcast::Sender<()>,
+    ticks_tx: broadcast::Sender<crate::server::Tick>,
     lmids: crate::server::LmidMap,
     replica_pos: Option<Rc<std::cell::Cell<u64>>>,
 ) -> Result<()> {
+    // Graceful drain (audit Tier 2 — previously crash-only, so every deploy
+    // was an instant fleet-wide rehydration storm): on SIGTERM, flip /ready to
+    // 503 so the load balancer stops routing new clients here, keep serving
+    // existing connections for ORBIT_DRAIN_SECONDS (default 15; clients keep
+    // getting pokes and their CVR checkpoints stay fresh), then exit cleanly.
+    // New connections are still ACCEPTED during the window (a client that
+    // races the LB update gets served rather than refused).
+    {
+        spawn_local(async move {
+            let Ok(mut term) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            else {
+                return;
+            };
+            term.recv().await;
+            if let Some(m) = crate::metrics::node_metrics() {
+                m.mark_draining();
+            }
+            let secs = std::env::var("ORBIT_DRAIN_SECONDS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(15u64);
+            eprintln!("SIGTERM: draining for {secs}s, then exiting");
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            std::process::exit(0);
+        });
+    }
     loop {
         let (sock, _) = listener.accept().await?;
         let replica = replica.clone();
@@ -1596,7 +1684,7 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
     let mutators = Rc::new(mutators);
     let queries = Rc::new(queries);
     let forwarder = Rc::new(crate::forward::Forwarder::new(cfg.forward_config()));
-    let (ticks_tx, _) = broadcast::channel::<()>(1024);
+    let (ticks_tx, _) = broadcast::channel::<crate::server::Tick>(1024);
     // Per-client lastMutationIDs, advanced from replicated `orbit_client_mutations`
     // events forwarded through the change-stream.
     let lmids: crate::server::LmidMap = Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
@@ -1708,10 +1796,10 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
                                 continue;
                             };
                             match t.commit(replica.as_ref(), &lmids, 0, pos) {
-                                Ok(dirty) => {
+                                Ok(tick) => {
                                     watermark = pos;
-                                    if dirty {
-                                        let _ = ticks_tx.send(());
+                                    if let Some(tick) = tick {
+                                        let _ = ticks_tx.send(tick);
                                     }
                                 }
                                 Err(e) => {

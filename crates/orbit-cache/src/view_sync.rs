@@ -143,6 +143,21 @@ impl RowRefs {
     }
 }
 
+/// Count the rows a hydration result would materialize (top-level nodes plus
+/// all related children). Used for the per-query result cap BEFORE the
+/// refcounted patch build mutates any client state.
+pub fn count_result_rows(nodes: &[Node]) -> usize {
+    fn walk(node: &Node) -> usize {
+        1 + node
+            .relationships
+            .iter()
+            .flat_map(|(_, children)| children.iter())
+            .map(walk)
+            .sum::<usize>()
+    }
+    nodes.iter().map(walk).sum()
+}
+
 /// Like [`initial_patches`] but ref-counted (see [`RowRefs`]).
 pub fn initial_patches_dedup(nodes: &[Node], schema: &Schema, refs: &mut RowRefs) -> RowsPatch {
     let mut out = Vec::new();

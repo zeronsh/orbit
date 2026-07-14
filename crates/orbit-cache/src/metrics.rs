@@ -53,6 +53,8 @@ pub enum ReadyComponent {
 pub struct Metrics {
     pub role: Role,
     ready: AtomicBool,
+    /// Draining flag: set on SIGTERM; forces `/ready` to 503.
+    pub draining: AtomicBool,
     ready_components: [AtomicBool; 3],
 
     // Replica.
@@ -104,6 +106,7 @@ impl Metrics {
         let m = Metrics {
             role,
             ready: AtomicBool::new(false),
+            draining: AtomicBool::new(false),
             ready_components: Default::default(),
             replica_rows: Default::default(),
             replica_logical_bytes: Default::default(),
@@ -151,7 +154,17 @@ impl Metrics {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.ready.load(Ordering::Acquire) && !self.draining.load(Ordering::Acquire)
+    }
+
+    /// Enter draining: `/ready` flips to 503 so the load balancer stops
+    /// routing new clients here, while existing connections keep being served
+    /// until the drain window elapses. Part of graceful deploys (previously
+    /// crash-only: every deploy was an instant full-fleet rehydration storm).
+    pub fn mark_draining(&self) {
+        if !self.draining.swap(true, Ordering::AcqRel) {
+            eprintln!("{}: DRAINING (readiness now 503; existing clients still served)", self.role.as_str());
+        }
     }
 
     /// Render in Prometheus text exposition format. Process gauges (RSS) are
@@ -273,7 +286,8 @@ async fn handle_http(sock: tokio::net::TcpStream, m: &Metrics) -> anyhow::Result
             if m.is_ready() {
                 ("200 OK", "text/plain", "ready\n".to_string())
             } else {
-                ("503 Service Unavailable", "text/plain", "starting\n".to_string())
+                let why = if m.draining.load(Ordering::Acquire) { "draining\n" } else { "starting\n" };
+                ("503 Service Unavailable", "text/plain", why.to_string())
             }
         }
         "/live" => ("200 OK", "text/plain", "live\n".to_string()),

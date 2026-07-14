@@ -176,6 +176,44 @@ pub struct Ast {
     pub order_by: Option<Ordering>,
 }
 
+impl Ast {
+    /// Every table this query (including related subqueries and EXISTS
+    /// conditions) reads from. Used for change-notification filtering: a
+    /// replication tick that touched none of a query's tables cannot change
+    /// its result, so its client task need not wake and drain.
+    pub fn tables(&self) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        self.collect_tables(&mut out);
+        out
+    }
+
+    fn collect_tables(&self, out: &mut std::collections::HashSet<String>) {
+        out.insert(self.table.clone());
+        if let Some(related) = &self.related {
+            for r in related {
+                r.subquery.collect_tables(out);
+            }
+        }
+        if let Some(w) = &self.where_ {
+            collect_condition_tables(w, out);
+        }
+    }
+}
+
+fn collect_condition_tables(c: &Condition, out: &mut std::collections::HashSet<String>) {
+    match c {
+        Condition::Simple { .. } => {}
+        Condition::And { conditions } | Condition::Or { conditions } => {
+            for c in conditions {
+                collect_condition_tables(c, out);
+            }
+        }
+        Condition::CorrelatedSubquery { related, .. } => {
+            related.subquery.collect_tables(out);
+        }
+    }
+}
+
 // serde needs the `where` field to serialize as `"where"`, not `"where_"`.
 // We can't name a Rust field `where` (reserved), so apply the rename via attr.
 // (Applied here rather than inline to keep the struct readable.)
