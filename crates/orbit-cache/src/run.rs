@@ -238,6 +238,51 @@ pub async fn run_server_full(
     local.run_until(run_inner(cfg, mutators, queries, replica)).await
 }
 
+/// Backfill tables added to the config after a durable replica was first
+/// synced (audit Tier 0.5): a watermark resume skips initial sync entirely, so
+/// a table newly added to `ORBIT_TABLES` would stream future changes while
+/// silently missing every pre-existing row. Runs in one storage transaction
+/// that PRESERVES the existing watermark; idempotent apply absorbs the overlap
+/// between the backfill SELECT and the stream resume (same discipline as the
+/// slot-creation/snapshot window). Zero's analog is the `BackfillManager`.
+pub async fn backfill_missing_tables<B: ReplicaBackend>(
+    pg: &tokio_postgres::Client,
+    replica: &B,
+    cfg: &ServerConfig,
+) -> Result<()> {
+    let Some(synced) = replica.synced_tables() else {
+        return Ok(()); // backend re-syncs from scratch every boot
+    };
+    let missing: Vec<&TableConfig> =
+        cfg.tables.iter().filter(|t| !synced.contains(&t.name)).collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let lsn = replica.resume_watermark().unwrap_or(0);
+    let pos = replica.resume_pos().unwrap_or(0);
+    replica.begin_txn().context("opening backfill storage transaction")?;
+    for t in &missing {
+        let n = match initial_sync_backend(pg, replica, &t.name)
+            .await
+            .with_context(|| format!("backfilling newly-added table {}", t.name))
+        {
+            Ok(n) => n,
+            Err(e) => {
+                replica.rollback_txn();
+                return Err(e);
+            }
+        };
+        if let Err(e) = replica.mark_synced(&t.name) {
+            replica.rollback_txn();
+            return Err(e);
+        }
+        eprintln!("backfill: {} rows from newly-added table {}", n, t.name);
+    }
+    // Re-commit the SAME watermark: the backfill doesn't advance replication.
+    replica.commit_txn(lsn, pos).context("committing backfill")?;
+    Ok(())
+}
+
 async fn run_inner<B: ReplicaBackend + 'static>(
     cfg: ServerConfig,
     mutators: MutatorRegistry,
@@ -278,7 +323,12 @@ async fn run_inner<B: ReplicaBackend + 'static>(
     // as phantoms in a durable replica).
     let resume_watermark = replica.resume_watermark();
     match resume_watermark {
-        Some(w) => eprintln!("durable replica: resuming from watermark {w} (skipping initial sync)"),
+        Some(w) => {
+            eprintln!("durable replica: resuming from watermark {w} (skipping initial sync)");
+            // Tables added to the config AFTER the first sync still need their
+            // pre-existing rows (the stream only carries new changes).
+            backfill_missing_tables(&pg, replica.as_ref(), &cfg).await?;
+        }
         None => {
             replica.start_fresh();
             // One storage transaction around the whole sync: a crash mid-sync
@@ -297,6 +347,7 @@ async fn run_inner<B: ReplicaBackend + 'static>(
                         return Err(e);
                     }
                 };
+                replica.mark_synced(&t.name)?;
                 eprintln!("initial sync: {} rows from {}", n, t.name);
             }
             replica.commit_txn(0, 0).context("committing initial sync")?;
@@ -689,17 +740,40 @@ impl SnapshotStrategy for SqliteSnapshots {
     ) -> Result<(crate::sqlite_source::SqliteReplica, u64)> {
         std::fs::create_dir_all(&self.cfg.dir).ok();
         self.sweep_staging();
+        // Which config tables a restored replica hasn't initial-synced. A
+        // view-syncer can't backfill from Postgres itself — it must restore a
+        // snapshot taken AFTER the replicator backfilled the new table.
+        let missing = |replica: &crate::sqlite_source::SqliteReplica| -> Vec<String> {
+            match replica.synced_tables() {
+                Some(synced) => cfg
+                    .tables
+                    .iter()
+                    .filter(|t| !synced.contains(&t.name))
+                    .map(|t| t.name.clone())
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
         // Local short-circuit: a durable view-syncer that recorded its applied
         // position resumes by DELTA from its own replica file — no download.
         if self.replica_db().exists() {
             let replica = self.build_replica(cfg);
             if let Some(p) = replica.resume_pos() {
+                let miss = missing(&replica);
+                if miss.is_empty() {
+                    eprintln!(
+                        "view-syncer: resuming from local replica.db @ pos {p} (skipping snapshot download)"
+                    );
+                    return Ok((replica, p));
+                }
+                // Tables were added to the config: the local file predates
+                // them (audit Tier 0.5) — fall through to snapshot restore.
                 eprintln!(
-                    "view-syncer: resuming from local replica.db @ pos {p} (skipping snapshot download)"
+                    "view-syncer: local replica.db missing newly-added tables {miss:?}; re-restoring from snapshot"
                 );
-                return Ok((replica, p));
             }
-            // Foreign or half-built file: close the connection, then clear it.
+            // Foreign, half-built, or table-incomplete file: close the
+            // connection, then clear it.
             drop(replica);
             self.invalidate_local();
         }
@@ -712,8 +786,20 @@ impl SnapshotStrategy for SqliteSnapshots {
                         std::fs::rename(&tmp, self.replica_db())
                             .context("rename snapshot into place")?;
                         let replica = self.build_replica(cfg);
-                        eprintln!("view-syncer restored snapshot @ pos {pos}");
-                        return Ok((replica, pos));
+                        let miss = missing(&replica);
+                        if !miss.is_empty() {
+                            // The replicator hasn't published a snapshot that
+                            // includes the newly-added tables yet — keep
+                            // waiting rather than serving silent empty history.
+                            eprintln!(
+                                "view-syncer: snapshot @ pos {pos} predates newly-added tables {miss:?}; waiting for the replicator to backfill + re-snapshot"
+                            );
+                            drop(replica);
+                            self.invalidate_local();
+                        } else {
+                            eprintln!("view-syncer restored snapshot @ pos {pos}");
+                            return Ok((replica, pos));
+                        }
                     }
                     Err(e) => {
                         // Corrupt / torn / garbage object: never rename it into
@@ -878,6 +964,9 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
         eprintln!(
             "durable replica: resuming from watermark {apply_watermark} (skipping initial sync)"
         );
+        // Tables added to the config AFTER the first sync still need their
+        // pre-existing rows (the stream only carries new changes).
+        backfill_missing_tables(&pg, replica.as_ref(), &cfg).await?;
     } else {
         replica.start_fresh();
         replica.begin_txn().context("opening initial-sync storage transaction")?;
@@ -892,6 +981,7 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
                     return Err(e);
                 }
             };
+            replica.mark_synced(&t.name)?;
             eprintln!("initial sync: {} rows from {}", n, t.name);
         }
         replica.commit_txn(0, start_seq).context("committing initial sync")?;

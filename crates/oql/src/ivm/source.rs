@@ -180,14 +180,29 @@ impl MemorySource {
 
     /// Reconcile to a new column set (a DDL schema change). Columns no longer
     /// present are dropped from every stored row; added columns simply appear in
-    /// subsequently-replicated rows. Invalidates secondary indexes.
+    /// subsequently-replicated rows; columns whose TYPE changed (name kept) have
+    /// their stored values converted in place — Postgres rewrites the table on
+    /// `ALTER COLUMN … TYPE` but logical replication never re-sends the rows,
+    /// so without this the replica silently keeps stale-typed values (audit
+    /// Tier 0.4). Invalidates secondary indexes.
     pub fn reconcile_columns(&mut self, new_columns: &[(String, ColumnType)]) {
+        let changed: Vec<(String, ColumnType)> = new_columns
+            .iter()
+            .filter(|(n, t)| self.columns.get(n).is_some_and(|old| old != t))
+            .cloned()
+            .collect();
         let rebuilt: Vec<Rc<Row>> = self
             .data
             .values()
             .map(|rc| {
                 let mut r = (**rc).clone();
                 r.retain(|k, _| new_columns.iter().any(|(n, _)| n.as_str() == k));
+                for (name, ty) in &changed {
+                    if let Some(v) = r.get(name) {
+                        let converted = super::schema::convert_column_value(v, *ty);
+                        r.insert(name.as_str(), converted);
+                    }
+                }
                 Rc::new(r)
             })
             .collect();

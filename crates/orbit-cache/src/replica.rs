@@ -55,6 +55,20 @@ pub trait ReplicaBackend: oql::SourceProvider {
     /// Abandon the current replication transaction after an apply error (best
     /// effort — the halt that follows is what actually guarantees safety).
     fn rollback_txn(&self) {}
+    /// The set of tables this durable replica has fully initial-synced, or
+    /// `None` for backends that re-sync from scratch on every boot (in-memory).
+    /// Lets startup detect tables newly added to the config after the replica
+    /// was first synced — a watermark resume would otherwise stream their
+    /// future changes while silently missing every pre-existing row (audit
+    /// Tier 0.5).
+    fn synced_tables(&self) -> Option<std::collections::HashSet<String>> {
+        None
+    }
+    /// Record `table` as fully synced (called inside the same storage
+    /// transaction as the rows it seeds).
+    fn mark_synced(&self, _table: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// The durably-recorded resume point from a previous run, if any. `Some`
     /// lets the server skip the full initial sync and resume from the slot.
     fn resume_watermark(&self) -> Option<u64> {

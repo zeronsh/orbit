@@ -175,3 +175,88 @@ async fn drop_column_mid_stream() {
         .await
         .ok();
 }
+
+/// `ALTER COLUMN … TYPE` mid-stream: Postgres rewrites its table but logical
+/// replication never re-sends rows — the replica must convert its own stored
+/// values when the Relation message reveals the new type (audit Tier 0.4:
+/// previously invisible, reconcile compared names only).
+#[tokio::test]
+async fn alter_column_type_mid_stream_converts_stored_values() {
+    let host = std::env::var("ORBIT_PG_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let port: u16 = std::env::var("ORBIT_PG_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5433);
+    let conn_str = format!("host={host} port={port} user=orbit dbname=orbit");
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .batch_execute(
+            "DROP TABLE IF EXISTS retype;
+             CREATE TABLE retype (id text PRIMARY KEY, n text);
+             ALTER TABLE retype REPLICA IDENTITY FULL;",
+        )
+        .await
+        .unwrap();
+    client
+        .batch_execute("SELECT pg_drop_replication_slot('orbit_slot_retype') FROM pg_replication_slots WHERE slot_name='orbit_slot_retype'")
+        .await
+        .ok();
+    create_publication(&client, "orbit_pub_retype", &["retype"]).await.unwrap();
+    let start_lsn = create_slot(&client, "orbit_slot_retype").await.unwrap();
+    let mut stream = orbit_cache::ReplicationStream::start(
+        &host, port, "orbit", "orbit", "orbit_slot_retype", "orbit_pub_retype", start_lsn,
+    )
+    .await
+    .unwrap();
+
+    let mut replica = Replica::new();
+    let mut cols = BTreeMap::new();
+    cols.insert("id".to_string(), ColumnType::String);
+    cols.insert("n".to_string(), ColumnType::String);
+    let _ = replica.add_table("retype", cols, vec!["id".into()]);
+
+    // Row exists as text, THEN the column becomes an integer, then another row
+    // arrives typed int8. The stored 'r1' value must convert to a number.
+    client
+        .batch_execute(
+            "INSERT INTO retype (id, n) VALUES ('r1', '41');
+             ALTER TABLE retype ALTER COLUMN n TYPE int8 USING n::int8;
+             INSERT INTO retype (id, n) VALUES ('r2', 42);",
+        )
+        .await
+        .unwrap();
+
+    let mut inserts = 0;
+    while inserts < 2 {
+        let (_lsn, ev) = tokio::time::timeout(Duration::from_secs(10), stream.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(ev, LogicalEvent::Insert { .. }) {
+            inserts += 1;
+        }
+        replica.apply(ev);
+    }
+
+    let src = replica.source("retype").unwrap();
+    let rows = src.borrow().all_rows();
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        let id = match r.get("id") {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("bad id {other:?}"),
+        };
+        let want = if id == "r1" { 41.0 } else { 42.0 };
+        assert_eq!(
+            r.get("n"),
+            Some(&Value::Number(want)),
+            "row {id}: stored value must be converted to the new column type"
+        );
+    }
+
+    client
+        .batch_execute("SELECT pg_drop_replication_slot('orbit_slot_retype') FROM pg_replication_slots WHERE slot_name='orbit_slot_retype'")
+        .await
+        .ok();
+}

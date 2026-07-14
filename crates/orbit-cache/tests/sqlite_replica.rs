@@ -408,3 +408,53 @@ fn relation_event_reconciles_sqlite_table() {
     let g2 = rows.iter().find(|r| r["id"] == "g2".into()).unwrap();
     assert_eq!(g2.get("c"), Some(&Value::String("new".into())));
 }
+
+/// Tier 0.4: a Relation message that keeps a column's NAME but changes its
+/// TYPE must convert the stored values (both backends share the rule; this
+/// covers the SQLite rewrite path — the in-memory path is covered by
+/// `ddl.rs::alter_column_type_mid_stream_converts_stored_values`).
+#[test]
+fn relation_type_change_converts_stored_sqlite_values() {
+    let mut replica = SqliteReplica::in_memory();
+    replica.add_table(
+        "rt",
+        vec![("id".into(), ColumnType::String), ("n".into(), ColumnType::String)],
+        vec!["id".into()],
+    );
+    replica
+        .apply(LogicalEvent::Insert { table: "rt".into(), row: row(&[("id", "a".into()), ("n", "41".into())]) })
+        .unwrap();
+    // text → number (e.g. ALTER COLUMN n TYPE int8 USING n::int8 upstream).
+    replica
+        .apply(LogicalEvent::Relation {
+            table: "rt".into(),
+            columns: vec![("id".into(), ColumnType::String), ("n".into(), ColumnType::Number)],
+        })
+        .unwrap();
+    let rows = replica.source("rt").unwrap().borrow().all_rows();
+    assert_eq!(rows[0].get("n"), Some(&Value::Number(41.0)), "stored text must convert to number");
+
+    // …and the reverse: number → text.
+    replica
+        .apply(LogicalEvent::Relation {
+            table: "rt".into(),
+            columns: vec![("id".into(), ColumnType::String), ("n".into(), ColumnType::String)],
+        })
+        .unwrap();
+    let rows = replica.source("rt").unwrap().borrow().all_rows();
+    assert_eq!(rows[0].get("n"), Some(&Value::String("41".into())), "number must convert back to text");
+
+    // …and text → json (PG text→jsonb parses JSON content).
+    replica
+        .apply(LogicalEvent::Insert { table: "rt".into(), row: row(&[("id", "j".into()), ("n", "{\"a\":1}".into())]) })
+        .unwrap();
+    replica
+        .apply(LogicalEvent::Relation {
+            table: "rt".into(),
+            columns: vec![("id".into(), ColumnType::String), ("n".into(), ColumnType::Json)],
+        })
+        .unwrap();
+    let rows = replica.source("rt").unwrap().borrow().all_rows();
+    let j = rows.iter().find(|r| r.get("id") == Some(&Value::String("j".into()))).unwrap();
+    assert_eq!(j.get("n"), Some(&Value::Json(serde_json::json!({"a": 1}))));
+}

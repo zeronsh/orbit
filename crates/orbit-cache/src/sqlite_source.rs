@@ -131,7 +131,17 @@ impl SqliteSource {
             .filter(|c| !new_columns.iter().any(|(n, _)| n == *c))
             .cloned()
             .collect();
-        if added.is_empty() && removed.is_empty() {
+        // Columns whose TYPE changed while keeping the name: Postgres rewrites
+        // the table on `ALTER COLUMN … TYPE` but never re-sends the rows, so
+        // the stored values must be converted in place (audit Tier 0.4 —
+        // previously invisible: reconcile compared names only).
+        let changed: Vec<(String, ColumnType, ColumnType)> = new_columns
+            .iter()
+            .filter_map(|(n, t)| {
+                self.columns.get(n).filter(|old| *old != t).map(|old| (n.clone(), *old, *t))
+            })
+            .collect();
+        if added.is_empty() && removed.is_empty() && changed.is_empty() {
             return;
         }
         for (name, _) in &added {
@@ -140,9 +150,9 @@ impl SqliteSource {
                 eprintln!("replica DDL: add column {name} to {} failed: {e}", self.table);
             }
         }
-        if !removed.is_empty() {
-            // Secondary indexes may cover a doomed column; drop them all (they
-            // are lazily re-created per fetch shape).
+        if !removed.is_empty() || !changed.is_empty() {
+            // Secondary indexes may cover a doomed/retyped column; drop them
+            // all (they are lazily re-created per fetch shape).
             for idx in self.created_indexes.borrow_mut().drain() {
                 let _ = self.db.execute_batch(&format!("DROP INDEX IF EXISTS {}", ident(&idx)));
             }
@@ -158,6 +168,48 @@ impl SqliteSource {
             let sql = format!("ALTER TABLE {} DROP COLUMN {}", ident(&self.table), ident(name));
             if let Err(e) = self.db.execute_batch(&sql) {
                 eprintln!("replica DDL: drop column {name} from {} failed: {e}", self.table);
+            }
+        }
+        // Convert stored values of retyped columns: read with the OLD type,
+        // convert, write with the NEW type's binding. Runs inside the
+        // surrounding replication transaction (Relation events are applied
+        // between Begin/Commit), so a crash mid-rewrite rolls back atomically.
+        for (name, old_ty, new_ty) in &changed {
+            let convert = |db: &Connection| -> anyhow::Result<()> {
+                let select =
+                    format!("SELECT rowid, {} FROM {}", ident(name), ident(&self.table));
+                let mut read = db.prepare(&select)?;
+                let rows: Vec<(i64, Value)> = read
+                    .query_map([], |r| {
+                        Ok((r.get::<_, i64>(0)?, read_value(r, 1, *old_ty)))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                let update = format!(
+                    "UPDATE {} SET {} = ?1 WHERE rowid = ?2",
+                    ident(&self.table),
+                    ident(name)
+                );
+                let mut write = db.prepare(&update)?;
+                for (rowid, v) in rows {
+                    let converted = oql::ivm::schema::convert_column_value(&v, *new_ty);
+                    // Match `param`'s JSON-column encoding for the NEW type.
+                    let bound = match (new_ty, &converted) {
+                        (_, Value::Null) => SqlVal(Value::Null),
+                        (ColumnType::Json, _) => SqlVal(Value::String(
+                            serde_json::to_string(&converted).unwrap_or_default(),
+                        )),
+                        _ => SqlVal(converted),
+                    };
+                    write.execute(rusqlite::params![bound, rowid])?;
+                }
+                Ok(())
+            };
+            if let Err(e) = convert(&self.db) {
+                eprintln!(
+                    "replica DDL: converting column {name} of {} from {old_ty:?} to {new_ty:?} failed: {e}",
+                    self.table
+                );
             }
         }
         self.columns = new_columns.iter().map(|(n, t)| (n.clone(), *t)).collect();
@@ -761,6 +813,33 @@ impl SqliteReplica {
         let _ = conn.execute_batch(
             "ALTER TABLE orbit_replication_state ADD COLUMN pos INTEGER NOT NULL DEFAULT 0",
         );
+        // Which tables have been fully initial-synced. Consulted on a
+        // watermark resume so tables newly added to the config get backfilled
+        // instead of silently starting empty (audit Tier 0.5).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS orbit_synced_tables (name TEXT PRIMARY KEY)",
+        )
+        .expect("create synced-tables registry");
+        // Migration: a pre-registry file that already carries a watermark was
+        // fully synced by an older version — count its physical tables as
+        // synced so the upgrade doesn't trigger a full re-seed.
+        let has_watermark: bool = conn
+            .query_row(
+                "SELECT lsn > 0 OR pos > 0 FROM orbit_replication_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        let registry_empty: bool = conn
+            .query_row("SELECT count(*) = 0 FROM orbit_synced_tables", [], |r| r.get(0))
+            .unwrap_or(true);
+        if has_watermark && registry_empty {
+            let _ = conn.execute_batch(
+                "INSERT OR IGNORE INTO orbit_synced_tables (name)
+                 SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'orbit_%' AND name NOT LIKE 'sqlite_%'",
+            );
+        }
         SqliteReplica {
             sources: std::collections::HashMap::new(),
             columns: std::collections::HashMap::new(),
@@ -926,6 +1005,23 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
         let _ = self.conn.execute_batch("ROLLBACK");
     }
 
+    fn synced_tables(&self) -> Option<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare_cached("SELECT name FROM orbit_synced_tables").ok()?;
+        let set = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+        Some(set)
+    }
+
+    fn mark_synced(&self, table: &str) -> anyhow::Result<()> {
+        self.conn
+            .prepare_cached("INSERT OR IGNORE INTO orbit_synced_tables (name) VALUES (?1)")?
+            .execute([table])?;
+        Ok(())
+    }
+
     fn resume_watermark(&self) -> Option<u64> {
         self.conn
             .query_row("SELECT lsn FROM orbit_replication_state WHERE id = 1", [], |r| {
@@ -979,6 +1075,7 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
             let _ = self.conn.execute_batch(&sql);
         }
         let _ = self.conn.execute_batch("DELETE FROM orbit_replication_state");
+        let _ = self.conn.execute_batch("DELETE FROM orbit_synced_tables");
         let _ = self.conn.execute_batch("COMMIT");
     }
 }
