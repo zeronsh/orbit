@@ -136,6 +136,7 @@ fn sql_literal(v: &Value) -> String {
                 format!("{n}")
             }
         }
+        Value::Int(i) => i.to_string(),
         Value::String(s) => quote_string(s),
         Value::Json(j) => format!("{}::jsonb", quote_string(&j.to_string())),
     }

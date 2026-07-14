@@ -81,7 +81,7 @@ fn run_scenario(g: &Golden) -> Result<(), String> {
             t.columns.iter().map(|(k, c)| (k.clone(), col_type(&c.ty))).collect();
         let src = replica.add_table(name, cols, t.pk.clone());
         for r in &t.rows {
-            src.borrow().insert_initial(&json_to_row(r));
+            src.borrow().insert_initial(&json_to_row(r)).expect("insert");
         }
     }
     let ast: Ast = serde_json::from_value(g.ast.clone()).map_err(|e| format!("parse ast: {e}"))?;
@@ -95,12 +95,13 @@ fn run_scenario(g: &Golden) -> Result<(), String> {
         let src = replica.source(&p.table).expect("source");
         let row = json_to_row(&p.row);
         match p.op.as_str() {
-            "add" => source_push(&src, SourceChange::Add(row)),
-            "remove" => source_push(&src, SourceChange::Remove(row)),
+            "add" => source_push(&src, SourceChange::Add(row)).expect("push"),
+            "remove" => source_push(&src, SourceChange::Remove(row)).expect("push"),
             "edit" => source_push(
                 &src,
                 SourceChange::Edit { row, old_row: json_to_row(p.old_row.as_ref().expect("oldRow")) },
-            ),
+            )
+            .expect("push"),
             other => return Err(format!("unknown op {other}")),
         }
         catch.borrow_mut().take_changes();

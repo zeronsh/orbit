@@ -189,13 +189,12 @@ impl SqliteSource {
     }
 
     /// Insert a row directly (initial load), bypassing change propagation.
-    pub fn insert_initial(&self, row: &Row) {
+    pub fn insert_initial(&self, row: &Row) -> anyhow::Result<()> {
         let (sql, params) = self.insert_sql(row);
         self.db
-            .prepare_cached(&sql)
-            .expect("prepare insert")
-            .execute(rusqlite::params_from_iter(params))
-            .expect("insert_initial");
+            .prepare_cached(&sql)?
+            .execute(rusqlite::params_from_iter(params))?;
+        Ok(())
     }
 
     /// Look up the stored row matching the primary key of `key_row`.
@@ -259,27 +258,31 @@ impl SqliteSource {
             .join(" AND ")
     }
 
-    fn write_change(&self, change: &SourceChange) {
+    /// Persist a change to SQLite. Errors propagate (no panic): the caller
+    /// rolls back the surrounding replication transaction and halts cleanly —
+    /// a torn half-write must never be committed under a watermark.
+    fn write_change(&self, change: &SourceChange) -> anyhow::Result<()> {
         match change {
             SourceChange::Add(r) => {
                 let (sql, params) = self.insert_sql(r);
-                self.db.prepare_cached(&sql).unwrap().execute(rusqlite::params_from_iter(params)).unwrap();
+                self.db.prepare_cached(&sql)?.execute(rusqlite::params_from_iter(params))?;
             }
             SourceChange::Remove(r) => {
                 let params: Vec<SqlVal> =
                     self.primary_key.iter().map(|k| self.param(k, r.get(k).cloned().unwrap_or(Value::Null))).collect();
                 let sql = format!("DELETE FROM \"{}\" WHERE {}", self.table, self.pk_where());
-                self.db.prepare_cached(&sql).unwrap().execute(rusqlite::params_from_iter(params)).unwrap();
+                self.db.prepare_cached(&sql)?.execute(rusqlite::params_from_iter(params))?;
             }
             SourceChange::Edit { row, old_row } => {
                 let params: Vec<SqlVal> =
                     self.primary_key.iter().map(|k| self.param(k, old_row.get(k).cloned().unwrap_or(Value::Null))).collect();
                 let sql = format!("DELETE FROM \"{}\" WHERE {}", self.table, self.pk_where());
-                self.db.prepare_cached(&sql).unwrap().execute(rusqlite::params_from_iter(params)).unwrap();
+                self.db.prepare_cached(&sql)?.execute(rusqlite::params_from_iter(params))?;
                 let (sql, p) = self.insert_sql(row);
-                self.db.prepare_cached(&sql).unwrap().execute(rusqlite::params_from_iter(p)).unwrap();
+                self.db.prepare_cached(&sql)?.execute(rusqlite::params_from_iter(p))?;
             }
         }
+        Ok(())
     }
 
     /// All rows (primary-key order) — for snapshotting the replica.
@@ -543,7 +546,10 @@ pub fn connect(src: &Rc<RefCell<SqliteSource>>, sort: AstOrdering) -> Rc<RefCell
 }
 
 /// Apply a change and propagate it to connected outputs (overlay then commit).
-pub fn source_push(src: &Rc<RefCell<SqliteSource>>, change: SourceChange) {
+/// A storage error propagates AFTER the overlay is cleared (pipelines saw a
+/// change that won't commit — the caller must roll back the surrounding
+/// replication transaction and halt, never commit the watermark over it).
+pub fn source_push(src: &Rc<RefCell<SqliteSource>>, change: SourceChange) -> anyhow::Result<()> {
     let epoch = {
         let mut s = src.borrow_mut();
         s.push_epoch += 1;
@@ -573,7 +579,7 @@ pub fn source_push(src: &Rc<RefCell<SqliteSource>>, change: SourceChange) {
     }
     let mut s = src.borrow_mut();
     s.overlay = None;
-    s.write_change(&change);
+    s.write_change(&change)
 }
 
 fn base_change(change: &SourceChange) -> Change {
@@ -815,15 +821,15 @@ impl SourceProvider for SqliteReplica {
 }
 
 impl crate::replica::ReplicaBackend for SqliteReplica {
-    fn apply(&self, event: crate::LogicalEvent) {
+    fn apply(&self, event: crate::LogicalEvent) -> anyhow::Result<()> {
         use crate::LogicalEvent as E;
         match event {
             E::Insert { table, row } => {
                 if let Some(src) = self.sources.get(&table) {
                     let existing = src.borrow().lookup(&row);
                     match existing {
-                        None => source_push(src, SourceChange::Add(row)),
-                        Some(old) => source_push(src, SourceChange::Edit { row, old_row: old }),
+                        None => source_push(src, SourceChange::Add(row))?,
+                        Some(old) => source_push(src, SourceChange::Edit { row, old_row: old })?,
                     }
                 }
             }
@@ -831,17 +837,36 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
                 if let Some(src) = self.sources.get(&table) {
                     let stored = src.borrow().lookup(&old_row);
                     if let Some(stored) = stored {
-                        source_push(src, SourceChange::Remove(stored));
+                        source_push(src, SourceChange::Remove(stored))?;
                     }
                 }
             }
-            E::Update { table, row, old_row } => {
+            E::Update { table, mut row, old_row } => {
                 if let Some(src) = self.sources.get(&table) {
                     let key = old_row.as_ref().unwrap_or(&row);
                     let existing = src.borrow().lookup(key);
                     match existing {
-                        Some(old) => source_push(src, SourceChange::Edit { row, old_row: old }),
-                        None => source_push(src, SourceChange::Add(row)),
+                        Some(old) => {
+                            // Unchanged-TOAST merge (apply side): columns the
+                            // stream omitted ('u') are absent from `row`; fill
+                            // them from the stored row. Without this the Edit's
+                            // DELETE + re-INSERT binds them as explicit NULL.
+                            row.merge_missing_from(&old);
+                            source_push(src, SourceChange::Edit { row, old_row: old })?
+                        }
+                        None => source_push(src, SourceChange::Add(row))?,
+                    }
+                }
+            }
+            E::Truncate { tables } => {
+                for table in tables {
+                    if let Some(src) = self.sources.get(&table) {
+                        // Remove every row THROUGH the pipelines so subscribed
+                        // queries and client caches converge (not just storage).
+                        let rows = src.borrow().all_rows();
+                        for row in rows {
+                            source_push(src, SourceChange::Remove(row))?;
+                        }
                     }
                 }
             }
@@ -857,11 +882,13 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
             }
             E::Begin | E::Commit | E::Other => {}
         }
+        Ok(())
     }
-    fn seed(&self, table: &str, row: Row) {
+    fn seed(&self, table: &str, row: Row) -> anyhow::Result<()> {
         if let Some(src) = self.sources.get(table) {
-            src.borrow().insert_initial(&row);
+            src.borrow().insert_initial(&row)?;
         }
+        Ok(())
     }
     fn table_columns(&self, table: &str) -> Vec<(String, ColumnType)> {
         self.columns.get(table).cloned().unwrap_or_default()
@@ -873,22 +900,30 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
             .collect()
     }
 
-    fn begin_txn(&self) {
+    fn begin_txn(&self) -> anyhow::Result<()> {
         // One SQLite transaction per upstream transaction: a crash mid-apply
         // rolls back on reopen instead of persisting a torn half-transaction.
-        let _ = self.conn.execute_batch("BEGIN IMMEDIATE");
+        // A failed BEGIN must propagate: applying in autocommit would tear.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
     }
 
-    fn commit_txn(&self, lsn: u64, pos: u64) {
-        // The watermark commits atomically WITH the rows it describes.
-        let _ = self
-            .conn
+    fn commit_txn(&self, lsn: u64, pos: u64) -> anyhow::Result<()> {
+        // The watermark commits atomically WITH the rows it describes. A
+        // failure here must propagate — acking WAL past an uncommitted
+        // watermark would lose the transaction on restart.
+        self.conn
             .prepare_cached(
                 "INSERT INTO orbit_replication_state (id, lsn, pos) VALUES (1, ?1, ?2)
                  ON CONFLICT (id) DO UPDATE SET lsn = excluded.lsn, pos = excluded.pos",
-            )
-            .and_then(|mut st| st.execute([lsn as i64, pos as i64]));
-        let _ = self.conn.execute_batch("COMMIT");
+            )?
+            .execute([lsn as i64, pos as i64])?;
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    fn rollback_txn(&self) {
+        let _ = self.conn.execute_batch("ROLLBACK");
     }
 
     fn resume_watermark(&self) -> Option<u64> {
@@ -1049,6 +1084,8 @@ impl rusqlite::ToSql for SqlVal {
                     ToSqlOutput::Owned(SqliteValue::Real(*n))
                 }
             }
+            // Exact 64-bit integers (beyond f64's 2^53) stay exact in SQLite.
+            Value::Int(i) => ToSqlOutput::Owned(SqliteValue::Integer(*i)),
             Value::String(s) => ToSqlOutput::Owned(SqliteValue::Text(s.clone())),
             Value::Json(j) => ToSqlOutput::Owned(SqliteValue::Text(j.to_string())),
         })
@@ -1062,7 +1099,8 @@ fn read_value(row: &rusqlite::Row, idx: usize, ty: ColumnType) -> Value {
         Ok(v) => match ty {
             ColumnType::Boolean => Value::Bool(v.as_i64().map(|i| i != 0).unwrap_or(false)),
             ColumnType::Number => match v {
-                ValueRef::Integer(i) => Value::Number(i as f64),
+                // Normalizing constructor: representable → Number, else exact Int.
+                ValueRef::Integer(i) => Value::int(i),
                 ValueRef::Real(f) => Value::Number(f),
                 ValueRef::Text(t) => std::str::from_utf8(t)
                     .ok()
@@ -1077,7 +1115,7 @@ fn read_value(row: &rusqlite::Row, idx: usize, ty: ColumnType) -> Value {
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
                     .map(Value::from_json)
                     .unwrap_or(Value::Null),
-                ValueRef::Integer(i) => Value::Number(i as f64),
+                ValueRef::Integer(i) => Value::int(i),
                 ValueRef::Real(f) => Value::Number(f),
                 _ => Value::Null,
             },

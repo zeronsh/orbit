@@ -193,9 +193,40 @@ pub async fn create_publication(client: &Client, name: &str, tables: &[&str]) ->
     Ok(())
 }
 
+/// Resolve the real Postgres type OID of each column by preparing an uncasted
+/// `SELECT` (no rows are fetched). The initial-sync SELECTs cast everything to
+/// text, which erases type information — this recovers it so snapshot rows are
+/// parsed with the SAME per-OID rules as streamed rows ([`pgoutput::parse_value`]).
+async fn table_column_oids(
+    client: &Client,
+    table: &str,
+    columns: &[(String, oql::ivm::ColumnType)],
+) -> Result<Vec<u32>> {
+    let select_cols = columns
+        .iter()
+        .map(|(c, _)| format!("\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT {} FROM \"{}\"", select_cols, table.replace('"', "\"\""));
+    let stmt = client.prepare(&sql).await?;
+    Ok(stmt.columns().iter().map(|c| c.type_().oid()).collect())
+}
+
+/// Parse one snapshot text value: per-OID when the OID's natural type agrees
+/// with the declared column type (the normal case — timestamps → epoch ms,
+/// arrays → json, big int8 → exact), otherwise by the declared type (a user
+/// override, e.g. a text column declared `json`).
+fn parse_synced_value(s: &str, oid: u32, declared: oql::ivm::ColumnType) -> oql::value::Value {
+    if pgoutput::column_type_for_oid(oid) == declared {
+        pgoutput::parse_value(s, oid)
+    } else {
+        parse_text_value(s, declared)
+    }
+}
+
 /// Seed a replica source with the current contents of its table (the initial
 /// snapshot). All columns are selected as text and parsed by the column's
-/// declared type, so this works for any column type without per-type binding.
+/// real type OID, so this works for any column type without per-type binding.
 ///
 /// Combined with [`Replica::apply`](crate::replica::Replica::apply)'s
 /// idempotency, this tolerates the small window between slot creation and the
@@ -208,6 +239,7 @@ pub async fn initial_sync(
     use oql::value::Value;
 
     let table = source.borrow().table_name().to_string();
+    let oids = table_column_oids(client, &table, columns).await?;
     let select_cols = columns
         .iter()
         .map(|(c, _)| format!("\"{0}\"::text AS \"{0}\"", c.replace('"', "\"\"")))
@@ -221,11 +253,11 @@ pub async fn initial_sync(
     let mut count = 0;
     for pg_row in &pg_rows {
         let mut row = oql::value::Row::new();
-        for (name, ty) in columns {
+        for (i, (name, ty)) in columns.iter().enumerate() {
             let text: Option<String> = pg_row.try_get(name.as_str()).ok().flatten();
             let value = match text {
                 None => Value::Null,
-                Some(s) => parse_text_value(&s, *ty),
+                Some(s) => parse_synced_value(&s, oids[i], *ty),
             };
             row.insert(name.as_str(), value);
         }
@@ -243,6 +275,7 @@ pub async fn select_all_rows(
     columns: &[(String, oql::ivm::ColumnType)],
 ) -> Result<Vec<oql::value::Row>> {
     use oql::value::Value;
+    let oids = table_column_oids(client, table, columns).await?;
     let select_cols = columns
         .iter()
         .map(|(c, _)| format!("\"{0}\"::text AS \"{0}\"", c.replace('"', "\"\"")))
@@ -253,11 +286,11 @@ pub async fn select_all_rows(
     let mut out = Vec::with_capacity(pg_rows.len());
     for pg_row in &pg_rows {
         let mut row = oql::value::Row::new();
-        for (name, ty) in columns {
+        for (i, (name, ty)) in columns.iter().enumerate() {
             let text: Option<String> = pg_row.try_get(name.as_str()).ok().flatten();
             let value = match text {
                 None => Value::Null,
-                Some(s) => parse_text_value(&s, *ty),
+                Some(s) => parse_synced_value(&s, oids[i], *ty),
             };
             row.insert(name.as_str(), value);
         }
@@ -276,6 +309,7 @@ pub async fn initial_sync_backend(
     use futures_util::TryStreamExt;
     use oql::value::Value;
     let columns = backend.table_columns(table);
+    let oids = table_column_oids(client, table, &columns).await?;
     let select_cols = columns
         .iter()
         .map(|(c, _)| format!("\"{0}\"::text AS \"{0}\"", c.replace('"', "\"\"")))
@@ -293,11 +327,14 @@ pub async fn initial_sync_backend(
     while let Some(pg_row) = stream.try_next().await? {
         let pg_row = &pg_row;
         let mut row = oql::value::Row::new();
-        for (name, ty) in &columns {
+        for (i, (name, ty)) in columns.iter().enumerate() {
             let text: Option<String> = pg_row.try_get(name.as_str()).ok().flatten();
-            row.insert(name.as_str(), text.map(|s| parse_text_value(&s, *ty)).unwrap_or(Value::Null));
+            row.insert(
+                name.as_str(),
+                text.map(|s| parse_synced_value(&s, oids[i], *ty)).unwrap_or(Value::Null),
+            );
         }
-        backend.seed(table, row);
+        backend.seed(table, row)?;
         count += 1;
     }
     Ok(count)

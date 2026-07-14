@@ -39,7 +39,7 @@ fn main() {
         t_src.borrow().insert_initial(&row(&[
             ("id", (i as i64).into()),
             ("n", (((i * 7919) % 1_000_000) as i64).into()),
-        ]));
+        ])).unwrap();
     }
     let load = t.elapsed();
 
@@ -60,7 +60,7 @@ fn main() {
         source_push(&t_src, SourceChange::Add(row(&[
             ("id", ((n + j) as i64).into()),
             ("n", (((j * 104_729) % 1_000_000) as i64).into()),
-        ])));
+        ]))).unwrap();
         catch.borrow_mut().take_changes();
     }
     let push = t.elapsed();
@@ -80,13 +80,13 @@ fn main() {
     let n_issues = 100usize;
     let t = Instant::now();
     for i in 0..n_issues {
-        issues.borrow().insert_initial(&row(&[("id", (i as i64).into())]));
+        issues.borrow().insert_initial(&row(&[("id", (i as i64).into())])).unwrap();
     }
     for i in 0..n {
         comments.borrow().insert_initial(&row(&[
             ("id", (i as i64).into()),
             ("issueID", ((i % n_issues) as i64).into()),
-        ]));
+        ])).unwrap();
     }
     let jload = t.elapsed();
 
@@ -112,7 +112,7 @@ fn main() {
         source_push(&comments, SourceChange::Add(row(&[
             ("id", ((n + j) as i64).into()),
             ("issueID", ((j % n_issues) as i64).into()),
-        ])));
+        ]))).unwrap();
         catch.borrow_mut().take_changes();
     }
     let jpush = t.elapsed();

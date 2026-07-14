@@ -142,7 +142,8 @@ fn shard_main(
         for t in &tables {
             replica.add_table(&t.name, t.columns.iter().cloned().collect(), t.primary_key.clone());
             for r in &t.seed {
-                replica.seed(&t.name, r.clone());
+                // In-memory seed is infallible (returns Ok for trait parity).
+                let _ = replica.seed(&t.name, r.clone());
             }
         }
         let replica = Rc::new(replica);
@@ -183,7 +184,7 @@ fn shard_main(
                 while let Some(ev) = events.recv().await {
                     let is_data = matches!(
                         ev,
-                        LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
+                        LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. } | LogicalEvent::Truncate { .. }
                     );
                     let is_commit = matches!(ev, LogicalEvent::Commit);
                     crate::server::capture_lmid(&ev, &lmids);

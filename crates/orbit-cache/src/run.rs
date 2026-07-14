@@ -285,14 +285,21 @@ async fn run_inner<B: ReplicaBackend + 'static>(
             // rolls back to empty-with-no-watermark (→ clean redo), and a
             // durable backend commits once instead of once per row. The
             // watermark stays unset (lsn 0) until the first replicated commit.
-            replica.begin_txn();
+            replica.begin_txn().context("opening initial-sync storage transaction")?;
             for t in &cfg.tables {
-                let n = initial_sync_backend(&pg, replica.as_ref(), &t.name)
+                let n = match initial_sync_backend(&pg, replica.as_ref(), &t.name)
                     .await
-                    .with_context(|| format!("initial sync of table {}", t.name))?;
+                    .with_context(|| format!("initial sync of table {}", t.name))
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        replica.rollback_txn();
+                        return Err(e);
+                    }
+                };
                 eprintln!("initial sync: {} rows from {}", n, t.name);
             }
-            replica.commit_txn(0, 0);
+            replica.commit_txn(0, 0).context("committing initial sync")?;
         }
     }
     let mutators = Rc::new(mutators);
@@ -343,20 +350,32 @@ async fn run_inner<B: ReplicaBackend + 'static>(
                 match stream.next_event().await {
                     Ok((lsn, LogicalEvent::Commit)) => {
                         if lsn > dedup_lsn {
-                            replica.begin_txn();
                             let mut dirty = false;
-                            for ev in txn_buf.drain(..) {
-                                if matches!(
-                                    ev,
-                                    LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
-                                ) {
-                                    dirty = true;
+                            // Apply errors (SQL failure in a durable backend) roll
+                            // back and halt cleanly: never commit a watermark over
+                            // a torn apply, never panic the serving thread.
+                            let applied = (|| -> anyhow::Result<()> {
+                                replica.begin_txn()?;
+                                for ev in txn_buf.drain(..) {
+                                    if matches!(
+                                        ev,
+                                        LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. } | LogicalEvent::Truncate { .. }
+                                    ) {
+                                        dirty = true;
+                                    }
+                                    crate::server::capture_lmid(&ev, &lmids);
+                                    replica.apply(ev)?;
                                 }
-                                crate::server::capture_lmid(&ev, &lmids);
-                                replica.apply(ev);
+                                replica.apply(LogicalEvent::Commit)?;
+                                replica.commit_txn(lsn, 0)?;
+                                Ok(())
+                            })();
+                            if let Err(e) = applied {
+                                replica.rollback_txn();
+                                eprintln!("replica apply error at lsn {lsn}: {e:#}; rolled back; exiting to re-sync (restart me)");
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                std::process::exit(1);
                             }
-                            replica.apply(LogicalEvent::Commit);
-                            replica.commit_txn(lsn, 0);
                             dedup_lsn = lsn;
                             if dirty {
                                 let _ = ticks_tx.send(());
@@ -515,7 +534,7 @@ impl SnapshotStrategy for JsonSnapshots {
                 let snap = ReplicaSnapshot::from_bytes(&bytes)?;
                 for (table, rows) in snap.tables {
                     for row in rows {
-                        replica.seed(&table, row);
+                        replica.seed(&table, row)?;
                     }
                 }
                 eprintln!("view-syncer restored snapshot @ pos {}", snap.pos);
@@ -861,14 +880,21 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
         );
     } else {
         replica.start_fresh();
-        replica.begin_txn();
+        replica.begin_txn().context("opening initial-sync storage transaction")?;
         for t in &cfg.tables {
-            let n = initial_sync_backend(&pg, replica.as_ref(), &t.name)
+            let n = match initial_sync_backend(&pg, replica.as_ref(), &t.name)
                 .await
-                .with_context(|| format!("initial sync of table {}", t.name))?;
+                .with_context(|| format!("initial sync of table {}", t.name))
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    replica.rollback_txn();
+                    return Err(e);
+                }
+            };
             eprintln!("initial sync: {} rows from {}", n, t.name);
         }
-        replica.commit_txn(0, start_seq);
+        replica.commit_txn(0, start_seq).context("committing initial sync")?;
     }
 
     // Ring/broadcast tuning from ORBIT_CHANGE_RING_BYTES / ORBIT_CHANGE_RING_CAPACITY /
@@ -1015,12 +1041,24 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
                     // over newer state.
                     let publish = lsn > dedup_lsn;
                     let apply = lsn > apply_watermark;
+                    // Apply errors are fatal (rollback + clean error return):
+                    // never commit a watermark over a torn apply, never panic.
+                    let halt = |err: anyhow::Error| -> anyhow::Error {
+                        replica.rollback_txn();
+                        err.context(format!(
+                            "replica apply failed at lsn {lsn}; rolled back (restart to re-sync)"
+                        ))
+                    };
                     if apply {
-                        replica.begin_txn();
+                        if let Err(e) = replica.begin_txn() {
+                            return Err(halt(e));
+                        }
                     }
                     for (l, e) in txn_buf.drain(..) {
                         if apply {
-                            replica.apply(e.clone());
+                            if let Err(err) = replica.apply(e.clone()) {
+                                return Err(halt(err));
+                            }
                         }
                         if publish {
                             // Awaits only when the durable log's byte budget is
@@ -1034,14 +1072,18 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
                         dedup_lsn = lsn;
                     }
                     if apply {
-                        replica.apply(LogicalEvent::Commit);
+                        if let Err(err) = replica.apply(LogicalEvent::Commit) {
+                            return Err(halt(err));
+                        }
                         // The pump is single-threaded, so right after
                         // publishing, `current_seq()` is exactly this commit's
                         // stream position. On a publish-skip replay, carry the
                         // previous position (a safe, idempotent resume point).
                         let pos =
                             if publish { server.current_seq() } else { last_committed_pos };
-                        replica.commit_txn(lsn, pos);
+                        if let Err(err) = replica.commit_txn(lsn, pos) {
+                            return Err(halt(err));
+                        }
                         apply_watermark = lsn;
                         last_committed_pos = pos;
                     }
@@ -1248,19 +1290,31 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
                             // a durable backend records its applied position
                             // (`commit_txn(0, watermark)`) atomically with the
                             // rows, enabling delta resume from the local file.
-                            replica.begin_txn();
-                            for (p, ev) in txn_buf.drain(..) {
-                                if matches!(
-                                    ev,
-                                    LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
-                                ) {
-                                    dirty = true;
+                            let applied = (|| -> anyhow::Result<()> {
+                                replica.begin_txn()?;
+                                for (p, ev) in txn_buf.drain(..) {
+                                    if matches!(
+                                        ev,
+                                        LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. } | LogicalEvent::Truncate { .. }
+                                    ) {
+                                        dirty = true;
+                                    }
+                                    crate::server::capture_lmid(&ev, &lmids);
+                                    replica.apply(ev)?;
+                                    watermark = p;
                                 }
-                                crate::server::capture_lmid(&ev, &lmids);
-                                replica.apply(ev);
-                                watermark = p;
+                                replica.commit_txn(0, watermark)?;
+                                Ok(())
+                            })();
+                            if let Err(e) = applied {
+                                // Same crash-only policy as Reset: rollback,
+                                // exit, restore fresh — never serve a torn or
+                                // silently-stale replica.
+                                replica.rollback_txn();
+                                eprintln!("replica apply error: {e:#}; rolled back; exiting to re-restore snapshot");
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                std::process::exit(1);
                             }
-                            replica.commit_txn(0, watermark);
                             replica_pos.set(watermark);
                             metrics.replica_pos.store(watermark, std::sync::atomic::Ordering::Relaxed);
                             // Mixed-version fallback: an old replicator never

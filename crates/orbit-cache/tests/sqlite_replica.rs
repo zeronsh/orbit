@@ -26,8 +26,8 @@ fn cols() -> BTreeMap<String, ColumnType> {
 #[test]
 fn ivm_over_sqlite_source() {
     let src = SqliteSource::new("task", cols(), vec!["id".into()]);
-    src.borrow().insert_initial(&row(&[("id", "t1".into()), ("done", false.into())]));
-    src.borrow().insert_initial(&row(&[("id", "t2".into()), ("done", true.into())]));
+    src.borrow().insert_initial(&row(&[("id", "t1".into()), ("done", false.into())])).expect("insert");
+    src.borrow().insert_initial(&row(&[("id", "t2".into()), ("done", true.into())])).expect("insert");
 
     let mut provider = SqliteProvider::new();
     provider.add(src.clone());
@@ -47,7 +47,7 @@ fn ivm_over_sqlite_source() {
     assert_eq!(ids, vec!["t1".into()]);
 
     // Live insert of an open task -> incremental Add + persisted.
-    source_push(&src, oql::ivm::SourceChange::Add(row(&[("id", "t3".into()), ("done", false.into())])));
+    source_push(&src, oql::ivm::SourceChange::Add(row(&[("id", "t3".into()), ("done", false.into())]))).unwrap();
     let changes = catch.borrow_mut().take_changes();
     assert!(changes.iter().any(|c| matches!(c, oql::ivm::Change::Add(n) if n.row["id"] == "t3".into())));
     let ids: Vec<Value> = catch.borrow().fetch().iter().map(|n| n.row["id"].clone()).collect();
@@ -60,7 +60,7 @@ fn ivm_over_sqlite_source() {
             row: row(&[("id", "t1".into()), ("done", true.into())]),
             old_row: row(&[("id", "t1".into()), ("done", false.into())]),
         },
-    );
+    ).unwrap();
     let _ = catch.borrow_mut().take_changes();
     let ids: Vec<Value> = catch.borrow().fetch().iter().map(|n| n.row["id"].clone()).collect();
     assert_eq!(ids, vec!["t3".into()]);
@@ -113,12 +113,12 @@ fn sqlite_replica_backend_applies_events() {
     };
 
     // Insert two tasks (one done) via replication events.
-    replica.apply(LogicalEvent::Insert { table: "task".into(), row: row(&[("id", "t1".into()), ("done", false.into())]) });
-    replica.apply(LogicalEvent::Insert { table: "task".into(), row: row(&[("id", "t2".into()), ("done", true.into())]) });
+    replica.apply(LogicalEvent::Insert { table: "task".into(), row: row(&[("id", "t1".into()), ("done", false.into())]) }).unwrap();
+    replica.apply(LogicalEvent::Insert { table: "task".into(), row: row(&[("id", "t2".into()), ("done", true.into())]) }).unwrap();
     assert_eq!(ids(&catch), vec!["t1"]);
 
     // Idempotent: re-applying the same insert (snapshot overlap) must not dup.
-    replica.apply(LogicalEvent::Insert { table: "task".into(), row: row(&[("id", "t1".into()), ("done", false.into())]) });
+    replica.apply(LogicalEvent::Insert { table: "task".into(), row: row(&[("id", "t1".into()), ("done", false.into())]) }).unwrap();
     assert_eq!(ids(&catch), vec!["t1"]);
 
     // Update t1 -> done -> drops out of the filter.
@@ -126,7 +126,7 @@ fn sqlite_replica_backend_applies_events() {
         table: "task".into(),
         row: row(&[("id", "t1".into()), ("done", true.into())]),
         old_row: Some(row(&[("id", "t1".into()), ("done", false.into())])),
-    });
+    }).unwrap();
     assert!(ids(&catch).is_empty());
 }
 
@@ -140,8 +140,8 @@ fn sqlite_replica_persists_across_reopen() {
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         let src = SqliteSource::with_connection(conn, "task", cols(), vec!["id".into()]);
-        source_push(&src, oql::ivm::SourceChange::Add(row(&[("id", "p1".into()), ("done", false.into())])));
-        source_push(&src, oql::ivm::SourceChange::Add(row(&[("id", "p2".into()), ("done", true.into())])));
+        source_push(&src, oql::ivm::SourceChange::Add(row(&[("id", "p1".into()), ("done", false.into())]))).unwrap();
+        source_push(&src, oql::ivm::SourceChange::Add(row(&[("id", "p2".into()), ("done", true.into())]))).unwrap();
     }
 
     // Second "process": reopen the same file; the rows are still there.
@@ -181,16 +181,16 @@ fn durable_transactions_are_atomic_across_tables_and_crashes() {
         replica.add_table("b", item_cols(), vec!["id".into()]);
 
         // Txn 1: rows in BOTH tables, committed with watermark 10.
-        replica.begin_txn();
-        replica.apply(LogicalEvent::Insert { table: "a".into(), row: row(&[("id", "a1".into()), ("n", 1.0.into())]) });
-        replica.apply(LogicalEvent::Insert { table: "b".into(), row: row(&[("id", "b1".into()), ("n", 1.0.into())]) });
-        replica.commit_txn(10, 0);
+        replica.begin_txn().unwrap();
+        replica.apply(LogicalEvent::Insert { table: "a".into(), row: row(&[("id", "a1".into()), ("n", 1.0.into())]) }).unwrap();
+        replica.apply(LogicalEvent::Insert { table: "b".into(), row: row(&[("id", "b1".into()), ("n", 1.0.into())]) }).unwrap();
+        replica.commit_txn(10, 0).unwrap();
 
         // Txn 2: applied but NEVER committed — the "crash" is dropping the
         // replica (and its connection) with the transaction open.
-        replica.begin_txn();
-        replica.apply(LogicalEvent::Insert { table: "a".into(), row: row(&[("id", "a2".into()), ("n", 2.0.into())]) });
-        replica.apply(LogicalEvent::Insert { table: "b".into(), row: row(&[("id", "b2".into()), ("n", 2.0.into())]) });
+        replica.begin_txn().unwrap();
+        replica.apply(LogicalEvent::Insert { table: "a".into(), row: row(&[("id", "a2".into()), ("n", 2.0.into())]) }).unwrap();
+        replica.apply(LogicalEvent::Insert { table: "b".into(), row: row(&[("id", "b2".into()), ("n", 2.0.into())]) }).unwrap();
     }
 
     // Reopen: txn 1 present in both tables, txn 2 fully rolled back, watermark = 10.
@@ -219,9 +219,9 @@ fn start_fresh_clears_stale_rows_and_watermark() {
     {
         let mut replica = SqliteReplica::durable(&dir);
         replica.add_table("t", item_cols(), vec!["id".into()]);
-        replica.begin_txn();
-        replica.apply(LogicalEvent::Insert { table: "t".into(), row: row(&[("id", "stale".into()), ("n", 1.0.into())]) });
-        replica.commit_txn(7, 0);
+        replica.begin_txn().unwrap();
+        replica.apply(LogicalEvent::Insert { table: "t".into(), row: row(&[("id", "stale".into()), ("n", 1.0.into())]) }).unwrap();
+        replica.commit_txn(7, 0).unwrap();
     }
 
     // "Restart" that decides on a fresh sync (e.g. watermark policy change):
@@ -233,9 +233,9 @@ fn start_fresh_clears_stale_rows_and_watermark() {
     assert!(t.borrow().all_rows().is_empty(), "stale rows cleared (no phantoms)");
 
     // Re-seed as initial sync would, then verify only the new state exists.
-    replica.begin_txn();
-    replica.seed("t", row(&[("id", "current".into()), ("n", 2.0.into())]));
-    replica.commit_txn(0, 0);
+    replica.begin_txn().unwrap();
+    replica.seed("t", row(&[("id", "current".into()), ("n", 2.0.into())])).expect("seed");
+    replica.commit_txn(0, 0).unwrap();
     let rows = t.borrow().all_rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], "current".into());
@@ -256,9 +256,9 @@ fn pos_watermark_roundtrip_and_start_fresh() {
     {
         let mut replica = SqliteReplica::durable(&dir);
         replica.add_table("t", item_cols(), vec!["id".into()]);
-        replica.begin_txn();
-        replica.apply(LogicalEvent::Insert { table: "t".into(), row: row(&[("id", "x".into()), ("n", 1.0.into())]) });
-        replica.commit_txn(42, 777);
+        replica.begin_txn().unwrap();
+        replica.apply(LogicalEvent::Insert { table: "t".into(), row: row(&[("id", "x".into()), ("n", 1.0.into())]) }).unwrap();
+        replica.commit_txn(42, 777).unwrap();
     }
 
     let mut replica = SqliteReplica::durable(&dir);
@@ -284,14 +284,14 @@ async fn backup_to_copies_rows_and_watermark_while_open() {
 
     let mut replica = SqliteReplica::durable(&dir);
     replica.add_table("t", item_cols(), vec!["id".into()]);
-    replica.begin_txn();
+    replica.begin_txn().unwrap();
     for i in 0..50 {
         replica.apply(LogicalEvent::Insert {
             table: "t".into(),
             row: row(&[("id", format!("r{i}").as_str().into()), ("n", (i as f64).into())]),
-        });
+        }).unwrap();
     }
-    replica.commit_txn(9, 123);
+    replica.commit_txn(9, 123).unwrap();
 
     // Source connection still open (replica alive) during the backup.
     SqliteReplica::backup_to(replica.db_path().unwrap().to_owned(), dest.clone()).await.unwrap();
@@ -337,8 +337,8 @@ fn pre_pos_schema_migrates_in_place() {
     replica.add_table("t", item_cols(), vec!["id".into()]);
     assert_eq!(replica.resume_watermark(), Some(55), "old lsn survives migration");
     assert_eq!(replica.resume_pos(), None, "migrated pos defaults to 0 (= None)");
-    replica.begin_txn();
-    replica.commit_txn(56, 900);
+    replica.begin_txn().unwrap();
+    replica.commit_txn(56, 900).unwrap();
     assert_eq!(replica.resume_pos(), Some(900));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -365,7 +365,7 @@ fn relation_event_reconciles_sqlite_table() {
     replica.apply(LogicalEvent::Insert {
         table: "gadget".into(),
         row: row(&[("id", "g1".into()), ("a", "x".into()), ("b", "y".into())]),
-    });
+    }).unwrap();
 
     // A filtered query over `b` — its connect lazily creates an index on `b`,
     // which would block DROP COLUMN without the reconcile's index sweep.
@@ -391,13 +391,13 @@ fn relation_event_reconciles_sqlite_table() {
             ("a".to_string(), ColumnType::String),
             ("c".to_string(), ColumnType::String),
         ],
-    });
+    }).unwrap();
 
     // A row using the new shape replicates cleanly.
     replica.apply(LogicalEvent::Insert {
         table: "gadget".into(),
         row: row(&[("id", "g2".into()), ("a", "z".into()), ("c", "new".into())]),
-    });
+    }).unwrap();
 
     let rows = src.borrow().all_rows();
     assert_eq!(rows.len(), 2);

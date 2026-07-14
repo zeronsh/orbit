@@ -61,6 +61,8 @@ pub fn capture_lmid(ev: &crate::LogicalEvent, lmids: &LmidMap) -> bool {
     };
     let id = match row.get("last_mutation_id") {
         Some(Value::Number(n)) => *n as u64,
+        // int8 column: values beyond 2^53 arrive as exact Ints.
+        Some(Value::Int(i)) => *i as u64,
         _ => return false,
     };
     let mut map = lmids.borrow_mut();

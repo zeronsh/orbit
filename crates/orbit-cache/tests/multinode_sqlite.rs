@@ -262,13 +262,13 @@ async fn write_snapshot_via_strategy<O: ObjectStore>(store: &O, work: &std::path
         vec![("id".into(), ColumnType::String), ("n".into(), ColumnType::Number)],
         vec!["id".into()],
     );
-    replica.begin_txn();
+    replica.begin_txn().unwrap();
     let row: oql::value::Row =
         [("id".to_string(), Value::String("s1".into())), ("n".to_string(), Value::Number(1.0))]
             .into_iter()
             .collect();
-    replica.apply(LogicalEvent::Insert { table: "mns_item".into(), row });
-    replica.commit_txn(1, pos);
+    replica.apply(LogicalEvent::Insert { table: "mns_item".into(), row }).unwrap();
+    replica.commit_txn(1, pos).unwrap();
     let strat = SqliteSnapshots { cfg: SqliteClusterConfig::new(work) };
     strat.write(store, &replica, pos).await.unwrap();
 }
@@ -295,8 +295,8 @@ async fn restore_short_circuits_snapshot_download() {
 
     // The node applies further txns, recording its own progress.
     use orbit_cache::ReplicaBackend;
-    replica.begin_txn();
-    replica.commit_txn(0, 45);
+    replica.begin_txn().unwrap();
+    replica.commit_txn(0, 45).unwrap();
     drop(replica);
 
     // Restart: the local replica.db short-circuits — same strategy, ZERO new

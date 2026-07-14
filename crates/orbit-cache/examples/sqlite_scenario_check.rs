@@ -98,12 +98,13 @@ fn run_scenario(g: &Golden) -> Result<(), String> {
         let src = replica.source(&p.table).expect("source");
         let row = json_to_row(&p.row);
         match p.op.as_str() {
-            "add" => source_push(&src, SourceChange::Add(row)),
-            "remove" => source_push(&src, SourceChange::Remove(row)),
+            "add" => source_push(&src, SourceChange::Add(row)).expect("push"),
+            "remove" => source_push(&src, SourceChange::Remove(row)).expect("push"),
             "edit" => source_push(
                 &src,
                 SourceChange::Edit { row, old_row: json_to_row(p.old_row.as_ref().expect("oldRow")) },
-            ),
+            )
+            .expect("push"),
             other => return Err(format!("unknown op {other}")),
         }
         catch.borrow_mut().take_changes();
