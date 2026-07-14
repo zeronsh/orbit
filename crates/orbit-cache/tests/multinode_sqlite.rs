@@ -250,6 +250,9 @@ impl ObjectStore for &CountingStore {
         self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.get_stream(key).await
     }
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete(key).await
+    }
 }
 
 /// Build a snapshot object by writing a small durable replica and backing it up
@@ -269,7 +272,7 @@ async fn write_snapshot_via_strategy<O: ObjectStore>(store: &O, work: &std::path
             .collect();
     replica.apply(LogicalEvent::Insert { table: "mns_item".into(), row }).unwrap();
     replica.commit_txn(1, pos).unwrap();
-    let strat = SqliteSnapshots { cfg: SqliteClusterConfig::new(work) };
+    let strat = SqliteSnapshots::new(SqliteClusterConfig::new(work));
     strat.write(store, &replica, pos).await.unwrap();
 }
 
@@ -286,7 +289,7 @@ async fn restore_short_circuits_snapshot_download() {
     write_snapshot_via_strategy(&&store, &base.join("writer"), 41).await;
 
     let node_dir = base.join("node");
-    let strat = SqliteSnapshots { cfg: SqliteClusterConfig::new(&node_dir) };
+    let strat = SqliteSnapshots::new(SqliteClusterConfig::new(&node_dir));
 
     // First boot: downloads (1 streamed GET) and restores at the file's pos.
     let (replica, pos) = strat.restore(&&store, &cfg(WS_A)).await.unwrap();
@@ -301,7 +304,7 @@ async fn restore_short_circuits_snapshot_download() {
 
     // Restart: the local replica.db short-circuits — same strategy, ZERO new
     // downloads, resumes at the locally-recorded pos.
-    let strat2 = SqliteSnapshots { cfg: SqliteClusterConfig::new(&node_dir) };
+    let strat2 = SqliteSnapshots::new(SqliteClusterConfig::new(&node_dir));
     let (_replica, pos2) = strat2.restore(&&store, &cfg(WS_A)).await.unwrap();
     assert_eq!(pos2, 45, "resumes from locally-recorded progress");
     assert_eq!(
@@ -313,7 +316,7 @@ async fn restore_short_circuits_snapshot_download() {
     // invalidate_local drops the file → the next restore downloads again.
     strat2.invalidate_local();
     assert!(!node_dir.join("replica.db").exists());
-    let strat3 = SqliteSnapshots { cfg: SqliteClusterConfig::new(&node_dir) };
+    let strat3 = SqliteSnapshots::new(SqliteClusterConfig::new(&node_dir));
     let (_replica, pos3) = strat3.restore(&&store, &cfg(WS_A)).await.unwrap();
     assert_eq!(pos3, 41, "fresh restore comes from the stored snapshot");
     assert_eq!(store.gets.load(std::sync::atomic::Ordering::Relaxed), 2);
@@ -332,7 +335,7 @@ async fn corrupt_snapshot_is_rejected_then_recovers() {
     store.put("snapshot/latest.db", b"this is not a sqlite file".to_vec()).await.unwrap();
 
     let node_dir = base.join("node");
-    let strat = std::rc::Rc::new(SqliteSnapshots { cfg: SqliteClusterConfig::new(&node_dir) });
+    let strat = std::rc::Rc::new(SqliteSnapshots::new(SqliteClusterConfig::new(&node_dir)));
 
     let local = tokio::task::LocalSet::new();
     local

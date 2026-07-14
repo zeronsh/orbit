@@ -608,6 +608,14 @@ pub struct SqliteClusterConfig {
     /// Multipart part & buffer size for snapshot upload/download — the memory
     /// ceiling of a snapshot transfer is ~2× this. Default 8 MiB.
     pub snapshot_part_size: usize,
+    /// Incremental (WAL-segment) backups: each cycle ships only the WAL bytes
+    /// appended since the last one, instead of re-uploading the whole replica
+    /// file (`ORBIT_BACKUP=full` opts out). Default on.
+    pub backup_incremental: bool,
+    /// WAL size that triggers a generation roll (checkpoint + fresh full
+    /// upload) under incremental backups. Bounds both local WAL growth and
+    /// restore replay length. Default 64 MiB (`ORBIT_BACKUP_MAX_WAL_MB`).
+    pub max_wal_bytes: u64,
 }
 
 impl SqliteClusterConfig {
@@ -616,6 +624,8 @@ impl SqliteClusterConfig {
             dir: dir.into(),
             opts: crate::sqlite_source::SqliteReplicaOpts::default(),
             snapshot_part_size: 8 << 20,
+            backup_incremental: true,
+            max_wal_bytes: 64 << 20,
         }
     }
 }
@@ -626,6 +636,68 @@ impl SqliteClusterConfig {
 /// multipart with O(part_size) memory and restored straight to disk.
 pub struct SqliteSnapshots {
     pub cfg: SqliteClusterConfig,
+    /// Incremental-backup shipping state for the current generation
+    /// (replicator-side; view-syncers only restore). `RefCell`: strategies
+    /// live on a single-thread `LocalSet` behind an `Rc`.
+    ship: std::cell::RefCell<Option<crate::walship::ShipState>>,
+}
+
+impl SqliteSnapshots {
+    pub fn new(cfg: SqliteClusterConfig) -> Self {
+        SqliteSnapshots { cfg, ship: std::cell::RefCell::new(None) }
+    }
+
+    /// One incremental-backup cycle (audit Tier 1.4). First call per process
+    /// rolls a generation: checkpoint + ONE full upload. Every later call
+    /// ships only the WAL bytes committed since the previous cycle — a 50 GB
+    /// replica no longer re-ships 50 GB per interval. Rolls a new generation
+    /// when the shipped WAL exceeds `max_wal_bytes` (bounding local WAL growth
+    /// and restore replay) or when the WAL restarted outside our control.
+    async fn write_incremental<O: ObjectStore>(
+        &self,
+        store: &O,
+        replica: &crate::sqlite_source::SqliteReplica,
+        db: &std::path::Path,
+        pos: u64,
+    ) -> Result<u64> {
+        use crate::walship::{self, ShipOutcome};
+        // Manual checkpoint control: the base file must stay byte-stable
+        // between generation rolls. Idempotent and cheap.
+        replica.set_wal_autocheckpoint(0)?;
+        let roll = |prev: Option<crate::walship::BackupManifest>| async move {
+            replica.checkpoint_truncate().context("checkpoint before generation roll")?;
+            walship::new_generation(store, db, pos, self.cfg.snapshot_part_size, prev.as_ref())
+                .await
+        };
+        let current = self.ship.borrow_mut().take();
+        let (state, shipped) = match current {
+            None => {
+                let state = roll(None).await?;
+                let n = std::fs::metadata(db).map(|m| m.len()).unwrap_or(0);
+                (state, n)
+            }
+            Some(mut state) => {
+                if state.shipped_offset > self.cfg.max_wal_bytes {
+                    let prev = state.manifest().clone();
+                    let state = roll(Some(prev)).await?;
+                    let n = std::fs::metadata(db).map(|m| m.len()).unwrap_or(0);
+                    (state, n)
+                } else {
+                    match walship::ship(store, db, &mut state, pos).await? {
+                        ShipOutcome::Shipped { bytes } => (state, bytes),
+                        ShipOutcome::NeedsNewGeneration => {
+                            let prev = state.manifest().clone();
+                            let state = roll(Some(prev)).await?;
+                            let n = std::fs::metadata(db).map(|m| m.len()).unwrap_or(0);
+                            (state, n)
+                        }
+                    }
+                }
+            }
+        };
+        *self.ship.borrow_mut() = Some(state);
+        Ok(shipped)
+    }
 }
 
 /// The object key holding the latest SQLite snapshot file…
@@ -700,6 +772,9 @@ impl SnapshotStrategy for SqliteSnapshots {
             .db_path()
             .context("file snapshots need a durable (file-backed) replica")?
             .to_owned();
+        if self.cfg.backup_incremental {
+            return self.write_incremental(store, replica, &src, pos).await;
+        }
         // Unique staging name: deploy overlap means two replicators may
         // snapshot concurrently into the same volume.
         let tmp = self.cfg.dir.join(format!(
@@ -726,6 +801,10 @@ impl SnapshotStrategy for SqliteSnapshots {
     }
 
     async fn stored_pos<O: ObjectStore>(&self, store: &O) -> Result<Option<u64>> {
+        // Incremental manifest first; legacy full-snapshot pos as fallback.
+        if let Some(m) = crate::walship::load_manifest(store).await? {
+            return Ok(Some(m.pos_hint));
+        }
         Ok(store
             .get(SQLITE_SNAPSHOT_POS_KEY)
             .await?
@@ -779,7 +858,15 @@ impl SnapshotStrategy for SqliteSnapshots {
         }
         let tmp = self.cfg.dir.join(format!("replica.db.tmp.{}", std::process::id()));
         loop {
-            match crate::objectstore::get_to_file(store, SQLITE_SNAPSHOT_KEY, &tmp).await {
+            // Incremental backups: assemble base + WAL segments from the
+            // manifest. Falls back to the legacy full-snapshot object when no
+            // manifest exists (older replicator still running).
+            let fetched = match crate::walship::restore(store, &tmp).await {
+                Ok(true) => Ok(true),
+                Ok(false) => crate::objectstore::get_to_file(store, SQLITE_SNAPSHOT_KEY, &tmp).await,
+                Err(e) => Err(e),
+            };
+            match fetched {
                 Ok(true) => match validate_sqlite_snapshot(tmp.clone()).await {
                     Ok(pos) => {
                         self.invalidate_local();
@@ -876,7 +963,7 @@ pub async fn run_replicator_sqlite<O: ObjectStore + 'static>(
             store,
             change_stream_addr,
             snapshot_interval,
-            Rc::new(SqliteSnapshots { cfg: sqlite }),
+            Rc::new(SqliteSnapshots::new(sqlite)),
             replica,
         ))
         .await
@@ -1064,6 +1151,11 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
     }
 
     // Periodic snapshot loop — captures the current change-stream position.
+    // Fixed cadence (a slow cycle doesn't silently degrade the interval to
+    // duration + interval), with a lag warning and WEDGE DETECTION: if no
+    // backup has succeeded for max(5×interval, 5 min), the node crashes out —
+    // silently running without restorable backups is the worst failure mode
+    // (mirrors Zero's litestream backup monitor).
     {
         let store = store.clone();
         let replica = replica.clone();
@@ -1071,13 +1163,45 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
         let snap = snap.clone();
         let m = metrics.clone();
         spawn_local(async move {
+            let wedge_limit = snapshot_interval
+                .saturating_mul(5)
+                .max(Duration::from_secs(300));
+            let mut ticker = tokio::time::interval(snapshot_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // first tick fires immediately; boot already snapshotted
+            let mut last_success = tokio::time::Instant::now();
             loop {
-                tokio::time::sleep(snapshot_interval).await;
+                ticker.tick().await;
                 let pos = server.current_seq();
+                let started = tokio::time::Instant::now();
                 match snap.write(store.as_ref(), replica.as_ref(), pos).await {
-                    Ok(n) => m.snapshot_bytes.store(n, std::sync::atomic::Ordering::Relaxed),
-                    Err(e) => eprintln!("snapshot failed: {e:#}"),
+                    Ok(n) => {
+                        m.snapshot_bytes.store(n, std::sync::atomic::Ordering::Relaxed);
+                        last_success = tokio::time::Instant::now();
+                        let took = started.elapsed();
+                        if took > snapshot_interval {
+                            eprintln!(
+                                "backup cycle took {took:?} (> interval {snapshot_interval:?}); cadence is lagging"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("backup cycle failed: {e:#}");
+                        if last_success.elapsed() > wedge_limit {
+                            eprintln!(
+                                "backup wedged: no successful backup for {:?} (> {:?}); exiting so the orchestrator restarts with a fresh generation",
+                                last_success.elapsed(),
+                                wedge_limit
+                            );
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            std::process::exit(1);
+                        }
+                    }
                 }
+                m.snapshot_age_seconds.store(
+                    last_success.elapsed().as_secs(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         });
     }
@@ -1241,7 +1365,7 @@ pub async fn run_view_syncer_sqlite<O: ObjectStore + 'static>(
             change_stream_addr,
             mutators,
             queries,
-            Rc::new(SqliteSnapshots { cfg: sqlite }),
+            Rc::new(SqliteSnapshots::new(sqlite)),
         ))
         .await
 }

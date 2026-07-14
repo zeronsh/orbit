@@ -63,6 +63,8 @@ pub struct Metrics {
 
     // Snapshots.
     pub snapshot_bytes: AtomicU64,
+    /// Seconds since the last successful backup cycle (wedge indicator).
+    pub snapshot_age_seconds: AtomicU64,
     pub snapshot_restore_peak_rss_bytes: AtomicU64,
 
     // Change stream (replicator).
@@ -96,6 +98,7 @@ impl Metrics {
             replica_sqlite_file_bytes: Default::default(),
             replica_pos: Default::default(),
             snapshot_bytes: Default::default(),
+            snapshot_age_seconds: Default::default(),
             snapshot_restore_peak_rss_bytes: Default::default(),
             change_ring_entries: Default::default(),
             change_ring_bytes: Default::default(),
@@ -149,6 +152,7 @@ impl Metrics {
         gauge("orbit_replica_sqlite_file_bytes", "Size of the SQLite replica database", self.replica_sqlite_file_bytes.load(Ordering::Relaxed));
         gauge("orbit_replica_pos", "Applied change-stream position", self.replica_pos.load(Ordering::Relaxed));
         gauge("orbit_snapshot_bytes", "Size of the last written/restored snapshot", self.snapshot_bytes.load(Ordering::Relaxed));
+        gauge("orbit_snapshot_age_seconds", "Seconds since the last successful backup cycle", self.snapshot_age_seconds.load(Ordering::Relaxed));
         gauge("orbit_snapshot_restore_peak_rss_bytes", "Peak RSS observed during snapshot restore", self.snapshot_restore_peak_rss_bytes.load(Ordering::Relaxed));
         gauge("orbit_change_ring_entries", "Events in the change-stream ring", self.change_ring_entries.load(Ordering::Relaxed));
         gauge("orbit_change_ring_bytes", "Estimated bytes in the change-stream ring", self.change_ring_bytes.load(Ordering::Relaxed));

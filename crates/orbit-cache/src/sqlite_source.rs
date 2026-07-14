@@ -780,6 +780,27 @@ impl SqliteReplica {
         self.path.as_deref()
     }
 
+    /// Set `PRAGMA wal_autocheckpoint` (0 disables). Incremental WAL-shipping
+    /// backups take manual control of checkpoints: the main db file must stay
+    /// byte-stable between generation rolls so only the WAL carries changes.
+    pub fn set_wal_autocheckpoint(&self, frames: i64) -> anyhow::Result<()> {
+        self.conn.pragma_update(None, "wal_autocheckpoint", frames)?;
+        Ok(())
+    }
+
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)`: fold the whole WAL into the main
+    /// file and reset the WAL to empty. Errors if the checkpoint could not
+    /// complete (e.g. a concurrent reader pinned the WAL).
+    pub fn checkpoint_truncate(&self) -> anyhow::Result<()> {
+        let (busy, _log, _ckpt): (i64, i64, i64) = self.conn.query_row(
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        anyhow::ensure!(busy == 0, "wal_checkpoint(TRUNCATE) blocked (busy)");
+        Ok(())
+    }
+
     fn with_connection(
         conn: Connection,
         path: Option<std::path::PathBuf>,

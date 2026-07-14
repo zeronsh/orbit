@@ -28,6 +28,7 @@ pub mod server;
 pub mod sharded;
 pub mod sqlite_source;
 pub mod view_sync;
+pub mod walship;
 
 pub use changestream::{ChangeMsg, ChangeStreamClient, ChangeStreamConfig, ChangeStreamServer};
 pub use metrics::{Metrics, ReadyComponent, Role};

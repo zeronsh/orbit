@@ -134,6 +134,10 @@ async fn main() -> anyhow::Result<()> {
         };
         let part_mb: usize = env("ORBIT_SNAPSHOT_PART_MB", "8").parse().unwrap_or(8);
         c.snapshot_part_size = part_mb.max(1) << 20;
+        // ORBIT_BACKUP=full opts out of incremental WAL-segment backups.
+        c.backup_incremental = env("ORBIT_BACKUP", "incremental") != "full";
+        let max_wal_mb: u64 = env("ORBIT_BACKUP_MAX_WAL_MB", "64").parse().unwrap_or(64);
+        c.max_wal_bytes = max_wal_mb.max(1) << 20;
         c
     };
 
