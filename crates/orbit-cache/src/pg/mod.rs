@@ -367,6 +367,48 @@ fn parse_text_value(s: &str, ty: oql::ivm::ColumnType) -> oql::value::Value {
     }
 }
 
+/// A slot freshly created over the replication protocol with an exported
+/// snapshot. The snapshot (usable via `SET TRANSACTION SNAPSHOT`) pins SQL
+/// reads to the slot's exact consistent point — but only while `conn` stays
+/// open; hold this struct until the initial sync commits.
+pub struct ExportedSlot {
+    pub start_lsn: u64,
+    pub snapshot: String,
+    _conn: RawConn,
+}
+
+/// Ensure the slot exists. When it must be CREATED (the fresh-sync case),
+/// create it over the replication protocol with an exported snapshot so the
+/// initial sync can read at the slot's exact consistent point (audit
+/// Tier 1.7 — previously the sync ran at "now" and correctness leaned
+/// entirely on idempotent apply over the overlap window). Returns the resume
+/// LSN plus the exported snapshot when one was created.
+#[allow(clippy::too_many_arguments)]
+pub async fn ensure_slot_with_snapshot(
+    client: &Client,
+    host: &str,
+    port: u16,
+    user: &str,
+    database: &str,
+    password: Option<&str>,
+    tls: PgTlsMode,
+    slot: &str,
+) -> Result<(u64, Option<ExportedSlot>)> {
+    if let Some(row) = client
+        .query_opt(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await?
+    {
+        let lsn: Option<String> = row.get(0);
+        return Ok((proto::parse_lsn(lsn.as_deref().unwrap_or("0/0"))?, None));
+    }
+    let mut conn = RawConn::connect_replication(host, port, user, database, password, tls).await?;
+    let (lsn, snapshot) = conn.create_replication_slot_exported(slot).await?;
+    Ok((lsn, Some(ExportedSlot { start_lsn: lsn, snapshot, _conn: conn })))
+}
+
 /// Ensure a logical replication slot (`pgoutput` plugin) exists, returning the LSN
 /// at which streaming should begin.
 ///

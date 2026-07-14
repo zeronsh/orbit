@@ -114,6 +114,13 @@ pub struct ChangeStreamServer {
     ring: Mutex<Ring>,
     cap: usize,
     max_bytes: usize,
+    /// Per-subscriber applied positions (from periodic `ack <pos>` lines;
+    /// initialized at the connect-time resume pos). Log pruning keeps
+    /// everything a LIVE subscriber still needs instead of force-Resetting a
+    /// slow-but-alive one at a fixed window (audit Tier 1.6 — Zero prunes by
+    /// subscriber-ACK consensus).
+    acks: Mutex<std::collections::HashMap<u64, u64>>,
+    next_conn_id: std::sync::atomic::AtomicU64,
     /// Optional durable change-log. When present, evicted resume points are served
     /// by delta from it instead of forcing a re-restore, and every change is
     /// appended (with byte-budget backpressure) for cross-restart durability.
@@ -170,6 +177,8 @@ impl ChangeStreamServer {
             }),
             cap: cfg.max_events,
             max_bytes: cfg.max_bytes,
+            acks: Mutex::new(std::collections::HashMap::new()),
+            next_conn_id: std::sync::atomic::AtomicU64::new(1),
             log,
         })
     }
@@ -228,6 +237,12 @@ impl ChangeStreamServer {
         self.tx.receiver_count()
     }
 
+    /// The lowest position any LIVE subscriber still needs (its last ack),
+    /// or `None` when no subscriber is connected.
+    pub fn min_subscriber_ack(&self) -> Option<u64> {
+        self.acks.lock().unwrap().values().min().copied()
+    }
+
     /// Accept view-syncer connections forever.
     pub async fn serve(self: Arc<Self>, addr: &str) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
@@ -256,6 +271,23 @@ impl ChangeStreamServer {
         reader.read_line(&mut line).await?;
         let resume: u64 = line.trim().parse().unwrap_or(0);
 
+        // Register this subscriber's applied position (starts at its resume
+        // point; advanced by its `ack` lines) and deregister on ANY exit.
+        let conn_id = self.next_conn_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.acks.lock().unwrap().insert(conn_id, resume);
+        let result = self.handle_registered(conn_id, resume, reader, &mut w).await;
+        self.acks.lock().unwrap().remove(&conn_id);
+        result
+    }
+
+    async fn handle_registered(
+        &self,
+        conn_id: u64,
+        resume: u64,
+        mut reader: BufReader<OwnedReadHalf>,
+        w: &mut OwnedWriteHalf,
+    ) -> Result<()> {
+
         // Subscribe before reading the ring so no change slips through the gap.
         let mut rx = self.tx.subscribe();
         let (backlog, floor, seq) = {
@@ -275,7 +307,7 @@ impl ChangeStreamServer {
         // Ahead of our sequence → the replicator restarted with a lower seq, so this
         // resume point is "in the future" and can't be served. Re-restore.
         if resume > seq {
-            send(&mut w, &ChangeMsgOut::Reset).await?;
+            send(w, &ChangeMsgOut::Reset).await?;
             return Ok(());
         }
 
@@ -305,14 +337,14 @@ impl ChangeStreamServer {
                         if pos != last + 1 {
                             break 'bridge; // hole / unreadable entry → Reset
                         }
-                        send(&mut w, &ChangeMsgOut::Change { pos, event: &event }).await?;
+                        send(w, &ChangeMsgOut::Change { pos, event: &event }).await?;
                         last = pos;
                     }
                 }
             }
             if last < floor {
                 // couldn't bridge to the ring (no log / pruned / hole / too far behind)
-                send(&mut w, &ChangeMsgOut::Reset).await?;
+                send(w, &ChangeMsgOut::Reset).await?;
                 return Ok(());
             }
         }
@@ -320,26 +352,46 @@ impl ChangeStreamServer {
         // Ring backlog: events in (last, seq].
         for (pos, event) in backlog {
             if pos > last {
-                send(&mut w, &ChangeMsgOut::Change { pos, event: &event }).await?;
+                send(w, &ChangeMsgOut::Change { pos, event: &event }).await?;
                 last = pos;
             }
         }
         // Backlog fully replayed — the subscriber is at the head it observed
         // at connect time (readiness signal; also correct when the backlog was
         // empty because the subscriber was already current).
-        send(&mut w, &ChangeMsgOut::CaughtUp { seq }).await?;
+        send(w, &ChangeMsgOut::CaughtUp { seq }).await?;
+        let mut ack_line = String::new();
         loop {
-            match rx.recv().await {
-                Ok((pos, event)) if pos > last => {
-                    send(&mut w, &ChangeMsgOut::Change { pos, event: &event }).await?;
-                    last = pos;
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Ok((pos, event)) if pos > last => {
+                        send(w, &ChangeMsgOut::Change { pos, event: &event }).await?;
+                        last = pos;
+                    }
+                    Ok(_) => {} // already covered by the backlog
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        send(w, &ChangeMsgOut::Reset).await?;
+                        return Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                },
+                // Subscriber acks: `ack <pos>` lines. EOF/garbage → treat the
+                // connection as gone (the write side will error soon anyway).
+                n = reader.read_line(&mut ack_line) => {
+                    match n {
+                        Ok(0) | Err(_) => return Ok(()),
+                        Ok(_) => {
+                            if let Some(pos) = ack_line
+                                .trim()
+                                .strip_prefix("ack ")
+                                .and_then(|p| p.trim().parse::<u64>().ok())
+                            {
+                                self.acks.lock().unwrap().insert(conn_id, pos);
+                            }
+                            ack_line.clear();
+                        }
+                    }
                 }
-                Ok(_) => {} // already covered by the backlog
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    send(&mut w, &ChangeMsgOut::Reset).await?;
-                    return Ok(());
-                }
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
             }
         }
     }
@@ -355,7 +407,7 @@ async fn send(w: &mut OwnedWriteHalf, msg: &ChangeMsgOut<'_>) -> Result<()> {
 /// View-syncer side: a connection to the replicator's change-stream.
 pub struct ChangeStreamClient {
     reader: BufReader<OwnedReadHalf>,
-    _write: OwnedWriteHalf, // kept alive to hold the socket open
+    write: OwnedWriteHalf,
 }
 
 impl ChangeStreamClient {
@@ -364,7 +416,15 @@ impl ChangeStreamClient {
         let sock = TcpStream::connect(addr).await?;
         let (r, mut w) = sock.into_split();
         w.write_all(format!("{resume_lsn}\n").as_bytes()).await?;
-        Ok(ChangeStreamClient { reader: BufReader::new(r), _write: w })
+        Ok(ChangeStreamClient { reader: BufReader::new(r), write: w })
+    }
+
+    /// Report the highest position durably applied — the replicator prunes
+    /// its change-log by consensus over these, so a slow-but-live subscriber
+    /// is never force-Reset by a fixed retention window.
+    pub async fn ack(&mut self, pos: u64) -> Result<()> {
+        self.write.write_all(format!("ack {pos}\n").as_bytes()).await?;
+        Ok(())
     }
 
     /// Next message, or `None` when the replicator closes the connection.

@@ -12,7 +12,7 @@
 use crate::changestream::{ChangeMsg, ChangeStreamClient, ChangeStreamServer};
 use crate::mutators::MutatorRegistry;
 use crate::objectstore::{ObjectStore, ReplicaSnapshot};
-use crate::pg::{create_publication, create_slot, initial_sync_backend};
+use crate::pg::{create_publication, initial_sync_backend};
 use crate::queries::QueryRegistry;
 use crate::replica::{Replica, ReplicaBackend};
 use crate::server::serve_client;
@@ -158,11 +158,20 @@ async fn run_sharded_inner(cfg: ServerConfig, num_shards: usize) -> Result<()> {
     create_publication(&pg, &cfg.publication, &table_names)
         .await
         .with_context(|| format!("creating publication for tables {table_names:?} — do they all exist in the database?"))?;
-    let start_lsn = create_slot(&pg, &cfg.slot)
-        .await
-        .context("creating logical replication slot — is the server started with wal_level=logical?")?;
+    let (start_lsn, exported) = crate::pg::ensure_slot_with_snapshot(
+        &pg, &cfg.host, cfg.port, &cfg.user, &cfg.database,
+        cfg.password.as_deref(), cfg.tls, &cfg.slot,
+    )
+    .await
+    .context("creating logical replication slot — is the server started with wal_level=logical?")?;
 
     // Take the initial snapshot once and seed every shard with the same rows.
+    // A freshly-created slot pins the reads to its exact consistent point.
+    if let Some(e) = &exported {
+        pg.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await?;
+        pg.execute(format!("SET TRANSACTION SNAPSHOT '{}'", e.snapshot).as_str(), &[]).await?;
+        eprintln!("initial sync pinned to slot snapshot {}", e.snapshot);
+    }
     let mut shard_tables = Vec::new();
     for t in &cfg.tables {
         let rows = crate::pg::select_all_rows(&pg, &t.name, &t.columns).await?;
@@ -174,6 +183,10 @@ async fn run_sharded_inner(cfg: ServerConfig, num_shards: usize) -> Result<()> {
             seed: rows,
         });
     }
+    if exported.is_some() {
+        let _ = pg.batch_execute("COMMIT").await;
+    }
+    drop(exported); // the snapshot's replication connection may close now
 
     let server = std::sync::Arc::new(crate::sharded::ShardedServer::start_with_pg(
         num_shards,
@@ -410,6 +423,75 @@ impl TxnApply {
     }
 }
 
+/// Fresh (or crash-resumed) initial sync: ONE storage transaction per table,
+/// each clearing the table's stale rows, seeding it, and registering it in the
+/// synced-tables registry — a crash resumes at the next unsynced table instead
+/// of redoing everything (audit Tier 1.7; previously one giant all-or-nothing
+/// transaction). When the slot was just created, `exported` pins every SELECT
+/// to the slot's exact consistent snapshot, so the sync and the stream tile
+/// with NO overlap window (Zero: parallel COPY pinned to the slot snapshot).
+/// A crash-resume continues unpinned at "now" — safe because the unconfirmed
+/// slot re-delivers everything since its creation and apply is idempotent.
+pub async fn initial_sync_all<B: ReplicaBackend>(
+    pg: &tokio_postgres::Client,
+    replica: &B,
+    cfg: &ServerConfig,
+    exported: Option<&crate::pg::ExportedSlot>,
+    pos: u64,
+) -> Result<()> {
+    let synced = replica.synced_tables().unwrap_or_default();
+    let todo: Vec<&TableConfig> =
+        cfg.tables.iter().filter(|t| !synced.contains(&t.name)).collect();
+    for t in cfg.tables.iter().filter(|t| synced.contains(&t.name)) {
+        eprintln!("initial sync: {} already synced (crash resume)", t.name);
+    }
+    if todo.is_empty() {
+        return Ok(());
+    }
+    // Pin to the exported snapshot when available. Safe on the shared client:
+    // this runs during single-threaded startup, before any other pg user.
+    let pinned = match exported {
+        Some(e) => {
+            pg.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await?;
+            pg.execute(format!("SET TRANSACTION SNAPSHOT '{}'", e.snapshot).as_str(), &[])
+                .await?;
+            eprintln!(
+                "initial sync pinned to slot snapshot {} (consistent point {})",
+                e.snapshot, e.start_lsn
+            );
+            true
+        }
+        None => false,
+    };
+    let result: Result<()> = async {
+        for t in &todo {
+            replica.begin_txn()?;
+            let seeded: Result<usize> = async {
+                replica.clear_table(&t.name)?;
+                initial_sync_backend(pg, replica, &t.name).await
+            }
+            .await;
+            match seeded {
+                Ok(n) => {
+                    replica.mark_synced(&t.name)?;
+                    replica.commit_txn(0, pos)?;
+                    eprintln!("initial sync: {n} rows from {}", t.name);
+                }
+                Err(e) => {
+                    replica.rollback_txn();
+                    return Err(e.context(format!("initial sync of table {}", t.name)));
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if pinned {
+        let _ = pg.batch_execute("COMMIT").await;
+    }
+    result
+}
+
 /// Backfill tables added to the config after a durable replica was first
 /// synced (audit Tier 0.5): a watermark resume skips initial sync entirely, so
 /// a table newly added to `ORBIT_TABLES` would stream future changes while
@@ -484,15 +566,17 @@ async fn run_inner<B: ReplicaBackend + 'static>(
     create_publication(&pg, &cfg.publication, &table_names)
         .await
         .with_context(|| format!("creating publication for tables {table_names:?} — do they all exist in the database?"))?;
-    let start_lsn = create_slot(&pg, &cfg.slot)
-        .await
-        .context("creating logical replication slot — is the server started with wal_level=logical?")?;
+    let (start_lsn, exported) = crate::pg::ensure_slot_with_snapshot(
+        &pg, &cfg.host, cfg.port, &cfg.user, &cfg.database,
+        cfg.password.as_deref(), cfg.tls, &cfg.slot,
+    )
+    .await
+    .context("creating logical replication slot — is the server started with wal_level=logical?")?;
 
     let replica = Rc::new(backend);
-    // A durable backend that recorded a watermark resumes from the slot instead
-    // of re-syncing; a fresh sync first CLEARS the backend (initial sync only
-    // upserts, so rows deleted upstream while offline would otherwise survive
-    // as phantoms in a durable replica).
+    // A durable backend that recorded a watermark resumes from the slot
+    // instead of re-syncing; otherwise the per-table resumable sync runs,
+    // pinned to the freshly-created slot's exported snapshot when available.
     let resume_watermark = replica.resume_watermark();
     match resume_watermark {
         Some(w) => {
@@ -502,29 +586,10 @@ async fn run_inner<B: ReplicaBackend + 'static>(
             backfill_missing_tables(&pg, replica.as_ref(), &cfg).await?;
         }
         None => {
-            replica.start_fresh();
-            // One storage transaction around the whole sync: a crash mid-sync
-            // rolls back to empty-with-no-watermark (→ clean redo), and a
-            // durable backend commits once instead of once per row. The
-            // watermark stays unset (lsn 0) until the first replicated commit.
-            replica.begin_txn().context("opening initial-sync storage transaction")?;
-            for t in &cfg.tables {
-                let n = match initial_sync_backend(&pg, replica.as_ref(), &t.name)
-                    .await
-                    .with_context(|| format!("initial sync of table {}", t.name))
-                {
-                    Ok(n) => n,
-                    Err(e) => {
-                        replica.rollback_txn();
-                        return Err(e);
-                    }
-                };
-                replica.mark_synced(&t.name)?;
-                eprintln!("initial sync: {} rows from {}", n, t.name);
-            }
-            replica.commit_txn(0, 0).context("committing initial sync")?;
+            initial_sync_all(&pg, replica.as_ref(), &cfg, exported.as_ref(), 0).await?;
         }
     }
+    drop(exported); // the snapshot's replication connection may close now
     let mutators = Rc::new(mutators);
     let queries = Rc::new(queries);
     let forwarder = Rc::new(crate::forward::Forwarder::new(cfg.forward_config()));
@@ -1225,9 +1290,12 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
 
     let table_names: Vec<&str> = cfg.tables.iter().map(|t| t.name.as_str()).collect();
     create_publication(&pg, &cfg.publication, &table_names).await?;
-    let start_lsn = create_slot(&pg, &cfg.slot)
-        .await
-        .context("creating logical replication slot — is wal_level=logical?")?;
+    let (start_lsn, exported) = crate::pg::ensure_slot_with_snapshot(
+        &pg, &cfg.host, cfg.port, &cfg.user, &cfg.database,
+        cfg.password.as_deref(), cfg.tls, &cfg.slot,
+    )
+    .await
+    .context("creating logical replication slot — is wal_level=logical?")?;
 
     let replica = Rc::new(replica);
     let store = Rc::new(store);
@@ -1247,9 +1315,18 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
             eprintln!("durable change-log DISABLED (ORBIT_DISABLE_CHANGELOG)");
             None
         } else {
+            // The CDC log defaults to the source Postgres, which re-writes
+            // every replicated change into the database it was read from
+            // (audit Tier 1.8 — measured 392 MB of change log vs 375 MB of
+            // data in 12 days). Point ORBIT_CDC_PG at a separate (cheap,
+            // unreplicated) Postgres to take that write load off the source.
+            let cdc_conn = std::env::var("ORBIT_CDC_PG").unwrap_or_else(|_| cfg.conn_str());
+            if std::env::var("ORBIT_CDC_PG").is_ok() {
+                eprintln!("durable change-log using dedicated CDC database (ORBIT_CDC_PG)");
+            }
             Some(Arc::new(
                 crate::changelog::PgChangeLog::open(
-                    cfg.conn_str(),
+                    cdc_conn,
                     format!("orbit_change_log_{}", cfg.slot),
                     cfg.tls,
                 )
@@ -1285,24 +1362,9 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
         // pre-existing rows (the stream only carries new changes).
         backfill_missing_tables(&pg, replica.as_ref(), &cfg).await?;
     } else {
-        replica.start_fresh();
-        replica.begin_txn().context("opening initial-sync storage transaction")?;
-        for t in &cfg.tables {
-            let n = match initial_sync_backend(&pg, replica.as_ref(), &t.name)
-                .await
-                .with_context(|| format!("initial sync of table {}", t.name))
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    replica.rollback_txn();
-                    return Err(e);
-                }
-            };
-            replica.mark_synced(&t.name)?;
-            eprintln!("initial sync: {} rows from {}", n, t.name);
-        }
-        replica.commit_txn(0, start_seq).context("committing initial sync")?;
+        initial_sync_all(&pg, replica.as_ref(), &cfg, exported.as_ref(), start_seq).await?;
     }
+    drop(exported); // the snapshot's replication connection may close now
 
     // Ring/broadcast tuning from ORBIT_CHANGE_RING_BYTES / ORBIT_CHANGE_RING_CAPACITY /
     // ORBIT_BROADCAST_CAP; the struct defaults match CHANGE_RING_CAPACITY + 64 MiB.
@@ -1324,6 +1386,11 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
             }
         });
     }
+
+    // The change-stream position of the most recent snapshot upload — a
+    // pruning floor (restore reservation): a restoring view-syncer resumes
+    // from at least this position.
+    let last_snapshot_pos = Arc::new(std::sync::atomic::AtomicU64::new(start_seq));
 
     // Refresh the snapshot with the freshly-synced replica at the continued
     // watermark, so view-syncers restore current data aligned with `start_seq`.
@@ -1360,17 +1427,24 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
         });
     }
 
-    // Retention: prune log entries well past the in-memory ring window. A
-    // view-syncer behind by more than this re-restores (rare); the rest resume by
-    // delta from the log.
+    // Retention: prune the durable log by SUBSCRIBER-ACK CONSENSUS (audit
+    // Tier 1.6 — a live-but-slow view-syncer is never force-Reset just
+    // because it lagged a fixed window) with two additional floors:
+    //  * the latest object-store snapshot position (restore reservation: a
+    //    node restoring that snapshot will resume from it), and
+    //  * LOG_RETENTION as the HARD upper bound on retention, so a wedged or
+    //    zombie subscriber can't pin the log forever (it re-restores instead).
     if let Some(log) = log.clone() {
         let server = server.clone();
+        let snap_floor = last_snapshot_pos.clone();
         spawn_local(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                let keep_from = server
-                    .current_seq()
-                    .saturating_sub(LOG_RETENTION);
+                let seq = server.current_seq();
+                let hard_floor = seq.saturating_sub(LOG_RETENTION);
+                let consensus = server.min_subscriber_ack().unwrap_or(seq);
+                let reservation = snap_floor.load(std::sync::atomic::Ordering::Relaxed);
+                let keep_from = consensus.min(reservation).max(hard_floor);
                 if keep_from > 0 {
                     if let Err(e) = log.prune_before(keep_from).await {
                         eprintln!("change-log prune failed: {e:#}");
@@ -1392,6 +1466,7 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
         let server = server.clone();
         let snap = snap.clone();
         let m = metrics.clone();
+        let snap_pos = last_snapshot_pos.clone();
         spawn_local(async move {
             let wedge_limit = snapshot_interval
                 .saturating_mul(5)
@@ -1407,6 +1482,7 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
                 match snap.write(store.as_ref(), replica.as_ref(), pos).await {
                     Ok(n) => {
                         m.snapshot_bytes.store(n, std::sync::atomic::Ordering::Relaxed);
+                        snap_pos.store(pos, std::sync::atomic::Ordering::Relaxed);
                         last_success = tokio::time::Instant::now();
                         let took = started.elapsed();
                         if took > snapshot_interval {
@@ -1747,6 +1823,7 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
                     }
                 };
                 let reconnect_watermark = watermark;
+                let mut last_ack = std::time::Instant::now();
                 // One transaction at a time. Small transactions buffer and
                 // apply in one synchronous slice at Commit (no awaits between
                 // events → a concurrent `subscribe` hydration on this LocalSet
@@ -1814,6 +1891,13 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
                             }
                             replica_pos.set(watermark);
                             metrics.replica_pos.store(watermark, std::sync::atomic::Ordering::Relaxed);
+                            // Throttled ack: tells the replicator how far this
+                            // node has durably applied, so log pruning keeps
+                            // what live subscribers still need (Tier 1.6).
+                            if last_ack.elapsed() >= Duration::from_secs(2) {
+                                let _ = client.ack(watermark).await;
+                                last_ack = std::time::Instant::now();
+                            }
                             // Mixed-version fallback: an old replicator never
                             // sends CaughtUp — the first applied live commit
                             // still proves we're current.

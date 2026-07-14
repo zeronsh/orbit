@@ -1026,6 +1026,14 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
         let _ = self.conn.execute_batch("ROLLBACK");
     }
 
+    fn clear_table(&self, table: &str) -> anyhow::Result<()> {
+        if self.sources.contains_key(table) {
+            self.conn
+                .execute_batch(&format!("DELETE FROM {}", ident(table)))?;
+        }
+        Ok(())
+    }
+
     fn synced_tables(&self) -> Option<std::collections::HashSet<String>> {
         let mut stmt = self.conn.prepare_cached("SELECT name FROM orbit_synced_tables").ok()?;
         let set = stmt

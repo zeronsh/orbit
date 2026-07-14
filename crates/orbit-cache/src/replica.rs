@@ -84,6 +84,12 @@ pub trait ReplicaBackend: oql::SourceProvider {
     /// upstream while the server was offline would otherwise survive as
     /// phantoms.
     fn start_fresh(&self) {}
+    /// Drop one table's stored rows (the per-table analog of
+    /// [`start_fresh`](Self::start_fresh), used by the resumable per-table
+    /// initial sync). Runs inside the caller's storage transaction.
+    fn clear_table(&self, _table: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// A point-in-time memory/size sample for the metrics exporter.
     fn metrics_sample(&self) -> ReplicaSample {
