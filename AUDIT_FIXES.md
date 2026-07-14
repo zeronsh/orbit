@@ -1,5 +1,11 @@
 # Orbit vs Zero audit — fix ledger
 
+**Verification:** 46/46 test suites green (unit + real-Postgres integration,
+incl. new TOAST / TRUNCATE / DDL-matrix / backfill / big-txn / pushdown
+suites), and the 512 MB cgroup acceptance harness PASSES on this branch
+(peak RSS 391 MB across nodes; no OOM, no restarts, readiness cycling,
+view-syncer replacement reconvergence, exact row counts).
+
 Tracks every item from `ORBIT_VS_ZERO_WALLS.md` (the four-way code audit vs
 Rocicorp Zero) to its disposition on this branch. ✅ fixed · 🟠 partially /
 mitigated · 📐 designed, not built · ⛔ out of scope by the audit's own framing.
@@ -24,7 +30,7 @@ mitigated · 📐 designed, not built · ⛔ out of scope by the audit's own fra
 | 1.2 Txns fully buffered fleet-wide | ✅ | Begin now carries `final_lsn` (decoded), so pumps decide apply/publish upfront. Replicator: pure streaming, O(one event) memory. Serving nodes: buffer to `ORBIT_TXN_BUFFER_BYTES` (32 MiB), then stream under a node-wide replica-consistency RwLock (readers: hydration materialize + tick flush) so no torn mid-txn state is observable. Sharded fan-out wraps Begin..Commit in the same lock (fixed a pre-existing torn-flush hazard). e2e: 1.2 MB txn through a 64 KiB cap arrives complete and untorn. |
 | 1.3 Multi-core XOR durable | 📐 | Needs Zero's wal2/`BEGIN CONCURRENT` snapshot leapfrogging or an equivalent pinned-read-snapshot + per-shard delta-overlay design; standard SQLite (rusqlite-bundled) has neither. Design notes below. |
 | 1.4 Full-file backup per interval | ✅ | `walship`: incremental WAL-segment shipping (generation = checkpoint + one base upload; per-cycle segments cut at the last committed frame, salt-validated; atomic manifest; restore = base + concat + SQLite recovery; grandparent-generation GC). Fixed backup cadence + lag warning + `orbit_snapshot_age_seconds` + wedge crash-out at max(5×interval, 5 min). `ORBIT_BACKUP=full` opt-out; legacy fallback on restore. |
-| 1.5 Un-yielded hydration; gate across poke | 🟠 | Admission permit released before the chunked poke (a stalled socket no longer head-of-line blocks queued hydrations); yields between per-query materializations; slow-hydration/advance detection with per-query attribution + metrics. The remaining sync block is `fetch()` itself — yielding inside it needs a generator-style IVM (Zero's model); detection is the actionable signal until then. |
+| 1.5 Un-yielded hydration; gate across poke | 🟠 | Results that fit `ORBIT_HYDRATION_BUDGET_BYTES` (64 MiB) reserve it and release the admission permit before the poke (a stalled socket no longer head-of-line blocks queued hydrations); oversized results keep the permit through the poke (at most one resident — the naive unconditional release stacked two ~200 MB full-history results and the 512 MB harness OOM'd, which is how this policy was found). Yields between per-query materializations; slow-hydration/advance detection with per-query attribution. The remaining sync block is `fetch()` itself — yielding inside it needs a generator-style IVM (Zero's model). |
 | 1.6 Fixed-window log pruning | ✅ | Subscriber-ACK consensus (`ack <pos>` lines, throttled) + latest-snapshot-position restore reservation, with `LOG_RETENTION` as the hard cap so zombies can't pin the log. |
 | 1.7 Serial, non-resumable, inconsistent initial sync | ✅ | Slot created over the replication protocol with `SNAPSHOT 'export'`; all seed SELECTs pinned via `SET TRANSACTION SNAPSHOT` to the slot's exact consistent point (single-node, replicator, sharded). Per-table transactions + registry = crash-resumable. Parallel COPY workers not done (single-thread `!Send` architecture; the pin removes the correctness motivation). |
 | 1.8 CDC log in the source PG | ✅ | `ORBIT_CDC_PG` points the change-log at a separate database. |
