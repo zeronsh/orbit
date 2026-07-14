@@ -126,6 +126,16 @@ impl ReplicationStream {
                             if matches!(event, LogicalEvent::Other) {
                                 continue;
                             }
+                            // A Begin's returned position is the transaction's
+                            // COMMIT LSN (its `final_lsn`) — consumers can
+                            // decide apply/skip at Begin and stream the
+                            // transaction's events through bounded memory
+                            // instead of buffering until Commit.
+                            if matches!(event, LogicalEvent::Begin) {
+                                if let Some(final_lsn) = self.decoder.begin_final_lsn() {
+                                    return Ok((final_lsn, event));
+                                }
+                            }
                             return Ok((wal_start, event));
                         }
                         b'k' => {

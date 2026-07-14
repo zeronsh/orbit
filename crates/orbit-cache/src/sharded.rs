@@ -181,7 +181,17 @@ fn shard_main(
             let lmids = lmids.clone();
             spawn_local(async move {
                 let mut dirty = false;
+                // Transaction atomicity: events arrive one-by-one across
+                // channel awaits, so a hydration or lagged tick-flush on this
+                // shard could otherwise observe (or send) a torn
+                // mid-transaction state. The consistency write lock spans
+                // Begin..Commit; memory stays O(one event).
+                let mut txn_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>> = None;
                 while let Some(ev) = events.recv().await {
+                    if matches!(ev, LogicalEvent::Begin) && txn_guard.is_none() {
+                        txn_guard =
+                            Some(crate::server::replica_apply_lock().write_owned().await);
+                    }
                     let is_data = matches!(
                         ev,
                         LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. } | LogicalEvent::Truncate { .. }
@@ -192,9 +202,12 @@ fn shard_main(
                     if is_data {
                         dirty = true;
                     }
-                    if is_commit && dirty {
-                        let _ = tick_tx.send(());
-                        dirty = false;
+                    if is_commit {
+                        txn_guard = None;
+                        if dirty {
+                            let _ = tick_tx.send(());
+                            dirty = false;
+                        }
                     }
                 }
             });

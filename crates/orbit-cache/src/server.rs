@@ -263,6 +263,13 @@ async fn flush_active<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Consistency: never drain Catch buffers while a pump is mid-way through
+    // STREAMING an oversized transaction (its partial changes are already in
+    // the buffers) — a lagged tick would otherwise flush a torn transaction
+    // to the client. Free when no streamed txn is in progress.
+    let apply_lock = replica_apply_lock();
+    let consistent = apply_lock.read().await;
+    let started = std::time::Instant::now();
     let mut patches = Vec::new();
     for q in active {
         let changes = q.catch.borrow_mut().take_changes();
@@ -270,6 +277,24 @@ where
             continue;
         }
         patches.extend(changes_to_patches_dedup(&changes, &q.schema, row_refs));
+    }
+    drop(consistent);
+    // Advancement circuit-breaker signal: a giant upstream transaction turns
+    // this synchronous drain into a shard-wide stall. The drain itself can't
+    // be aborted mid-walk (the pipelines already consumed the push), so the
+    // actionable output is detection + attribution (Zero aborts + rehydrates;
+    // Orbit's tick-drain happens after apply, so the equivalent recovery is a
+    // reconnect — which the client does if the stall exceeds its timeouts).
+    let took = started.elapsed();
+    let slow = took > slow_hydration_budget();
+    crate::metrics::observe_advance(took, slow);
+    if slow {
+        eprintln!(
+            "slow advance: draining {} queries produced {} ops in {took:?} (budget {:?})",
+            active.len(),
+            patches.len(),
+            slow_hydration_budget()
+        );
     }
     if !patches.is_empty() || !lmids.is_empty() {
         let lmids = if lmids.is_empty() { None } else { Some(lmids) };
@@ -355,6 +380,41 @@ thread_local! {
 
 fn hydration_gate() -> Rc<tokio::sync::Semaphore> {
     HYDRATION_GATE.with(Rc::clone)
+}
+
+thread_local! {
+    /// Node-wide replica-consistency lock (one serving thread per node).
+    ///
+    /// Readers: hydration materialize phases and tick flushes. Writer: a
+    /// replication pump STREAMING an oversized transaction (audit Tier 1.2 —
+    /// transactions larger than the buffer cap apply event-by-event across
+    /// socket awaits instead of atomically at Commit). The write hold is what
+    /// keeps a mid-transaction replica state invisible: no query and no flush
+    /// can observe a state that existed in no Postgres snapshot. `Arc` (not
+    /// `Rc`) so pumps can hold an owned write guard across await points.
+    static REPLICA_APPLY_LOCK: std::sync::Arc<tokio::sync::RwLock<()>> =
+        std::sync::Arc::new(tokio::sync::RwLock::new(()));
+}
+
+/// The node's replica-consistency lock (see [`REPLICA_APPLY_LOCK`]).
+pub fn replica_apply_lock() -> std::sync::Arc<tokio::sync::RwLock<()>> {
+    REPLICA_APPLY_LOCK.with(std::sync::Arc::clone)
+}
+
+/// Wall-clock budget for one query's synchronous materialize phase before it
+/// is reported as a shard-stalling slow hydration (`ORBIT_SLOW_HYDRATION_MS`,
+/// default 500ms). The IVM fetch cannot yield mid-walk, so detection +
+/// per-query attribution is the actionable signal (Zero's lap-budget analog).
+fn slow_hydration_budget() -> std::time::Duration {
+    static BUDGET: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::time::Duration::from_millis(
+            std::env::var("ORBIT_SLOW_HYDRATION_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(500),
+        )
+    })
 }
 
 /// Serialized-size cap per `pokePart` frame. `ORBIT_POKE_PART_BYTES`
@@ -877,11 +937,21 @@ where
                 };
                 let Some(ast) = ast else { continue };
                 // Admission control: the fetch + patch below materialize the
-                // full result, and the permit is held through the chunked
-                // sends — peak node memory stays at (gate width) × result
-                // instead of (connected hydrating clients) × result.
+                // full result — the permit bounds peak node memory during the
+                // MATERIALIZE phase to (gate width) × result. The permit is
+                // released before the chunked poke: holding it across a
+                // slow-socket send let one stalled client head-of-line block
+                // every queued hydration on the node (audit Tier 1.5) — the
+                // poke drains an already-materialized patch under its own TCP
+                // backpressure and needs no admission slot.
                 let gate = hydration_gate();
-                let _hydrating = gate.acquire().await.expect("hydration gate closed");
+                let hydrating = gate.acquire().await.expect("hydration gate closed");
+                // Consistency: wait out any in-progress streamed transaction
+                // (held only while a pump streams an oversized txn — free
+                // otherwise). Released with `hydrating` before the poke.
+                let apply_lock = replica_apply_lock();
+                let consistent = apply_lock.read().await;
+                let started = std::time::Instant::now();
                 let top = build_pipeline(&ast, provider);
                 let catch = Catch::new(top.input.clone());
                 let link: Link = catch.clone();
@@ -896,6 +966,25 @@ where
                 // tree here frees only its scaffolding — but do it before the
                 // (chunked, potentially slow-socket) poke holds it alive.
                 drop(nodes);
+                drop(consistent);
+                drop(hydrating);
+                let hydrate_took = started.elapsed();
+                if hydrate_took > slow_hydration_budget() {
+                    eprintln!(
+                        "slow hydration: query {} materialized {} ops in {hydrate_took:?} (budget {:?}) — other clients on this shard stalled for that long",
+                        hash,
+                        rows.len(),
+                        slow_hydration_budget()
+                    );
+                }
+                crate::metrics::observe_hydration(
+                    hydrate_took,
+                    rows.len() as u64,
+                    hydrate_took > slow_hydration_budget(),
+                );
+                // Let queued work (other clients' sends, ticks) interleave
+                // between one query's heavy synchronous fetch and the next.
+                tokio::task::yield_now().await;
                 // Prepend the replacement Clear to the first query's poke so its rows
                 // clear+rebuild atomically (no flash of an empty result).
                 if pending_clear {

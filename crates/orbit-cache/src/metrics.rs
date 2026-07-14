@@ -82,6 +82,18 @@ pub struct Metrics {
     pub active_queries: AtomicU64,
     pub matched_rows: AtomicU64,
     pub hydration_bytes_total: AtomicU64,
+    /// Total hydrations served and their cumulative materialize time/rows —
+    /// rate + division give mean cost; the slow-hydration log line carries the
+    /// per-query attribution.
+    pub hydrations_total: AtomicU64,
+    pub hydration_ms_total: AtomicU64,
+    pub hydration_ops_total: AtomicU64,
+    /// Hydrations whose materialize phase exceeded the slow budget.
+    pub slow_hydrations_total: AtomicU64,
+    /// Advance (tick-flush) cycles and cumulative time — the push-side analog.
+    pub advances_total: AtomicU64,
+    pub advance_ms_total: AtomicU64,
+    pub slow_advances_total: AtomicU64,
     pub poke_bytes_total: AtomicU64,
     pub poke_parts_total: AtomicU64,
     pub pokes_total: AtomicU64,
@@ -110,6 +122,13 @@ impl Metrics {
             active_queries: Default::default(),
             matched_rows: Default::default(),
             hydration_bytes_total: Default::default(),
+            hydrations_total: Default::default(),
+            hydration_ms_total: Default::default(),
+            hydration_ops_total: Default::default(),
+            slow_hydrations_total: Default::default(),
+            advances_total: Default::default(),
+            advance_ms_total: Default::default(),
+            slow_advances_total: Default::default(),
             poke_bytes_total: Default::default(),
             pokes_total: Default::default(),
             poke_parts_total: Default::default(),
@@ -164,6 +183,13 @@ impl Metrics {
         gauge("orbit_active_queries", "Materialized client queries", self.active_queries.load(Ordering::Relaxed));
         gauge("orbit_matched_rows", "Rows referenced by client views", self.matched_rows.load(Ordering::Relaxed));
         gauge("orbit_hydration_bytes_total", "Serialized bytes sent in initial-subscribe pokes", self.hydration_bytes_total.load(Ordering::Relaxed));
+        gauge("orbit_hydrations_total", "Hydrations served", self.hydrations_total.load(Ordering::Relaxed));
+        gauge("orbit_hydration_ms_total", "Cumulative hydration materialize time (ms)", self.hydration_ms_total.load(Ordering::Relaxed));
+        gauge("orbit_hydration_ops_total", "Cumulative hydration result ops", self.hydration_ops_total.load(Ordering::Relaxed));
+        gauge("orbit_slow_hydrations_total", "Hydrations over the slow budget", self.slow_hydrations_total.load(Ordering::Relaxed));
+        gauge("orbit_advances_total", "Tick-flush advance cycles", self.advances_total.load(Ordering::Relaxed));
+        gauge("orbit_advance_ms_total", "Cumulative advance time (ms)", self.advance_ms_total.load(Ordering::Relaxed));
+        gauge("orbit_slow_advances_total", "Advance cycles over the slow budget", self.slow_advances_total.load(Ordering::Relaxed));
         gauge("orbit_poke_bytes_total", "Serialized bytes sent in all pokes", self.poke_bytes_total.load(Ordering::Relaxed));
         gauge("orbit_poke_parts_total", "pokePart frames sent", self.poke_parts_total.load(Ordering::Relaxed));
         gauge("orbit_pokes_total", "Poke transactions sent", self.pokes_total.load(Ordering::Relaxed));
@@ -319,5 +345,42 @@ mod tests {
         assert!(get(addr, "/ready").await.starts_with("HTTP/1.1 200"));
         let metrics = get(addr, "/metrics").await;
         assert!(metrics.contains("orbit_ready{role=\"single-node\"} 1"));
+    }
+}
+
+impl Metrics {
+    /// Record one hydration's materialize phase.
+    pub fn observe_hydration_on(&self, took: std::time::Duration, ops: u64, slow: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.hydrations_total.fetch_add(1, Relaxed);
+        self.hydration_ms_total.fetch_add(took.as_millis() as u64, Relaxed);
+        self.hydration_ops_total.fetch_add(ops, Relaxed);
+        if slow {
+            self.slow_hydrations_total.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Record one advance (tick-flush) cycle.
+    pub fn observe_advance_on(&self, took: std::time::Duration, slow: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.advances_total.fetch_add(1, Relaxed);
+        self.advance_ms_total.fetch_add(took.as_millis() as u64, Relaxed);
+        if slow {
+            self.slow_advances_total.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// Record a hydration on the node's metrics, if registered.
+pub fn observe_hydration(took: std::time::Duration, ops: u64, slow: bool) {
+    if let Some(m) = node_metrics() {
+        m.observe_hydration_on(took, ops, slow);
+    }
+}
+
+/// Record an advance cycle on the node's metrics, if registered.
+pub fn observe_advance(took: std::time::Duration, slow: bool) {
+    if let Some(m) = node_metrics() {
+        m.observe_advance_on(took, slow);
     }
 }

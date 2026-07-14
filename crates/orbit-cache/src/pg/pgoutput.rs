@@ -152,11 +152,22 @@ pub fn column_type_for_oid(oid: u32) -> ColumnType {
 #[derive(Default)]
 pub struct Decoder {
     relations: HashMap<u32, Relation>,
+    /// The `final_lsn` (commit LSN) of the most recently decoded Begin
+    /// message. Knowing a transaction's commit LSN AT ITS BEGIN lets the
+    /// replication pumps decide apply/skip upfront and stream events through
+    /// bounded memory instead of buffering the whole transaction (audit
+    /// Tier 1.2).
+    begin_final_lsn: Option<u64>,
 }
 
 impl Decoder {
     pub fn new() -> Self {
         Decoder::default()
+    }
+
+    /// The commit LSN carried by the most recent Begin message.
+    pub fn begin_final_lsn(&self) -> Option<u64> {
+        self.begin_final_lsn
     }
 
     /// Decode one pgoutput message (the body of an XLogData frame).
@@ -167,7 +178,11 @@ impl Decoder {
         let mut c = Cursor::new(data);
         let tag = c.u8()?;
         match tag {
-            b'B' => Ok(LogicalEvent::Begin),
+            b'B' => {
+                // Begin: final_lsn (8) + commit timestamp (8) + xid (4).
+                self.begin_final_lsn = c.u64().ok();
+                Ok(LogicalEvent::Begin)
+            }
             b'C' => Ok(LogicalEvent::Commit),
             b'R' => self.decode_relation(&mut c),
             b'I' => self.decode_insert(&mut c),
@@ -767,6 +782,9 @@ impl<'a> Cursor<'a> {
     }
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
     fn i32(&mut self) -> Result<i32> {
         Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
