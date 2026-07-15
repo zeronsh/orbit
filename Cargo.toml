@@ -6,7 +6,7 @@ members = ["crates/*"]
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/zeronsh/orbit"
-version = "0.3.12"
+version = "0.4.0"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive", "rc"] }
