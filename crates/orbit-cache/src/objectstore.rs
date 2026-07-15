@@ -32,6 +32,9 @@ pub trait ObjectStore {
     async fn put_stream(&self, key: &str, data: ByteStream, part_size: usize) -> Result<()>;
     /// Stream the object at `key` (`None` if absent).
     async fn get_stream(&self, key: &str) -> Result<Option<ByteStream>>;
+    /// Delete the object at `key` (no error if absent). Used to garbage-collect
+    /// retired backup generations.
+    async fn delete(&self, key: &str) -> Result<()>;
 }
 
 /// Upload the file at `path` to `key`, streamed with `part_size` read buffers.
@@ -176,6 +179,14 @@ impl ObjectStore for LocalObjectStore {
             Err(e) => Err(e).context("open object"),
         }
     }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        match tokio::fs::remove_file(self.root.join(key)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).context("delete object"),
+        }
+    }
 }
 
 /// An S3-compatible object store (AWS S3, **Tigris**, MinIO, …). Enable with the
@@ -276,6 +287,15 @@ impl ObjectStore for S3ObjectStore {
             Ok(r) => Ok(Some(r.into_stream().map_err(anyhow::Error::from).boxed())),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e).context("s3 get"),
+        }
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        use object_store::ObjectStore as _;
+        match self.inner.delete(&object_store::path::Path::from(key)).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e).context("s3 delete"),
         }
     }
 }

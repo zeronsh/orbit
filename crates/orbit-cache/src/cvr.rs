@@ -287,6 +287,20 @@ impl PgCvrStore {
                      DELETE FROM orbit_cvr_clients
                      WHERE last_seen < now() - make_interval(days => $1)
                      RETURNING client_id
+                 ),
+                 -- lastMutationID records of swept clients (previously never
+                 -- GC'd — they accumulated forever; audit Tier 2)
+                 dead_mutations AS (
+                     DELETE FROM orbit_cvr_mutations m USING stale s
+                     WHERE m.client_id = s.client_id
+                 ),
+                 -- desired-query records of groups with no surviving client
+                 dead_queries AS (
+                     DELETE FROM orbit_cvr_queries q
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM orbit_cvr_mutations m
+                         WHERE m.client_group_id = q.client_group_id
+                     )
                  )
                  DELETE FROM orbit_cvr_client_rows r USING stale s
                  WHERE r.client_id = s.client_id",

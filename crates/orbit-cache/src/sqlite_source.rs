@@ -22,6 +22,10 @@ use std::rc::Rc;
 
 struct Conn {
     sort: AstOrdering,
+    /// Superset-safe pushable subset of the query's WHERE condition — applied
+    /// to FETCH SQL only (pushes still flow unfiltered; the pipeline's Filter
+    /// re-applies the full predicate). See `pushable_subset`.
+    filter: Option<oql::ast::Condition>,
     /// Weak (see the memory source): dead downstream pipelines are pruned by
     /// the push loop instead of receiving every future change forever.
     output: Option<oql::ivm::operator::WeakLink>,
@@ -123,15 +127,56 @@ impl SqliteSource {
     /// dropping any lazily-created secondary indexes (SQLite refuses to drop an
     /// indexed column); primary-key columns are never dropped (warn instead).
     pub fn reconcile_columns(&mut self, new_columns: &[(String, ColumnType)]) {
-        let added: Vec<&(String, ColumnType)> =
+        let mut added: Vec<&(String, ColumnType)> =
             new_columns.iter().filter(|(n, _)| !self.columns.contains_key(n)).collect();
-        let removed: Vec<String> = self
+        let mut removed: Vec<String> = self
             .columns
             .keys()
             .filter(|c| !new_columns.iter().any(|(n, _)| n == *c))
             .cloned()
             .collect();
-        if added.is_empty() && removed.is_empty() {
+        // RENAME pairing (see the in-memory reconcile): one out + one in of
+        // the same type → ALTER TABLE … RENAME COLUMN, values preserved.
+        if removed.len() == 1
+            && added.len() == 1
+            && self.columns.get(&removed[0]) == Some(&added[0].1)
+            && !self.primary_key.iter().any(|k| *k == removed[0])
+        {
+            let (from, to) = (removed[0].clone(), added[0].0.clone());
+            eprintln!("replica DDL: treating column {from} -> {to} as a RENAME (values preserved)");
+            for idx in self.created_indexes.borrow_mut().drain() {
+                let _ = self.db.execute_batch(&format!("DROP INDEX IF EXISTS {}", ident(&idx)));
+            }
+            let sql = format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                ident(&self.table),
+                ident(&from),
+                ident(&to)
+            );
+            if let Err(e) = self.db.execute_batch(&sql) {
+                eprintln!("replica DDL: rename column {from} -> {to} failed: {e}");
+            } else {
+                // Keep the logical column map in step with the physical rename
+                // NOW — the shared early-return below fires when the rename was
+                // the only change.
+                if let Some(ty) = self.columns.remove(&from) {
+                    self.columns.insert(to.clone(), ty);
+                }
+                added.clear();
+                removed.clear();
+            }
+        }
+        // Columns whose TYPE changed while keeping the name: Postgres rewrites
+        // the table on `ALTER COLUMN … TYPE` but never re-sends the rows, so
+        // the stored values must be converted in place (audit Tier 0.4 —
+        // previously invisible: reconcile compared names only).
+        let changed: Vec<(String, ColumnType, ColumnType)> = new_columns
+            .iter()
+            .filter_map(|(n, t)| {
+                self.columns.get(n).filter(|old| *old != t).map(|old| (n.clone(), *old, *t))
+            })
+            .collect();
+        if added.is_empty() && removed.is_empty() && changed.is_empty() {
             return;
         }
         for (name, _) in &added {
@@ -140,9 +185,9 @@ impl SqliteSource {
                 eprintln!("replica DDL: add column {name} to {} failed: {e}", self.table);
             }
         }
-        if !removed.is_empty() {
-            // Secondary indexes may cover a doomed column; drop them all (they
-            // are lazily re-created per fetch shape).
+        if !removed.is_empty() || !changed.is_empty() {
+            // Secondary indexes may cover a doomed/retyped column; drop them
+            // all (they are lazily re-created per fetch shape).
             for idx in self.created_indexes.borrow_mut().drain() {
                 let _ = self.db.execute_batch(&format!("DROP INDEX IF EXISTS {}", ident(&idx)));
             }
@@ -158,6 +203,48 @@ impl SqliteSource {
             let sql = format!("ALTER TABLE {} DROP COLUMN {}", ident(&self.table), ident(name));
             if let Err(e) = self.db.execute_batch(&sql) {
                 eprintln!("replica DDL: drop column {name} from {} failed: {e}", self.table);
+            }
+        }
+        // Convert stored values of retyped columns: read with the OLD type,
+        // convert, write with the NEW type's binding. Runs inside the
+        // surrounding replication transaction (Relation events are applied
+        // between Begin/Commit), so a crash mid-rewrite rolls back atomically.
+        for (name, old_ty, new_ty) in &changed {
+            let convert = |db: &Connection| -> anyhow::Result<()> {
+                let select =
+                    format!("SELECT rowid, {} FROM {}", ident(name), ident(&self.table));
+                let mut read = db.prepare(&select)?;
+                let rows: Vec<(i64, Value)> = read
+                    .query_map([], |r| {
+                        Ok((r.get::<_, i64>(0)?, read_value(r, 1, *old_ty)))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                let update = format!(
+                    "UPDATE {} SET {} = ?1 WHERE rowid = ?2",
+                    ident(&self.table),
+                    ident(name)
+                );
+                let mut write = db.prepare(&update)?;
+                for (rowid, v) in rows {
+                    let converted = oql::ivm::schema::convert_column_value(&v, *new_ty);
+                    // Match `param`'s JSON-column encoding for the NEW type.
+                    let bound = match (new_ty, &converted) {
+                        (_, Value::Null) => SqlVal(Value::Null),
+                        (ColumnType::Json, _) => SqlVal(Value::String(
+                            serde_json::to_string(&converted).unwrap_or_default(),
+                        )),
+                        _ => SqlVal(converted),
+                    };
+                    write.execute(rusqlite::params![bound, rowid])?;
+                }
+                Ok(())
+            };
+            if let Err(e) = convert(&self.db) {
+                eprintln!(
+                    "replica DDL: converting column {name} of {} from {old_ty:?} to {new_ty:?} failed: {e}",
+                    self.table
+                );
             }
         }
         self.columns = new_columns.iter().map(|(n, t)| (n.clone(), *t)).collect();
@@ -189,13 +276,12 @@ impl SqliteSource {
     }
 
     /// Insert a row directly (initial load), bypassing change propagation.
-    pub fn insert_initial(&self, row: &Row) {
+    pub fn insert_initial(&self, row: &Row) -> anyhow::Result<()> {
         let (sql, params) = self.insert_sql(row);
         self.db
-            .prepare_cached(&sql)
-            .expect("prepare insert")
-            .execute(rusqlite::params_from_iter(params))
-            .expect("insert_initial");
+            .prepare_cached(&sql)?
+            .execute(rusqlite::params_from_iter(params))?;
+        Ok(())
     }
 
     /// Look up the stored row matching the primary key of `key_row`.
@@ -259,27 +345,31 @@ impl SqliteSource {
             .join(" AND ")
     }
 
-    fn write_change(&self, change: &SourceChange) {
+    /// Persist a change to SQLite. Errors propagate (no panic): the caller
+    /// rolls back the surrounding replication transaction and halts cleanly —
+    /// a torn half-write must never be committed under a watermark.
+    fn write_change(&self, change: &SourceChange) -> anyhow::Result<()> {
         match change {
             SourceChange::Add(r) => {
                 let (sql, params) = self.insert_sql(r);
-                self.db.prepare_cached(&sql).unwrap().execute(rusqlite::params_from_iter(params)).unwrap();
+                self.db.prepare_cached(&sql)?.execute(rusqlite::params_from_iter(params))?;
             }
             SourceChange::Remove(r) => {
                 let params: Vec<SqlVal> =
                     self.primary_key.iter().map(|k| self.param(k, r.get(k).cloned().unwrap_or(Value::Null))).collect();
                 let sql = format!("DELETE FROM \"{}\" WHERE {}", self.table, self.pk_where());
-                self.db.prepare_cached(&sql).unwrap().execute(rusqlite::params_from_iter(params)).unwrap();
+                self.db.prepare_cached(&sql)?.execute(rusqlite::params_from_iter(params))?;
             }
             SourceChange::Edit { row, old_row } => {
                 let params: Vec<SqlVal> =
                     self.primary_key.iter().map(|k| self.param(k, old_row.get(k).cloned().unwrap_or(Value::Null))).collect();
                 let sql = format!("DELETE FROM \"{}\" WHERE {}", self.table, self.pk_where());
-                self.db.prepare_cached(&sql).unwrap().execute(rusqlite::params_from_iter(params)).unwrap();
+                self.db.prepare_cached(&sql)?.execute(rusqlite::params_from_iter(params))?;
                 let (sql, p) = self.insert_sql(row);
-                self.db.prepare_cached(&sql).unwrap().execute(rusqlite::params_from_iter(p)).unwrap();
+                self.db.prepare_cached(&sql)?.execute(rusqlite::params_from_iter(p))?;
             }
         }
+        Ok(())
     }
 
     /// All rows (primary-key order) — for snapshotting the replica.
@@ -385,6 +475,14 @@ impl SqliteSource {
         if let Some(start) = &req.start {
             let conv = |col: &str, v: Value| self.param(col, v);
             wheres.push(start_bound_sql(&eff, &start.row, start.basis, &mut params, &conv));
+        }
+        // WHERE pushdown: filter inside SQLite instead of materializing the
+        // whole table into RAM and filtering above (audit Tier 2). Superset-
+        // safe by construction, and the pipeline Filter re-checks every row.
+        if let Some(cond) = &conn.filter {
+            if let Some(sql) = pushed_where_sql(cond, &mut params, &|col, v| self.param(col, v)) {
+                wheres.push(sql);
+            }
         }
         let order = eff
             .iter()
@@ -516,12 +614,23 @@ impl SqliteSource {
 /// Connect a new consumer; returns a handle usable as both [`Input`] and
 /// [`Operator`].
 pub fn connect(src: &Rc<RefCell<SqliteSource>>, sort: AstOrdering) -> Rc<RefCell<SqliteConnection>> {
+    connect_filtered(src, sort, None)
+}
+
+/// [`connect`] with a WHERE condition offered for fetch pushdown.
+pub fn connect_filtered(
+    src: &Rc<RefCell<SqliteSource>>,
+    sort: AstOrdering,
+    cond: Option<&oql::ast::Condition>,
+) -> Rc<RefCell<SqliteConnection>> {
     let conn_idx;
     {
         let mut s = src.borrow_mut();
         let schema = s.build_schema(&sort);
+        let filter = cond.and_then(|c| pushable_subset(c, &s.columns));
         let connection = Conn {
             sort,
+            filter,
             output: None,
             active_pos: s.active_connections.len(),
             last_pushed_epoch: 0,
@@ -543,7 +652,10 @@ pub fn connect(src: &Rc<RefCell<SqliteSource>>, sort: AstOrdering) -> Rc<RefCell
 }
 
 /// Apply a change and propagate it to connected outputs (overlay then commit).
-pub fn source_push(src: &Rc<RefCell<SqliteSource>>, change: SourceChange) {
+/// A storage error propagates AFTER the overlay is cleared (pipelines saw a
+/// change that won't commit — the caller must roll back the surrounding
+/// replication transaction and halt, never commit the watermark over it).
+pub fn source_push(src: &Rc<RefCell<SqliteSource>>, change: SourceChange) -> anyhow::Result<()> {
     let epoch = {
         let mut s = src.borrow_mut();
         s.push_epoch += 1;
@@ -573,7 +685,7 @@ pub fn source_push(src: &Rc<RefCell<SqliteSource>>, change: SourceChange) {
     }
     let mut s = src.borrow_mut();
     s.overlay = None;
-    s.write_change(&change);
+    s.write_change(&change)
 }
 
 fn base_change(change: &SourceChange) -> Change {
@@ -658,6 +770,14 @@ impl SourceProvider for SqliteProvider {
     fn connect(&self, table: &str, sort: AstOrdering) -> Option<OpHandle> {
         self.sources.get(table).map(|s| OpHandle::new(connect(s, sort)))
     }
+    fn connect_filtered(
+        &self,
+        table: &str,
+        sort: AstOrdering,
+        cond: Option<&oql::ast::Condition>,
+    ) -> Option<OpHandle> {
+        self.sources.get(table).map(|s| OpHandle::new(connect_filtered(s, sort, cond)))
+    }
 }
 
 /// A SQLite-backed replica: a [`ReplicaBackend`](crate::replica::ReplicaBackend)
@@ -671,6 +791,9 @@ pub struct SqliteReplica {
     conn: Rc<Connection>,
     /// The database file path (`None` for in-memory replicas).
     path: Option<std::path::PathBuf>,
+    /// Upstream-name → source-key aliases created by upstream
+    /// `ALTER TABLE … RENAME TO` (see the in-memory replica's field).
+    aliases: RefCell<std::collections::HashMap<String, String>>,
 }
 
 /// Tuning knobs for a [`SqliteReplica`]'s connection. Defaults leave SQLite's
@@ -722,6 +845,27 @@ impl SqliteReplica {
         self.path.as_deref()
     }
 
+    /// Set `PRAGMA wal_autocheckpoint` (0 disables). Incremental WAL-shipping
+    /// backups take manual control of checkpoints: the main db file must stay
+    /// byte-stable between generation rolls so only the WAL carries changes.
+    pub fn set_wal_autocheckpoint(&self, frames: i64) -> anyhow::Result<()> {
+        self.conn.pragma_update(None, "wal_autocheckpoint", frames)?;
+        Ok(())
+    }
+
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)`: fold the whole WAL into the main
+    /// file and reset the WAL to empty. Errors if the checkpoint could not
+    /// complete (e.g. a concurrent reader pinned the WAL).
+    pub fn checkpoint_truncate(&self) -> anyhow::Result<()> {
+        let (busy, _log, _ckpt): (i64, i64, i64) = self.conn.query_row(
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        anyhow::ensure!(busy == 0, "wal_checkpoint(TRUNCATE) blocked (busy)");
+        Ok(())
+    }
+
     fn with_connection(
         conn: Connection,
         path: Option<std::path::PathBuf>,
@@ -755,11 +899,39 @@ impl SqliteReplica {
         let _ = conn.execute_batch(
             "ALTER TABLE orbit_replication_state ADD COLUMN pos INTEGER NOT NULL DEFAULT 0",
         );
+        // Which tables have been fully initial-synced. Consulted on a
+        // watermark resume so tables newly added to the config get backfilled
+        // instead of silently starting empty (audit Tier 0.5).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS orbit_synced_tables (name TEXT PRIMARY KEY)",
+        )
+        .expect("create synced-tables registry");
+        // Migration: a pre-registry file that already carries a watermark was
+        // fully synced by an older version — count its physical tables as
+        // synced so the upgrade doesn't trigger a full re-seed.
+        let has_watermark: bool = conn
+            .query_row(
+                "SELECT lsn > 0 OR pos > 0 FROM orbit_replication_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        let registry_empty: bool = conn
+            .query_row("SELECT count(*) = 0 FROM orbit_synced_tables", [], |r| r.get(0))
+            .unwrap_or(true);
+        if has_watermark && registry_empty {
+            let _ = conn.execute_batch(
+                "INSERT OR IGNORE INTO orbit_synced_tables (name)
+                 SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'orbit_%' AND name NOT LIKE 'sqlite_%'",
+            );
+        }
         SqliteReplica {
             sources: std::collections::HashMap::new(),
             columns: std::collections::HashMap::new(),
             conn: Rc::new(conn),
             path,
+            aliases: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -803,6 +975,15 @@ impl SqliteReplica {
     pub fn source(&self, name: &str) -> Option<Rc<RefCell<SqliteSource>>> {
         self.sources.get(name).cloned()
     }
+
+    /// Resolve an upstream table name to its source key (following a RENAME
+    /// alias when the name isn't a source itself).
+    fn resolve_key(&self, table: &str) -> String {
+        if self.sources.contains_key(table) {
+            return table.to_string();
+        }
+        self.aliases.borrow().get(table).cloned().unwrap_or_else(|| table.to_string())
+    }
 }
 
 impl SourceProvider for SqliteReplica {
@@ -812,56 +993,94 @@ impl SourceProvider for SqliteReplica {
     fn connect(&self, table: &str, sort: AstOrdering) -> Option<OpHandle> {
         self.sources.get(table).map(|s| OpHandle::new(connect(s, sort)))
     }
+    fn connect_filtered(
+        &self,
+        table: &str,
+        sort: AstOrdering,
+        cond: Option<&oql::ast::Condition>,
+    ) -> Option<OpHandle> {
+        self.sources.get(table).map(|s| OpHandle::new(connect_filtered(s, sort, cond)))
+    }
 }
 
 impl crate::replica::ReplicaBackend for SqliteReplica {
-    fn apply(&self, event: crate::LogicalEvent) {
+    fn apply(&self, event: crate::LogicalEvent) -> anyhow::Result<()> {
         use crate::LogicalEvent as E;
         match event {
             E::Insert { table, row } => {
-                if let Some(src) = self.sources.get(&table) {
+                if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                     let existing = src.borrow().lookup(&row);
                     match existing {
-                        None => source_push(src, SourceChange::Add(row)),
-                        Some(old) => source_push(src, SourceChange::Edit { row, old_row: old }),
+                        None => source_push(src, SourceChange::Add(row))?,
+                        Some(old) => source_push(src, SourceChange::Edit { row, old_row: old })?,
                     }
                 }
             }
             E::Delete { table, old_row } => {
-                if let Some(src) = self.sources.get(&table) {
+                if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                     let stored = src.borrow().lookup(&old_row);
                     if let Some(stored) = stored {
-                        source_push(src, SourceChange::Remove(stored));
+                        source_push(src, SourceChange::Remove(stored))?;
                     }
                 }
             }
-            E::Update { table, row, old_row } => {
-                if let Some(src) = self.sources.get(&table) {
+            E::Update { table, mut row, old_row } => {
+                if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                     let key = old_row.as_ref().unwrap_or(&row);
                     let existing = src.borrow().lookup(key);
                     match existing {
-                        Some(old) => source_push(src, SourceChange::Edit { row, old_row: old }),
-                        None => source_push(src, SourceChange::Add(row)),
+                        Some(old) => {
+                            // Unchanged-TOAST merge (apply side): columns the
+                            // stream omitted ('u') are absent from `row`; fill
+                            // them from the stored row. Without this the Edit's
+                            // DELETE + re-INSERT binds them as explicit NULL.
+                            row.merge_missing_from(&old);
+                            source_push(src, SourceChange::Edit { row, old_row: old })?
+                        }
+                        None => source_push(src, SourceChange::Add(row))?,
                     }
                 }
             }
-            E::Relation { table, columns } => {
+            E::Truncate { tables } => {
+                for table in tables {
+                    if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
+                        // Remove every row THROUGH the pipelines so subscribed
+                        // queries and client caches converge (not just storage).
+                        let rows = src.borrow().all_rows();
+                        for row in rows {
+                            source_push(src, SourceChange::Remove(row))?;
+                        }
+                    }
+                }
+            }
+            E::Relation { table, columns, renamed_from } => {
+                if let Some(from) = renamed_from {
+                    let key = self.resolve_key(&from);
+                    if !self.sources.contains_key(&table) && self.sources.contains_key(&key) {
+                        eprintln!(
+                            "upstream renamed table {from} -> {table}; aliasing so clients subscribed to {key} keep receiving changes"
+                        );
+                        self.aliases.borrow_mut().insert(table.clone(), key);
+                    }
+                }
                 // Mirror the in-memory replica: reconcile the physical table to
                 // the upstream column set (DDL). `self.columns` stays at the
                 // boot-time declaration — exact parity with the in-memory
                 // backend, whose `Replica.columns` also goes stale; it is only
                 // used for the initial-sync SELECT.
-                if let Some(src) = self.sources.get(&table) {
+                if let Some(src) = self.sources.get(&self.resolve_key(&table)) {
                     src.borrow_mut().reconcile_columns(&columns);
                 }
             }
             E::Begin | E::Commit | E::Other => {}
         }
+        Ok(())
     }
-    fn seed(&self, table: &str, row: Row) {
+    fn seed(&self, table: &str, row: Row) -> anyhow::Result<()> {
         if let Some(src) = self.sources.get(table) {
-            src.borrow().insert_initial(&row);
+            src.borrow().insert_initial(&row)?;
         }
+        Ok(())
     }
     fn table_columns(&self, table: &str) -> Vec<(String, ColumnType)> {
         self.columns.get(table).cloned().unwrap_or_default()
@@ -873,22 +1092,55 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
             .collect()
     }
 
-    fn begin_txn(&self) {
+    fn begin_txn(&self) -> anyhow::Result<()> {
         // One SQLite transaction per upstream transaction: a crash mid-apply
         // rolls back on reopen instead of persisting a torn half-transaction.
-        let _ = self.conn.execute_batch("BEGIN IMMEDIATE");
+        // A failed BEGIN must propagate: applying in autocommit would tear.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
     }
 
-    fn commit_txn(&self, lsn: u64, pos: u64) {
-        // The watermark commits atomically WITH the rows it describes.
-        let _ = self
-            .conn
+    fn commit_txn(&self, lsn: u64, pos: u64) -> anyhow::Result<()> {
+        // The watermark commits atomically WITH the rows it describes. A
+        // failure here must propagate — acking WAL past an uncommitted
+        // watermark would lose the transaction on restart.
+        self.conn
             .prepare_cached(
                 "INSERT INTO orbit_replication_state (id, lsn, pos) VALUES (1, ?1, ?2)
                  ON CONFLICT (id) DO UPDATE SET lsn = excluded.lsn, pos = excluded.pos",
-            )
-            .and_then(|mut st| st.execute([lsn as i64, pos as i64]));
-        let _ = self.conn.execute_batch("COMMIT");
+            )?
+            .execute([lsn as i64, pos as i64])?;
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    fn rollback_txn(&self) {
+        let _ = self.conn.execute_batch("ROLLBACK");
+    }
+
+    fn clear_table(&self, table: &str) -> anyhow::Result<()> {
+        if self.sources.contains_key(table) {
+            self.conn
+                .execute_batch(&format!("DELETE FROM {}", ident(table)))?;
+        }
+        Ok(())
+    }
+
+    fn synced_tables(&self) -> Option<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare_cached("SELECT name FROM orbit_synced_tables").ok()?;
+        let set = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+        Some(set)
+    }
+
+    fn mark_synced(&self, table: &str) -> anyhow::Result<()> {
+        self.conn
+            .prepare_cached("INSERT OR IGNORE INTO orbit_synced_tables (name) VALUES (?1)")?
+            .execute([table])?;
+        Ok(())
     }
 
     fn resume_watermark(&self) -> Option<u64> {
@@ -944,7 +1196,173 @@ impl crate::replica::ReplicaBackend for SqliteReplica {
             let _ = self.conn.execute_batch(&sql);
         }
         let _ = self.conn.execute_batch("DELETE FROM orbit_replication_state");
+        let _ = self.conn.execute_batch("DELETE FROM orbit_synced_tables");
         let _ = self.conn.execute_batch("COMMIT");
+    }
+}
+
+/// Reduce a WHERE condition to the subset that can be pushed into SQLite
+/// SQL **without ever excluding a row the OQL predicate would admit** (the
+/// superset rule — the pipeline Filter re-applies the full predicate, so SQL
+/// may only ever admit MORE):
+/// * simple `col <op> literal` for `=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`,
+///   `NOT IN`, and `IS` — on columns whose declared type is not `Json`
+///   (JSON's TEXT encoding differs from literal bindings) and with non-null
+///   literals (OQL: any non-`IS` op vs NULL is constant false; SQL agrees,
+///   but we simply skip). `IS NOT` is skipped: OQL admits absent-column rows
+///   that SQL's `IS NOT NULL` would exclude.
+/// * `LIKE`/`ILIKE` are skipped (SQLite LIKE is ASCII-case-insensitive).
+/// * `AND`: any pushable subset of its children (dropping a child widens).
+/// * `OR`: only when EVERY child is fully pushable (dropping one would
+///   narrow the union — an exclusion violation).
+/// * `EXISTS` subqueries: never pushed.
+fn pushable_subset(
+    cond: &oql::ast::Condition,
+    columns: &BTreeMap<String, ColumnType>,
+) -> Option<oql::ast::Condition> {
+    use oql::ast::{Condition as C, LiteralValue, SimpleOperator as Op, ValuePosition as VP};
+    match cond {
+        C::Simple { op, left, right } => {
+            let VP::Column { name } = left else { return None };
+            match columns.get(name) {
+                None | Some(ColumnType::Json) => return None,
+                _ => {}
+            }
+            let VP::Literal { value } = right else { return None };
+            match op {
+                Op::Like | Op::NotLike | Op::ILike | Op::NotILike | Op::IsNot => None,
+                Op::Is => match value {
+                    // `IS NULL` is safe: SQL admits absent-column rows OQL
+                    // rejects (superset), never the reverse.
+                    _ => Some(cond.clone()),
+                },
+                _ => match value {
+                    LiteralValue::Null => None, // OQL: constant false; skip
+                    LiteralValue::Array(_) if matches!(op, Op::In | Op::NotIn) => {
+                        Some(cond.clone())
+                    }
+                    LiteralValue::Array(_) => None,
+                    _ => Some(cond.clone()),
+                },
+            }
+        }
+        C::And { conditions } => {
+            let kept: Vec<oql::ast::Condition> =
+                conditions.iter().filter_map(|c| pushable_subset(c, columns)).collect();
+            if kept.is_empty() {
+                None
+            } else {
+                Some(C::And { conditions: kept })
+            }
+        }
+        C::Or { conditions } => {
+            let kept: Vec<oql::ast::Condition> =
+                conditions.iter().filter_map(|c| pushable_subset(c, columns)).collect();
+            if kept.len() == conditions.len() {
+                Some(C::Or { conditions: kept })
+            } else {
+                None
+            }
+        }
+        C::CorrelatedSubquery { .. } => None,
+    }
+}
+
+fn literal_to_value(v: &oql::ast::LiteralValue) -> Value {
+    use oql::ast::LiteralValue as LV;
+    match v {
+        LV::Null => Value::Null,
+        LV::Bool(b) => Value::Bool(*b),
+        LV::Number(n) => Value::Number(*n),
+        LV::String(s) => Value::String(s.clone()),
+        LV::Array(_) => Value::Null, // handled by the IN path
+    }
+}
+
+fn literal_prim_to_value(v: &oql::ast::LiteralPrimitive) -> Value {
+    use oql::ast::LiteralPrimitive as LP;
+    match v {
+        LP::Bool(b) => Value::Bool(*b),
+        LP::Number(n) => Value::Number(*n),
+        LP::String(s) => Value::String(s.clone()),
+    }
+}
+
+/// Render a pushable condition (from [`pushable_subset`]) as SQL, appending
+/// its bindings to `params`.
+fn pushed_where_sql(
+    cond: &oql::ast::Condition,
+    params: &mut Vec<SqlVal>,
+    conv: &dyn Fn(&str, Value) -> SqlVal,
+) -> Option<String> {
+    use oql::ast::{Condition as C, LiteralValue, SimpleOperator as Op, ValuePosition as VP};
+    match cond {
+        C::Simple { op, left, right } => {
+            let VP::Column { name } = left else { return None };
+            let VP::Literal { value } = right else { return None };
+            let col = ident(name);
+            match op {
+                Op::In | Op::NotIn => {
+                    let LiteralValue::Array(items) = value else { return None };
+                    if items.is_empty() {
+                        // IN () is invalid SQL; OQL: IN [] = false, NOT IN [] =
+                        // true for non-null lhs. Render equivalents.
+                        return Some(if matches!(op, Op::In) {
+                            "0".to_string()
+                        } else {
+                            format!("{col} IS NOT NULL")
+                        });
+                    }
+                    let mut holes = Vec::with_capacity(items.len());
+                    for item in items {
+                        params.push(conv(name, literal_prim_to_value(item)));
+                        holes.push(format!("?{}", params.len()));
+                    }
+                    let not = if matches!(op, Op::NotIn) { " NOT" } else { "" };
+                    Some(format!("{col}{not} IN ({})", holes.join(", ")))
+                }
+                Op::Is => {
+                    if matches!(value, LiteralValue::Null) {
+                        Some(format!("{col} IS NULL"))
+                    } else {
+                        params.push(conv(name, literal_to_value(value)));
+                        Some(format!("{col} IS ?{}", params.len()))
+                    }
+                }
+                Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+                    let sql_op = match op {
+                        Op::Eq => "=",
+                        Op::Ne => "<>",
+                        Op::Lt => "<",
+                        Op::Le => "<=",
+                        Op::Gt => ">",
+                        Op::Ge => ">=",
+                        _ => unreachable!(),
+                    };
+                    params.push(conv(name, literal_to_value(value)));
+                    Some(format!("{col} {sql_op} ?{}", params.len()))
+                }
+                _ => None,
+            }
+        }
+        C::And { conditions } => {
+            let parts: Vec<String> =
+                conditions.iter().filter_map(|c| pushed_where_sql(c, params, conv)).collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(format!("({})", parts.join(" AND ")))
+            }
+        }
+        C::Or { conditions } => {
+            let mut parts = Vec::with_capacity(conditions.len());
+            for c in conditions {
+                // All-or-nothing (guaranteed by pushable_subset).
+                parts.push(pushed_where_sql(c, params, conv)?);
+            }
+            Some(format!("({})", parts.join(" OR ")))
+        }
+        C::CorrelatedSubquery { .. } => None,
     }
 }
 
@@ -1049,6 +1467,8 @@ impl rusqlite::ToSql for SqlVal {
                     ToSqlOutput::Owned(SqliteValue::Real(*n))
                 }
             }
+            // Exact 64-bit integers (beyond f64's 2^53) stay exact in SQLite.
+            Value::Int(i) => ToSqlOutput::Owned(SqliteValue::Integer(*i)),
             Value::String(s) => ToSqlOutput::Owned(SqliteValue::Text(s.clone())),
             Value::Json(j) => ToSqlOutput::Owned(SqliteValue::Text(j.to_string())),
         })
@@ -1062,7 +1482,8 @@ fn read_value(row: &rusqlite::Row, idx: usize, ty: ColumnType) -> Value {
         Ok(v) => match ty {
             ColumnType::Boolean => Value::Bool(v.as_i64().map(|i| i != 0).unwrap_or(false)),
             ColumnType::Number => match v {
-                ValueRef::Integer(i) => Value::Number(i as f64),
+                // Normalizing constructor: representable → Number, else exact Int.
+                ValueRef::Integer(i) => Value::int(i),
                 ValueRef::Real(f) => Value::Number(f),
                 ValueRef::Text(t) => std::str::from_utf8(t)
                     .ok()
@@ -1077,7 +1498,7 @@ fn read_value(row: &rusqlite::Row, idx: usize, ty: ColumnType) -> Value {
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
                     .map(Value::from_json)
                     .unwrap_or(Value::Null),
-                ValueRef::Integer(i) => Value::Number(i as f64),
+                ValueRef::Integer(i) => Value::int(i),
                 ValueRef::Real(f) => Value::Number(f),
                 _ => Value::Null,
             },

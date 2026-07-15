@@ -1,5 +1,5 @@
 //! Observability: a per-node metrics registry, a Prometheus text renderer, and
-//! a tiny hand-rolled HTTP responder serving `/metrics`, `/ready`, and `/live`.
+//! a tiny hand-rolled HTTP responder serving `/metrics`, `/ready`, `/live`, and `/statz` (per-query costs).
 //!
 //! Zero dependencies by design — this repo already hand-rolls its TCP change
 //! stream and WebSocket handshake, everything runs on a current-thread
@@ -53,6 +53,8 @@ pub enum ReadyComponent {
 pub struct Metrics {
     pub role: Role,
     ready: AtomicBool,
+    /// Draining flag: set on SIGTERM; forces `/ready` to 503.
+    pub draining: AtomicBool,
     ready_components: [AtomicBool; 3],
 
     // Replica.
@@ -63,6 +65,8 @@ pub struct Metrics {
 
     // Snapshots.
     pub snapshot_bytes: AtomicU64,
+    /// Seconds since the last successful backup cycle (wedge indicator).
+    pub snapshot_age_seconds: AtomicU64,
     pub snapshot_restore_peak_rss_bytes: AtomicU64,
 
     // Change stream (replicator).
@@ -80,6 +84,18 @@ pub struct Metrics {
     pub active_queries: AtomicU64,
     pub matched_rows: AtomicU64,
     pub hydration_bytes_total: AtomicU64,
+    /// Total hydrations served and their cumulative materialize time/rows —
+    /// rate + division give mean cost; the slow-hydration log line carries the
+    /// per-query attribution.
+    pub hydrations_total: AtomicU64,
+    pub hydration_ms_total: AtomicU64,
+    pub hydration_ops_total: AtomicU64,
+    /// Hydrations whose materialize phase exceeded the slow budget.
+    pub slow_hydrations_total: AtomicU64,
+    /// Advance (tick-flush) cycles and cumulative time — the push-side analog.
+    pub advances_total: AtomicU64,
+    pub advance_ms_total: AtomicU64,
+    pub slow_advances_total: AtomicU64,
     pub poke_bytes_total: AtomicU64,
     pub poke_parts_total: AtomicU64,
     pub pokes_total: AtomicU64,
@@ -90,12 +106,14 @@ impl Metrics {
         let m = Metrics {
             role,
             ready: AtomicBool::new(false),
+            draining: AtomicBool::new(false),
             ready_components: Default::default(),
             replica_rows: Default::default(),
             replica_logical_bytes: Default::default(),
             replica_sqlite_file_bytes: Default::default(),
             replica_pos: Default::default(),
             snapshot_bytes: Default::default(),
+            snapshot_age_seconds: Default::default(),
             snapshot_restore_peak_rss_bytes: Default::default(),
             change_ring_entries: Default::default(),
             change_ring_bytes: Default::default(),
@@ -107,6 +125,13 @@ impl Metrics {
             active_queries: Default::default(),
             matched_rows: Default::default(),
             hydration_bytes_total: Default::default(),
+            hydrations_total: Default::default(),
+            hydration_ms_total: Default::default(),
+            hydration_ops_total: Default::default(),
+            slow_hydrations_total: Default::default(),
+            advances_total: Default::default(),
+            advance_ms_total: Default::default(),
+            slow_advances_total: Default::default(),
             poke_bytes_total: Default::default(),
             pokes_total: Default::default(),
             poke_parts_total: Default::default(),
@@ -129,7 +154,17 @@ impl Metrics {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.ready.load(Ordering::Acquire) && !self.draining.load(Ordering::Acquire)
+    }
+
+    /// Enter draining: `/ready` flips to 503 so the load balancer stops
+    /// routing new clients here, while existing connections keep being served
+    /// until the drain window elapses. Part of graceful deploys (previously
+    /// crash-only: every deploy was an instant full-fleet rehydration storm).
+    pub fn mark_draining(&self) {
+        if !self.draining.swap(true, Ordering::AcqRel) {
+            eprintln!("{}: DRAINING (readiness now 503; existing clients still served)", self.role.as_str());
+        }
     }
 
     /// Render in Prometheus text exposition format. Process gauges (RSS) are
@@ -149,6 +184,7 @@ impl Metrics {
         gauge("orbit_replica_sqlite_file_bytes", "Size of the SQLite replica database", self.replica_sqlite_file_bytes.load(Ordering::Relaxed));
         gauge("orbit_replica_pos", "Applied change-stream position", self.replica_pos.load(Ordering::Relaxed));
         gauge("orbit_snapshot_bytes", "Size of the last written/restored snapshot", self.snapshot_bytes.load(Ordering::Relaxed));
+        gauge("orbit_snapshot_age_seconds", "Seconds since the last successful backup cycle", self.snapshot_age_seconds.load(Ordering::Relaxed));
         gauge("orbit_snapshot_restore_peak_rss_bytes", "Peak RSS observed during snapshot restore", self.snapshot_restore_peak_rss_bytes.load(Ordering::Relaxed));
         gauge("orbit_change_ring_entries", "Events in the change-stream ring", self.change_ring_entries.load(Ordering::Relaxed));
         gauge("orbit_change_ring_bytes", "Estimated bytes in the change-stream ring", self.change_ring_bytes.load(Ordering::Relaxed));
@@ -160,6 +196,13 @@ impl Metrics {
         gauge("orbit_active_queries", "Materialized client queries", self.active_queries.load(Ordering::Relaxed));
         gauge("orbit_matched_rows", "Rows referenced by client views", self.matched_rows.load(Ordering::Relaxed));
         gauge("orbit_hydration_bytes_total", "Serialized bytes sent in initial-subscribe pokes", self.hydration_bytes_total.load(Ordering::Relaxed));
+        gauge("orbit_hydrations_total", "Hydrations served", self.hydrations_total.load(Ordering::Relaxed));
+        gauge("orbit_hydration_ms_total", "Cumulative hydration materialize time (ms)", self.hydration_ms_total.load(Ordering::Relaxed));
+        gauge("orbit_hydration_ops_total", "Cumulative hydration result ops", self.hydration_ops_total.load(Ordering::Relaxed));
+        gauge("orbit_slow_hydrations_total", "Hydrations over the slow budget", self.slow_hydrations_total.load(Ordering::Relaxed));
+        gauge("orbit_advances_total", "Tick-flush advance cycles", self.advances_total.load(Ordering::Relaxed));
+        gauge("orbit_advance_ms_total", "Cumulative advance time (ms)", self.advance_ms_total.load(Ordering::Relaxed));
+        gauge("orbit_slow_advances_total", "Advance cycles over the slow budget", self.slow_advances_total.load(Ordering::Relaxed));
         gauge("orbit_poke_bytes_total", "Serialized bytes sent in all pokes", self.poke_bytes_total.load(Ordering::Relaxed));
         gauge("orbit_poke_parts_total", "pokePart frames sent", self.poke_parts_total.load(Ordering::Relaxed));
         gauge("orbit_pokes_total", "Poke transactions sent", self.pokes_total.load(Ordering::Relaxed));
@@ -243,10 +286,12 @@ async fn handle_http(sock: tokio::net::TcpStream, m: &Metrics) -> anyhow::Result
             if m.is_ready() {
                 ("200 OK", "text/plain", "ready\n".to_string())
             } else {
-                ("503 Service Unavailable", "text/plain", "starting\n".to_string())
+                let why = if m.draining.load(Ordering::Acquire) { "draining\n" } else { "starting\n" };
+                ("503 Service Unavailable", "text/plain", why.to_string())
             }
         }
         "/live" => ("200 OK", "text/plain", "live\n".to_string()),
+        "/statz" => ("200 OK", "application/json", render_statz()),
         _ => ("404 Not Found", "text/plain", "not found\n".to_string()),
     };
     let resp = format!(
@@ -316,4 +361,112 @@ mod tests {
         let metrics = get(addr, "/metrics").await;
         assert!(metrics.contains("orbit_ready{role=\"single-node\"} 1"));
     }
+}
+
+impl Metrics {
+    /// Record one hydration's materialize phase.
+    pub fn observe_hydration_on(&self, took: std::time::Duration, ops: u64, slow: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.hydrations_total.fetch_add(1, Relaxed);
+        self.hydration_ms_total.fetch_add(took.as_millis() as u64, Relaxed);
+        self.hydration_ops_total.fetch_add(ops, Relaxed);
+        if slow {
+            self.slow_hydrations_total.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Record one advance (tick-flush) cycle.
+    pub fn observe_advance_on(&self, took: std::time::Duration, slow: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.advances_total.fetch_add(1, Relaxed);
+        self.advance_ms_total.fetch_add(took.as_millis() as u64, Relaxed);
+        if slow {
+            self.slow_advances_total.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// Record a hydration on the node's metrics, if registered.
+pub fn observe_hydration(took: std::time::Duration, ops: u64, slow: bool) {
+    if let Some(m) = node_metrics() {
+        m.observe_hydration_on(took, ops, slow);
+    }
+}
+
+/// Record an advance cycle on the node's metrics, if registered.
+pub fn observe_advance(took: std::time::Duration, slow: bool) {
+    if let Some(m) = node_metrics() {
+        m.observe_advance_on(took, slow);
+    }
+}
+
+// --- Per-query observability (audit: "which query is expensive?" was
+// unanswerable — ~20 node-level gauges, no per-query dimension). Zero's
+// analog is /statz. Keyed by the client-supplied query hash; global (not
+// per-connection) so identical subscriptions aggregate.
+
+#[derive(Default, Clone, serde::Serialize)]
+pub struct QueryStat {
+    /// Live subscriptions of this query across all connections.
+    pub active: i64,
+    /// Hydrations served and their cumulative materialize cost.
+    pub hydrations: u64,
+    pub hydrate_ms: u64,
+    pub hydrate_rows: u64,
+    /// Incremental advances that produced ops for this query.
+    pub advances: u64,
+    pub advance_ops: u64,
+}
+
+fn query_stats() -> &'static std::sync::Mutex<std::collections::HashMap<String, QueryStat>> {
+    static STATS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, QueryStat>>,
+    > = std::sync::OnceLock::new();
+    STATS.get_or_init(Default::default)
+}
+
+pub fn record_query_hydration(hash: &str, took: std::time::Duration, rows: u64) {
+    if let Ok(mut m) = query_stats().lock() {
+        let e = m.entry(hash.to_string()).or_default();
+        e.hydrations += 1;
+        e.hydrate_ms += took.as_millis() as u64;
+        e.hydrate_rows += rows;
+    }
+}
+
+pub fn record_query_advance(hash: &str, ops: u64) {
+    if ops == 0 {
+        return;
+    }
+    if let Ok(mut m) = query_stats().lock() {
+        let e = m.entry(hash.to_string()).or_default();
+        e.advances += 1;
+        e.advance_ops += ops;
+    }
+}
+
+pub fn record_query_active(hash: &str, delta: i64) {
+    if let Ok(mut m) = query_stats().lock() {
+        let e = m.entry(hash.to_string()).or_default();
+        e.active += delta;
+    }
+}
+
+/// Render `/statz`: per-query stats as JSON, most expensive (cumulative
+/// hydrate ms, then advance ops) first, capped at 200 entries.
+pub fn render_statz() -> String {
+    let m = match query_stats().lock() {
+        Ok(m) => m,
+        Err(_) => return "{}".into(),
+    };
+    let mut entries: Vec<(&String, &QueryStat)> = m.iter().collect();
+    entries.sort_by(|a, b| {
+        (b.1.hydrate_ms, b.1.advance_ops).cmp(&(a.1.hydrate_ms, a.1.advance_ops))
+    });
+    entries.truncate(200);
+    let obj: serde_json::Map<String, serde_json::Value> = entries
+        .into_iter()
+        .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or(serde_json::Value::Null)))
+        .collect();
+    serde_json::to_string_pretty(&serde_json::Value::Object(obj)).unwrap_or_else(|_| "{}".into())
 }

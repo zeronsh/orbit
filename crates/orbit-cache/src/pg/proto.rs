@@ -309,6 +309,70 @@ impl RawConn {
         Ok(())
     }
 
+    /// `CREATE_REPLICATION_SLOT ... LOGICAL pgoutput (SNAPSHOT 'export')`:
+    /// creates the slot AND exports the snapshot it was created at. A SQL
+    /// session that runs `SET TRANSACTION SNAPSHOT '<name>'` then reads the
+    /// database EXACTLY at the slot's consistent point — the initial sync and
+    /// the stream tile perfectly with no overlap window. The snapshot stays
+    /// valid only while THIS connection lives; keep it open until the sync
+    /// commits. Returns `(consistent_point_lsn, snapshot_name)`.
+    pub async fn create_replication_slot_exported(
+        &mut self,
+        slot: &str,
+    ) -> Result<(u64, String)> {
+        self.send_query(&format!(
+            "CREATE_REPLICATION_SLOT {slot} LOGICAL pgoutput (SNAPSHOT 'export')"
+        ))
+        .await?;
+        let mut fields: Vec<Option<String>> = Vec::new();
+        loop {
+            let msg = self.read_message().await?;
+            match msg.tag {
+                b'D' => {
+                    // DataRow: u16 col count, then per column i32 len + bytes.
+                    let b = &msg.body;
+                    if b.len() < 2 {
+                        bail!("short DataRow");
+                    }
+                    let n = u16::from_be_bytes([b[0], b[1]]) as usize;
+                    let mut off = 2usize;
+                    for _ in 0..n {
+                        if off + 4 > b.len() {
+                            bail!("short DataRow column header");
+                        }
+                        let len = i32::from_be_bytes(b[off..off + 4].try_into().unwrap());
+                        off += 4;
+                        if len < 0 {
+                            fields.push(None);
+                        } else {
+                            let len = len as usize;
+                            if off + len > b.len() {
+                                bail!("short DataRow column");
+                            }
+                            fields.push(Some(
+                                String::from_utf8_lossy(&b[off..off + len]).into_owned(),
+                            ));
+                            off += len;
+                        }
+                    }
+                }
+                b'E' => bail!("CREATE_REPLICATION_SLOT failed: {}", parse_error(&msg.body)),
+                b'Z' => break, // ReadyForQuery
+                _ => {}        // RowDescription / CommandComplete / ParameterStatus
+            }
+        }
+        // Columns: slot_name, consistent_point, snapshot_name, output_plugin.
+        let lsn = fields
+            .get(1)
+            .and_then(|f| f.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("no consistent_point in CREATE_REPLICATION_SLOT reply"))?;
+        let snapshot = fields
+            .get(2)
+            .and_then(|f| f.clone())
+            .ok_or_else(|| anyhow::anyhow!("no snapshot_name in CREATE_REPLICATION_SLOT reply"))?;
+        Ok((parse_lsn(lsn)?, snapshot))
+    }
+
     /// Begin `START_REPLICATION` on `slot`/`publication` from `start_lsn`.
     /// After this the server enters CopyBoth mode and streams `CopyData`.
     pub async fn start_replication(

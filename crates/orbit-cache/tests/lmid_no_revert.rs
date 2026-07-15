@@ -115,7 +115,7 @@ async fn lmid_ack_rides_with_own_rows_not_another_clients_tick() {
             let replica = Rc::new(replica);
             let mutators = Rc::new(MutatorRegistry::new());
             let lmids: LmidMap = Rc::new(RefCell::new(HashMap::new()));
-            let (tick_tx, _) = tokio::sync::broadcast::channel::<()>(16);
+            let (tick_tx, _) = tokio::sync::broadcast::channel::<orbit_cache::server::Tick>(16);
 
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -171,7 +171,7 @@ async fn lmid_ack_rides_with_own_rows_not_another_clients_tick() {
             // B's write commits: B's row + B's lastMutationID land together, then tick.
             source_push(&src, SourceChange::Add(row("b1")));
             lmids.borrow_mut().insert("cB".into(), 1);
-            tick_tx.send(()).unwrap();
+            tick_tx.send(std::sync::Arc::new(Vec::new())).unwrap();
 
             // A sees B's row but NOT an ack for A's own mutation (the bug would ack
             // cA here — before A's row exists — and revert A's optimistic pixel).
@@ -190,7 +190,7 @@ async fn lmid_ack_rides_with_own_rows_not_another_clients_tick() {
             // in the same commit → the ack rides with the row.
             source_push(&src, SourceChange::Add(row("a1")));
             lmids.borrow_mut().insert("cA".into(), 1);
-            tick_tx.send(()).unwrap();
+            tick_tx.send(std::sync::Arc::new(Vec::new())).unwrap();
 
             let (a_ids, a_lmids) = read_poke(&mut a).await;
             assert_eq!(a_ids, vec!["a1"]);

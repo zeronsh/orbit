@@ -61,6 +61,8 @@ pub fn capture_lmid(ev: &crate::LogicalEvent, lmids: &LmidMap) -> bool {
     };
     let id = match row.get("last_mutation_id") {
         Some(Value::Number(n)) => *n as u64,
+        // int8 column: values beyond 2^53 arrive as exact Ints.
+        Some(Value::Int(i)) => *i as u64,
         _ => return false,
     };
     let mut map = lmids.borrow_mut();
@@ -87,7 +89,24 @@ struct ActiveQuery {
     hash: String,
     catch: Rc<RefCell<Catch>>,
     schema: Rc<oql::ivm::Schema>,
+    /// Tables this query reads (incl. subqueries) — a tick that touched none
+    /// of them cannot change the result, so the drain is skipped.
+    tables: std::collections::HashSet<String>,
 }
+
+impl Drop for ActiveQuery {
+    fn drop(&mut self) {
+        // Covers every teardown path — explicit Del, clean close, AND error
+        // disconnects — so /statz active counts can't drift.
+        crate::metrics::record_query_active(&self.hash, -1);
+    }
+}
+
+/// A replication tick: the tables the committed transaction touched. An empty
+/// list means "unknown" — every client conservatively drains. Carrying the
+/// table set suppresses no-op wakeups: previously EVERY transaction woke EVERY
+/// client task to drain all of its queries (audit Tier 2).
+pub type Tick = std::sync::Arc<Vec<String>>;
 
 /// Serve a single WebSocket connection until it closes.
 ///
@@ -261,13 +280,40 @@ async fn flush_active<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Consistency: never drain Catch buffers while a pump is mid-way through
+    // STREAMING an oversized transaction (its partial changes are already in
+    // the buffers) — a lagged tick would otherwise flush a torn transaction
+    // to the client. Free when no streamed txn is in progress.
+    let apply_lock = replica_apply_lock();
+    let consistent = apply_lock.read().await;
+    let started = std::time::Instant::now();
     let mut patches = Vec::new();
     for q in active {
         let changes = q.catch.borrow_mut().take_changes();
         if changes.is_empty() {
             continue;
         }
+        let before = patches.len();
         patches.extend(changes_to_patches_dedup(&changes, &q.schema, row_refs));
+        crate::metrics::record_query_advance(&q.hash, (patches.len() - before) as u64);
+    }
+    drop(consistent);
+    // Advancement circuit-breaker signal: a giant upstream transaction turns
+    // this synchronous drain into a shard-wide stall. The drain itself can't
+    // be aborted mid-walk (the pipelines already consumed the push), so the
+    // actionable output is detection + attribution (Zero aborts + rehydrates;
+    // Orbit's tick-drain happens after apply, so the equivalent recovery is a
+    // reconnect — which the client does if the stall exceeds its timeouts).
+    let took = started.elapsed();
+    let slow = took > slow_hydration_budget();
+    crate::metrics::observe_advance(took, slow);
+    if slow {
+        eprintln!(
+            "slow advance: draining {} queries produced {} ops in {took:?} (budget {:?})",
+            active.len(),
+            patches.len(),
+            slow_hydration_budget()
+        );
     }
     if !patches.is_empty() || !lmids.is_empty() {
         let lmids = if lmids.is_empty() { None } else { Some(lmids) };
@@ -342,7 +388,7 @@ thread_local! {
     /// bounds peak memory to `ORBIT_MAX_CONCURRENT_HYDRATIONS` × result
     /// (default 1). Queued clients hydrate as soon as a permit frees — they
     /// wait, they don't fail.
-    static HYDRATION_GATE: Rc<tokio::sync::Semaphore> = Rc::new(tokio::sync::Semaphore::new(
+    static HYDRATION_GATE: std::sync::Arc<tokio::sync::Semaphore> = std::sync::Arc::new(tokio::sync::Semaphore::new(
         std::env::var("ORBIT_MAX_CONCURRENT_HYDRATIONS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
@@ -351,8 +397,125 @@ thread_local! {
     ));
 }
 
-fn hydration_gate() -> Rc<tokio::sync::Semaphore> {
-    HYDRATION_GATE.with(Rc::clone)
+fn hydration_gate() -> std::sync::Arc<tokio::sync::Semaphore> {
+    HYDRATION_GATE.with(std::sync::Arc::clone)
+}
+
+thread_local! {
+    /// Node-wide hydration RESULT-MEMORY budget, in 4 KiB permits
+    /// (`ORBIT_HYDRATION_BUDGET_BYTES`, default 64 MiB). The admission gate
+    /// bounds how many results MATERIALIZE at once; this bounds how many stay
+    /// RESIDENT through their (possibly slow-socket) pokes. Without it,
+    /// releasing the admission permit before the poke un-bounded peak memory
+    /// to (connected clients) × result — the 512 MB acceptance harness OOMs.
+    /// A result larger than the whole budget clamps to it (serializing giant
+    /// hydrations, the pre-release behavior).
+    static HYDRATION_BYTES: std::sync::Arc<tokio::sync::Semaphore> = {
+        let bytes: usize = std::env::var("ORBIT_HYDRATION_BUDGET_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(64 << 20)
+            .max(1 << 20);
+        std::sync::Arc::new(tokio::sync::Semaphore::new(bytes / 4096))
+    };
+}
+
+/// Try to reserve `bytes` of the hydration result budget WITHOUT waiting.
+/// `None` means the result may not overlap other pokes — the caller keeps the
+/// admission permit through its poke instead (bounding residency to one
+/// result, exactly the pre-overlap behavior). Waiting here would be wrong:
+/// the caller has ALREADY materialized its result, so blocking would leave it
+/// resident on top of whoever holds the budget.
+fn try_reserve_hydration_bytes(bytes: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let sem = HYDRATION_BYTES.with(std::sync::Arc::clone);
+    let want = ((bytes / 4096).max(1) as u32).min(hydration_budget_permits());
+    if want >= hydration_budget_permits() {
+        return None; // oversized result: never overlaps
+    }
+    sem.try_acquire_many_owned(want).ok()
+}
+
+fn hydration_budget_permits() -> u32 {
+    static PERMITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PERMITS.get_or_init(|| {
+        let bytes: usize = std::env::var("ORBIT_HYDRATION_BUDGET_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(64 << 20)
+            .max(1 << 20);
+        (bytes / 4096) as u32
+    })
+}
+
+thread_local! {
+    /// Node-wide replica-consistency lock (one serving thread per node).
+    ///
+    /// Readers: hydration materialize phases and tick flushes. Writer: a
+    /// replication pump STREAMING an oversized transaction (audit Tier 1.2 —
+    /// transactions larger than the buffer cap apply event-by-event across
+    /// socket awaits instead of atomically at Commit). The write hold is what
+    /// keeps a mid-transaction replica state invisible: no query and no flush
+    /// can observe a state that existed in no Postgres snapshot. `Arc` (not
+    /// `Rc`) so pumps can hold an owned write guard across await points.
+    static REPLICA_APPLY_LOCK: std::sync::Arc<tokio::sync::RwLock<()>> =
+        std::sync::Arc::new(tokio::sync::RwLock::new(()));
+}
+
+/// The node's replica-consistency lock (see [`REPLICA_APPLY_LOCK`]).
+pub fn replica_apply_lock() -> std::sync::Arc<tokio::sync::RwLock<()>> {
+    REPLICA_APPLY_LOCK.with(std::sync::Arc::clone)
+}
+
+/// Per-client serving limits (audit Tier 2 — Zero has targetClientRowCount /
+/// maxRowsPerTable / perUserMutationLimit; Orbit previously had none).
+pub struct ServeLimits {
+    /// Max concurrently-active queries per connection
+    /// (`ORBIT_MAX_QUERIES_PER_CLIENT`, default 200; 0 = unlimited).
+    pub max_queries_per_client: usize,
+    /// Max rows one query may materialize (`ORBIT_MAX_ROWS_PER_QUERY`,
+    /// default 100_000; 0 = unlimited). Checked before any client state is
+    /// touched; an over-limit query is rejected with an error message.
+    pub max_rows_per_query: usize,
+    /// Sliding-window per-client mutation rate limit
+    /// (`ORBIT_MUTATIONS_PER_MINUTE`, default 0 = unlimited).
+    pub mutations_per_minute: usize,
+    /// Eviction timeout for a poke send onto a stalled socket
+    /// (`ORBIT_POKE_TIMEOUT_SECS`, default 120). A client that stops reading
+    /// otherwise parks its task (and its view memory) forever.
+    pub poke_timeout: std::time::Duration,
+}
+
+pub fn serve_limits() -> &'static ServeLimits {
+    static LIMITS: std::sync::OnceLock<ServeLimits> = std::sync::OnceLock::new();
+    LIMITS.get_or_init(|| {
+        let num = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d)
+        };
+        ServeLimits {
+            max_queries_per_client: num("ORBIT_MAX_QUERIES_PER_CLIENT", 200),
+            max_rows_per_query: num("ORBIT_MAX_ROWS_PER_QUERY", 100_000),
+            mutations_per_minute: num("ORBIT_MUTATIONS_PER_MINUTE", 0),
+            poke_timeout: std::time::Duration::from_secs(
+                num("ORBIT_POKE_TIMEOUT_SECS", 120) as u64
+            ),
+        }
+    })
+}
+
+/// Wall-clock budget for one query's synchronous materialize phase before it
+/// is reported as a shard-stalling slow hydration (`ORBIT_SLOW_HYDRATION_MS`,
+/// default 500ms). The IVM fetch cannot yield mid-walk, so detection +
+/// per-query attribution is the actionable signal (Zero's lap-budget analog).
+fn slow_hydration_budget() -> std::time::Duration {
+    static BUDGET: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::time::Duration::from_millis(
+            std::env::var("ORBIT_SLOW_HYDRATION_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(500),
+        )
+    })
 }
 
 /// Serialized-size cap per `pokePart` frame. `ORBIT_POKE_PART_BYTES`
@@ -505,7 +668,17 @@ where
 {
     let s = serde_json::to_string(msg)?;
     let n = s.len();
-    tx.send(Message::Text(s)).await?;
+    // Slow-client eviction: a stalled socket (TCP backpressure never
+    // draining) would otherwise park this task — and everything its view
+    // holds — forever. Time out and drop the connection instead; the client
+    // reconnects and resumes from its CVR.
+    match tokio::time::timeout(serve_limits().poke_timeout, tx.send(Message::Text(s))).await {
+        Ok(res) => res?,
+        Err(_) => anyhow::bail!(
+            "client socket stalled for {:?}; evicting slow client",
+            serve_limits().poke_timeout
+        ),
+    }
     Ok(n)
 }
 
@@ -578,7 +751,7 @@ pub async fn serve_client<S, P>(
     // The last cookie the client successfully applied (from the connect URL); used
     // to prove it's safe to resume as a delta. `None` (or a mismatch) → full resync.
     client_base_cookie: Option<u64>,
-    mut ticks: tokio::sync::broadcast::Receiver<()>,
+    mut ticks: tokio::sync::broadcast::Receiver<Tick>,
     // Per-client lastMutationIDs, advanced by the replication apply loop from
     // replicated `orbit_client_mutations` rows (see [`capture_lmid`]).
     lmids: &LmidMap,
@@ -660,6 +833,11 @@ where
     // commit as the rows), so the ack rides atomically with the rows — and a tick
     // caused by ANOTHER client's write never carries this client's ack.
     let mut last_sent_lmid: u64 = 0;
+    // Sliding-window per-client mutation rate limiter (Zero's
+    // perUserMutationLimit analog). Timestamps of accepted pushes in the
+    // last minute; disabled when the env knob is 0.
+    let mut mutation_window: std::collections::VecDeque<std::time::Instant> =
+        std::collections::VecDeque::new();
 
     // Queries supplied during the handshake (Zero client `initConnection`).
     if !initial_queries.is_empty() {
@@ -683,6 +861,32 @@ where
                                 send(&mut tx, &Downstream::Pong).await?;
                             }
                             Upstream::Push(push) => {
+                                let limit = serve_limits().mutations_per_minute;
+                                if limit > 0 {
+                                    let now = std::time::Instant::now();
+                                    while mutation_window
+                                        .front()
+                                        .is_some_and(|t| now.duration_since(*t).as_secs() >= 60)
+                                    {
+                                        mutation_window.pop_front();
+                                    }
+                                    if mutation_window.len() + push.mutations.len() > limit {
+                                        // Rejected, not consumed: the lastMutationID
+                                        // does NOT advance, so the client re-sends
+                                        // later — nothing is lost, just deferred.
+                                        send(&mut tx, &Downstream::Error(orbit_protocol::ErrorBody {
+                                            kind: orbit_protocol::ErrorKind::MutationRateLimited,
+                                            message: format!(
+                                                "mutation rate limit: {limit}/min per client"
+                                            ),
+                                        }))
+                                        .await?;
+                                        continue;
+                                    }
+                                    for _ in 0..push.mutations.len() {
+                                        mutation_window.push_back(now);
+                                    }
+                                }
                                 // The lastMutationID is NOT acked here. It's advanced by the app's
                                 // PushProcessor (or the direct-write path below) in `orbit_client_mutations`
                                 // — in the same Postgres transaction as the data — and returns via
@@ -774,8 +978,9 @@ where
                 }
             }
             tick = ticks.recv() => {
-                // Lagged or closed: still attempt a flush.
-                let _ = tick;
+                // Which tables the transaction touched. Lagged/closed (or an
+                // empty set) → conservative: drain everything.
+                let touched: Option<Tick> = tick.ok();
                 // Ack this client's mutations up to the id replication has confirmed
                 // (advanced from the same commit as this tick's rows). A tick from
                 // another client's write leaves our id unchanged → no ack for us.
@@ -791,6 +996,18 @@ where
                     }
                     None => HashMap::new(),
                 };
+                // No-op wake suppression: if the transaction touched none of
+                // this client's tables and there is nothing to ack, skip the
+                // drain (and the checkpoint clock) entirely.
+                let relevant = match &touched {
+                    Some(t) if !t.is_empty() => {
+                        active.iter().any(|q| t.iter().any(|tb| q.tables.contains(tb)))
+                    }
+                    _ => true,
+                };
+                if !relevant && ack.is_empty() {
+                    continue;
+                }
                 flush_active(&active, &mut tx, &mut version, &mut base_cookie, &mut row_refs, ack).await?;
                 gauges.update(active.len(), row_refs.len());
                 // Throttled CVR checkpoint (off the per-mutation hot path) so a
@@ -874,18 +1091,63 @@ where
                     },
                 };
                 let Some(ast) = ast else { continue };
+                let limits = serve_limits();
+                if limits.max_queries_per_client > 0
+                    && active.len() >= limits.max_queries_per_client
+                {
+                    send(tx, &Downstream::Error(orbit_protocol::ErrorBody {
+                        kind: orbit_protocol::ErrorKind::ServerOverloaded,
+                        message: format!(
+                            "query {hash} rejected: max {} active queries per client",
+                            limits.max_queries_per_client
+                        ),
+                    }))
+                    .await?;
+                    continue;
+                }
+                let ast_tables = ast.tables();
                 // Admission control: the fetch + patch below materialize the
-                // full result, and the permit is held through the chunked
-                // sends — peak node memory stays at (gate width) × result
-                // instead of (connected hydrating clients) × result.
+                // full result — the permit bounds peak node memory during the
+                // MATERIALIZE phase to (gate width) × result. The permit is
+                // released before the chunked poke: holding it across a
+                // slow-socket send let one stalled client head-of-line block
+                // every queued hydration on the node (audit Tier 1.5) — the
+                // poke drains an already-materialized patch under its own TCP
+                // backpressure and needs no admission slot.
                 let gate = hydration_gate();
-                let _hydrating = gate.acquire().await.expect("hydration gate closed");
+                let mut hydrating =
+                    Some(gate.acquire_owned().await.expect("hydration gate closed"));
+                // Consistency: wait out any in-progress streamed transaction
+                // (held only while a pump streams an oversized txn — free
+                // otherwise). Released with `hydrating` before the poke.
+                let apply_lock = replica_apply_lock();
+                let consistent = apply_lock.read().await;
+                let started = std::time::Instant::now();
                 let top = build_pipeline(&ast, provider);
                 let catch = Catch::new(top.input.clone());
                 let link: Link = catch.clone();
                 top.set_output(link);
                 let schema = catch.borrow().get_schema();
                 let nodes = catch.borrow().fetch();
+                if limits.max_rows_per_query > 0 {
+                    let n = crate::view_sync::count_result_rows(&nodes);
+                    if n > limits.max_rows_per_query {
+                        // Reject BEFORE the refcounted patch build touches any
+                        // client state — nothing to unwind.
+                        drop(nodes);
+                        drop(consistent);
+                        drop(hydrating);
+                        send(tx, &Downstream::Error(orbit_protocol::ErrorBody {
+                            kind: orbit_protocol::ErrorKind::ServerOverloaded,
+                            message: format!(
+                                "query {hash} rejected: result has {n} rows (max {})",
+                                limits.max_rows_per_query
+                            ),
+                        }))
+                        .await?;
+                        continue;
+                    }
+                }
                 let mut rows = match resume {
                     Some(prior) => resume_patches_dedup(&nodes, &schema, row_refs, prior),
                     None => initial_patches_dedup(&nodes, &schema, row_refs),
@@ -894,6 +1156,41 @@ where
                 // tree here frees only its scaffolding — but do it before the
                 // (chunked, potentially slow-socket) poke holds it alive.
                 drop(nodes);
+                // Overlap policy: a result that fits the free hydration byte
+                // budget reserves it and RELEASES the admission permit before
+                // the poke (a stalled socket then can't head-of-line block the
+                // queue). Otherwise — oversized result or budget exhausted —
+                // the admission permit is HELD through the poke, so at most
+                // one such result is resident (the 512 MB acceptance harness
+                // OOMs under any policy that lets full-history results stack).
+                let result_bytes: usize = rows.iter().map(estimate_op_bytes).sum();
+                let _resident = match try_reserve_hydration_bytes(result_bytes) {
+                    Some(permit) => {
+                        hydrating.take();
+                        Some(permit)
+                    }
+                    None => None, // keep `hydrating` until the poke completes
+                };
+                drop(consistent);
+                let hydrate_took = started.elapsed();
+                if hydrate_took > slow_hydration_budget() {
+                    eprintln!(
+                        "slow hydration: query {} materialized {} ops in {hydrate_took:?} (budget {:?}) — other clients on this shard stalled for that long",
+                        hash,
+                        rows.len(),
+                        slow_hydration_budget()
+                    );
+                }
+                crate::metrics::observe_hydration(
+                    hydrate_took,
+                    rows.len() as u64,
+                    hydrate_took > slow_hydration_budget(),
+                );
+                crate::metrics::record_query_hydration(&hash, hydrate_took, rows.len() as u64);
+                crate::metrics::record_query_active(&hash, 1);
+                // Let queued work (other clients' sends, ticks) interleave
+                // between one query's heavy synchronous fetch and the next.
+                tokio::task::yield_now().await;
                 // Prepend the replacement Clear to the first query's poke so its rows
                 // clear+rebuild atomically (no flash of an empty result).
                 if pending_clear {
@@ -901,7 +1198,7 @@ where
                     pending_clear = false;
                 }
                 poke(tx, version, base_cookie, Some(hash.clone()), None, rows).await?;
-                active.push(ActiveQuery { hash, catch, schema });
+                active.push(ActiveQuery { hash, catch, schema, tables: ast_tables });
             }
             QueriesPatchOp::Del { hash } => {
                 // Retract the query's rows BEFORE dropping its pipeline: decrement

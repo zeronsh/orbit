@@ -142,7 +142,8 @@ fn shard_main(
         for t in &tables {
             replica.add_table(&t.name, t.columns.iter().cloned().collect(), t.primary_key.clone());
             for r in &t.seed {
-                replica.seed(&t.name, r.clone());
+                // In-memory seed is infallible (returns Ok for trait parity).
+                let _ = replica.seed(&t.name, r.clone());
             }
         }
         let replica = Rc::new(replica);
@@ -165,7 +166,7 @@ fn shard_main(
             None => None,
         };
 
-        let (tick_tx, _) = broadcast::channel::<()>(1024);
+        let (tick_tx, _) = broadcast::channel::<crate::server::Tick>(1024);
 
         // Per-client lastMutationIDs for this shard, advanced from replicated
         // `orbit_client_mutations` events in the fan-out.
@@ -180,20 +181,51 @@ fn shard_main(
             let lmids = lmids.clone();
             spawn_local(async move {
                 let mut dirty = false;
+                // Transaction atomicity: events arrive one-by-one across
+                // channel awaits, so a hydration or lagged tick-flush on this
+                // shard could otherwise observe (or send) a torn
+                // mid-transaction state. The consistency write lock spans
+                // Begin..Commit; memory stays O(one event).
+                let mut txn_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>> = None;
+                let mut touched: std::collections::HashSet<String> = Default::default();
                 while let Some(ev) = events.recv().await {
+                    if matches!(ev, LogicalEvent::Begin) && txn_guard.is_none() {
+                        txn_guard =
+                            Some(crate::server::replica_apply_lock().write_owned().await);
+                    }
                     let is_data = matches!(
                         ev,
-                        LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
+                        LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. } | LogicalEvent::Truncate { .. }
                     );
                     let is_commit = matches!(ev, LogicalEvent::Commit);
+                    if is_data {
+                        match &ev {
+                            LogicalEvent::Insert { table, .. }
+                            | LogicalEvent::Update { table, .. }
+                            | LogicalEvent::Delete { table, .. } => {
+                                touched.insert(table.clone());
+                            }
+                            LogicalEvent::Truncate { tables } => {
+                                touched.extend(tables.iter().cloned());
+                            }
+                            _ => {}
+                        }
+                    }
                     crate::server::capture_lmid(&ev, &lmids);
                     replica.apply(ev);
                     if is_data {
                         dirty = true;
                     }
-                    if is_commit && dirty {
-                        let _ = tick_tx.send(());
-                        dirty = false;
+                    if is_commit {
+                        txn_guard = None;
+                        if dirty {
+                            let _ = tick_tx.send(std::sync::Arc::new(
+                                std::mem::take(&mut touched).into_iter().collect(),
+                            ));
+                            dirty = false;
+                        } else {
+                            touched.clear();
+                        }
                     }
                 }
             });

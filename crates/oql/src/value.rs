@@ -27,20 +27,51 @@ pub enum Value {
     Null,
     Bool(bool),
     Number(f64),
+    /// An integer that is **not** exactly representable as an `f64`
+    /// (|v| > 2^53). Everything representable is normalized to
+    /// [`Value::Number`] (see [`Value::int`]), so the two variants' domains are
+    /// disjoint and structural identity remains correct. This preserves 64-bit
+    /// Postgres ids (snowflake ids!) exactly — where Zero's f64-everywhere
+    /// model would collapse distinct primary keys into one row.
+    Int(i64),
     String(String),
     /// Arbitrary JSON, used for `json` columns. Not orderable as an id.
     Json(serde_json::Value),
 }
 
+/// Whether `i` survives an i64 → f64 → i64 round trip exactly. The `f < 2^63`
+/// bound guards the saturation trap: `(i64::MAX as f64) as i64` saturates back
+/// to `i64::MAX` even though the f64 is 2^63 (≠ i64::MAX).
+#[inline]
+pub fn i64_fits_f64(i: i64) -> bool {
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    let f = i as f64;
+    (-TWO_63..TWO_63).contains(&f) && (f as i64) == i
+}
+
 impl Value {
+    /// Normalizing integer constructor: exactly-representable integers become
+    /// [`Value::Number`] (the common case, and what JS clients see); the
+    /// unrepresentable tail becomes [`Value::Int`] so precision is never lost.
+    #[inline]
+    pub fn int(i: i64) -> Value {
+        if i64_fits_f64(i) {
+            Value::Number(i as f64)
+        } else {
+            Value::Int(i)
+        }
+    }
+
     /// Rank used to give a *total* order across differing types. Within the IVM
     /// engine, comparisons are always same-type (or involve null); the
     /// cross-type ordering here exists only so [`Value`] can be a map key.
+    /// `Int` shares `Number`'s rank — the two are compared numerically before
+    /// this fallback is consulted.
     fn type_rank(&self) -> u8 {
         match self {
             Value::Null => 0,
             Value::Bool(_) => 1,
-            Value::Number(_) => 2,
+            Value::Number(_) | Value::Int(_) => 2,
             Value::String(_) => 3,
             Value::Json(_) => 4,
         }
@@ -54,7 +85,15 @@ impl Value {
         match j {
             serde_json::Value::Null => Value::Null,
             serde_json::Value::Bool(b) => Value::Bool(b),
-            serde_json::Value::Number(n) => Value::Number(n.as_f64().unwrap_or(f64::NAN)),
+            serde_json::Value::Number(n) => {
+                // Integers stay exact (JSON carries arbitrary integer digits;
+                // serde_json parses up to i64/u64 losslessly). Anything beyond
+                // — or fractional — is an f64.
+                match n.as_i64() {
+                    Some(i) => Value::int(i),
+                    None => Value::Number(n.as_f64().unwrap_or(f64::NAN)),
+                }
+            }
             serde_json::Value::String(s) => Value::String(s),
             other => Value::Json(other),
         }
@@ -90,7 +129,7 @@ impl Value {
     pub fn estimated_bytes(&self) -> usize {
         let base = std::mem::size_of::<Value>();
         match self {
-            Value::Null | Value::Bool(_) | Value::Number(_) => base,
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::Int(_) => base,
             Value::String(s) => base + s.len(),
             Value::Json(j) => base + json_estimated_bytes(j),
         }
@@ -112,6 +151,7 @@ impl Serialize for Value {
                     s.serialize_f64(*n)
                 }
             }
+            Value::Int(i) => s.serialize_i64(*i),
             Value::String(st) => s.serialize_str(st),
             Value::Json(j) => j.serialize(s),
         }
@@ -137,7 +177,7 @@ impl From<f64> for Value {
 }
 impl From<i64> for Value {
     fn from(n: i64) -> Self {
-        Value::Number(n as f64)
+        Value::int(n)
     }
 }
 impl From<i32> for Value {
@@ -180,6 +220,9 @@ pub fn compare_values(a: &Value, b: &Value) -> Ordering {
             // Mirror `a - b`: NaN-safe, treat equal floats as Equal.
             x.partial_cmp(y).unwrap_or(Ordering::Equal)
         }
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Int(x), Value::Number(y)) => cmp_i64_f64(*x, *y),
+        (Value::Number(x), Value::Int(y)) => cmp_i64_f64(*y, *x).reverse(),
         // false < true (Zero: `a ? 1 : -1`).
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Json(x), Value::Json(y)) => compare_utf8(&x.to_string(), &y.to_string()),
@@ -194,6 +237,34 @@ pub fn compare_values(a: &Value, b: &Value) -> Ordering {
 #[inline]
 pub fn compare_utf8(a: &str, b: &str) -> Ordering {
     a.as_bytes().cmp(b.as_bytes())
+}
+
+/// Exact `i64` vs `f64` numeric comparison (no lossy casts of `i`).
+/// NaN compares Equal, mirroring the NaN-safe `partial_cmp` fallback above.
+fn cmp_i64_f64(i: i64, f: f64) -> Ordering {
+    if f.is_nan() {
+        return Ordering::Equal;
+    }
+    // 2^63 = i64::MAX + 1 is exactly representable; anything >= it exceeds i64.
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if f >= TWO_63 {
+        return Ordering::Less;
+    }
+    if f < -TWO_63 {
+        return Ordering::Greater;
+    }
+    // f is finite and within [-2^63, 2^63): floor(f) converts to i64 exactly.
+    let floor = f.floor();
+    match i.cmp(&(floor as i64)) {
+        Ordering::Equal => {
+            if f > floor {
+                Ordering::Less // i == floor(f) < f
+            } else {
+                Ordering::Equal
+            }
+        }
+        other => other,
+    }
 }
 
 /// Determine if two values are equal with *join* semantics.
@@ -214,6 +285,10 @@ pub fn values_identical(a: &Value, b: &Value) -> bool {
         (Value::Null, Value::Null) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Number(x), Value::Number(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        // Disjoint domains under `Value::int` normalization (an `Int` is never
+        // f64-representable, a `Number` always is), so cross-variant values are
+        // never numerically equal.
         (Value::String(x), Value::String(y)) => x == y,
         (Value::Json(x), Value::Json(y)) => x == y,
         _ => false,
@@ -338,6 +413,23 @@ impl Row {
 
     pub fn retain<F: FnMut(&str, &mut Value) -> bool>(&mut self, mut f: F) {
         self.cols.retain_mut(|(k, v)| f(k.as_ref(), v));
+    }
+
+    /// Fill in any column present in `old` but absent from `self` with `old`'s
+    /// value (the column *name* is shared, the value is cloned).
+    ///
+    /// This is the unchanged-TOAST merge: a pgoutput `UPDATE` ships unchanged
+    /// TOASTed columns as `'u'` (not present at all — distinct from an explicit
+    /// NULL), so the decoded new row is *partial*. Merging over the stored old
+    /// row reconstructs the full row; without it every replica NULLs the column.
+    pub fn merge_missing_from(&mut self, old: &Row) {
+        for (k, v) in &old.cols {
+            // Insert at the sorted position; reuse the interned key Arc from
+            // `old` (refcount bump, no copy).
+            if let Err(i) = self.position(k.as_ref()) {
+                self.cols.insert(i, (k.clone(), v.clone()));
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -635,5 +727,78 @@ mod tests {
         let r2 = row(&[("a", 1.into()), ("b", 2.into())]);
         // a equal, b desc => r2 (b=2) sorts before r1 (b=1)
         assert_eq!(cmp.compare(&r1, &r2), Ordering::Greater);
+    }
+}
+
+#[cfg(test)]
+mod int_tests {
+    use super::*;
+
+    #[test]
+    fn int_constructor_normalizes() {
+        // Representable integers stay Number (JS-compatible fast path).
+        assert!(matches!(Value::int(42), Value::Number(n) if n == 42.0));
+        assert!(matches!(Value::int(1 << 53), Value::Number(_)));
+        // The unrepresentable tail keeps all 64 bits.
+        assert!(matches!(Value::int((1 << 53) + 1), Value::Int(9007199254740993)));
+        assert!(matches!(Value::int(i64::MAX), Value::Int(i64::MAX)));
+        assert!(matches!(Value::int(i64::MIN), Value::Number(_))); // -2^63 is exact in f64
+    }
+
+    #[test]
+    fn adjacent_big_ints_stay_distinct() {
+        // The exact failure Zero's f64 model has: two adjacent snowflake ids
+        // collapse into one row key.
+        let a = Value::int(9007199254740993);
+        let b = Value::int(9007199254740994);
+        assert!(!values_identical(&a, &b));
+        assert_eq!(compare_values(&a, &b), Ordering::Less);
+    }
+
+    #[test]
+    fn int_number_cross_comparison_is_exact() {
+        let big = Value::Int(9007199254740993); // 2^53 + 1
+        let f = Value::Number(9007199254740992.0); // 2^53
+        assert_eq!(compare_values(&big, &f), Ordering::Greater);
+        assert_eq!(compare_values(&f, &big), Ordering::Less);
+        // NaN-safe like the Number/Number path.
+        assert_eq!(compare_values(&big, &Value::Number(f64::NAN)), Ordering::Equal);
+        assert_eq!(compare_values(&big, &Value::Number(f64::INFINITY)), Ordering::Less);
+        assert_eq!(compare_values(&big, &Value::Number(f64::NEG_INFINITY)), Ordering::Greater);
+        // Fractional straddle: 2^53 + 1 vs a float just above it.
+        assert_eq!(
+            compare_values(&big, &Value::Number(9007199254740994.0)),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn int_serializes_exactly_and_round_trips() {
+        let v = Value::Int(9007199254740993);
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(json, "9007199254740993");
+        let back: Value = serde_json::from_str(&json).unwrap();
+        assert!(values_identical(&v, &back), "round trip through JSON must be exact");
+        // And a representable integer round-trips to Number.
+        let n: Value = serde_json::from_str("42").unwrap();
+        assert!(matches!(n, Value::Number(x) if x == 42.0));
+    }
+
+    #[test]
+    fn merge_missing_from_fills_only_absent_columns() {
+        let mut new_row: Row = [("id", Value::from("k")), ("n", 2.into())].into_iter().collect();
+        let old: Row = [
+            ("id", Value::from("k")),
+            ("n", 1.into()),
+            ("big", Value::from("payload")),
+            ("nullable", Value::Null),
+        ]
+        .into_iter()
+        .collect();
+        new_row.merge_missing_from(&old);
+        assert_eq!(new_row.get("n"), Some(&Value::Number(2.0)), "present columns unchanged");
+        assert_eq!(new_row.get("big"), Some(&Value::String("payload".into())), "absent filled");
+        assert_eq!(new_row.get("nullable"), Some(&Value::Null), "explicit old NULL carried");
+        assert_eq!(new_row.len(), 4);
     }
 }

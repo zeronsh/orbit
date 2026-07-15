@@ -34,7 +34,7 @@ async fn zero_client_handshake_via_sec_protocol_header() {
             src.borrow_mut().insert_initial(row(&[("id", "i1".into())]));
             let replica = Rc::new(replica);
             let mutators = Rc::new(MutatorRegistry::new());
-            let (tick_tx, _) = tokio::sync::broadcast::channel::<()>(16);
+            let (tick_tx, _) = tokio::sync::broadcast::channel::<orbit_cache::server::Tick>(16);
 
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();

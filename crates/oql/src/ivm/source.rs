@@ -180,14 +180,57 @@ impl MemorySource {
 
     /// Reconcile to a new column set (a DDL schema change). Columns no longer
     /// present are dropped from every stored row; added columns simply appear in
-    /// subsequently-replicated rows. Invalidates secondary indexes.
+    /// subsequently-replicated rows; columns whose TYPE changed (name kept) have
+    /// their stored values converted in place — Postgres rewrites the table on
+    /// `ALTER COLUMN … TYPE` but logical replication never re-sends the rows,
+    /// so without this the replica silently keeps stale-typed values (audit
+    /// Tier 0.4). Invalidates secondary indexes.
     pub fn reconcile_columns(&mut self, new_columns: &[(String, ColumnType)]) {
+        let changed: Vec<(String, ColumnType)> = new_columns
+            .iter()
+            .filter(|(n, t)| self.columns.get(n).is_some_and(|old| old != t))
+            .cloned()
+            .collect();
+        // RENAME pairing: exactly one column disappeared and exactly one (of
+        // the same type) appeared → an `ALTER TABLE … RENAME COLUMN` (the
+        // wire can't distinguish it from drop+add; a same-statement drop+add
+        // of matching type would misidentify — loudly logged, and strictly
+        // better than the old behavior of always dropping the values).
+        let removed: Vec<String> = self
+            .columns
+            .keys()
+            .filter(|c| !new_columns.iter().any(|(n, _)| n == *c))
+            .cloned()
+            .collect();
+        let added: Vec<(String, ColumnType)> = new_columns
+            .iter()
+            .filter(|(n, _)| !self.columns.contains_key(n))
+            .cloned()
+            .collect();
+        let rename: Option<(String, String)> = match (&removed[..], &added[..]) {
+            ([r], [(a, at)]) if self.columns.get(r) == Some(at) => {
+                eprintln!("replica DDL: treating column {r} -> {a} as a RENAME (values preserved)");
+                Some((r.clone(), a.clone()))
+            }
+            _ => None,
+        };
         let rebuilt: Vec<Rc<Row>> = self
             .data
             .values()
             .map(|rc| {
                 let mut r = (**rc).clone();
+                if let Some((from, to)) = &rename {
+                    if let Some(v) = r.remove(from) {
+                        r.insert(to.as_str(), v);
+                    }
+                }
                 r.retain(|k, _| new_columns.iter().any(|(n, _)| n.as_str() == k));
+                for (name, ty) in &changed {
+                    if let Some(v) = r.get(name) {
+                        let converted = super::schema::convert_column_value(v, *ty);
+                        r.insert(name.as_str(), converted);
+                    }
+                }
                 Rc::new(r)
             })
             .collect();

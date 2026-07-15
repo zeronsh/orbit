@@ -12,7 +12,7 @@
 use crate::changestream::{ChangeMsg, ChangeStreamClient, ChangeStreamServer};
 use crate::mutators::MutatorRegistry;
 use crate::objectstore::{ObjectStore, ReplicaSnapshot};
-use crate::pg::{create_publication, create_slot, initial_sync_backend};
+use crate::pg::{create_publication, initial_sync_backend};
 use crate::queries::QueryRegistry;
 use crate::replica::{Replica, ReplicaBackend};
 use crate::server::serve_client;
@@ -135,15 +135,43 @@ async fn run_sharded_inner(cfg: ServerConfig, num_shards: usize) -> Result<()> {
     // Shared-CVR tables (per-client view + version), shared across shards.
     crate::cvr::PgCvrStore::ensure_schema(&pg).await?;
 
+    // CVR GC (same sweep as the other serving paths): ephemeral clients leave
+    // their materialized views + lastMutationIDs in Postgres forever otherwise.
+    {
+        let gc_conn = cfg.conn_str();
+        let gc_tls = cfg.tls;
+        spawn_local(async move {
+            let Ok((gc_pg, driver)) = tls::connect(&gc_conn, gc_tls).await else { return };
+            spawn_local(driver);
+            loop {
+                match crate::cvr::PgCvrStore::gc_stale_clients(&gc_pg, 7).await {
+                    Ok(n) if n > 0 => eprintln!("cvr gc: swept {n} stale client rows"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("cvr gc failed (retrying next cycle): {e:#}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
     let table_names: Vec<&str> = cfg.tables.iter().map(|t| t.name.as_str()).collect();
     create_publication(&pg, &cfg.publication, &table_names)
         .await
         .with_context(|| format!("creating publication for tables {table_names:?} — do they all exist in the database?"))?;
-    let start_lsn = create_slot(&pg, &cfg.slot)
-        .await
-        .context("creating logical replication slot — is the server started with wal_level=logical?")?;
+    let (start_lsn, exported) = crate::pg::ensure_slot_with_snapshot(
+        &pg, &cfg.host, cfg.port, &cfg.user, &cfg.database,
+        cfg.password.as_deref(), cfg.tls, &cfg.slot,
+    )
+    .await
+    .context("creating logical replication slot — is the server started with wal_level=logical?")?;
 
     // Take the initial snapshot once and seed every shard with the same rows.
+    // A freshly-created slot pins the reads to its exact consistent point.
+    if let Some(e) = &exported {
+        pg.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await?;
+        pg.execute(format!("SET TRANSACTION SNAPSHOT '{}'", e.snapshot).as_str(), &[]).await?;
+        eprintln!("initial sync pinned to slot snapshot {}", e.snapshot);
+    }
     let mut shard_tables = Vec::new();
     for t in &cfg.tables {
         let rows = crate::pg::select_all_rows(&pg, &t.name, &t.columns).await?;
@@ -155,6 +183,10 @@ async fn run_sharded_inner(cfg: ServerConfig, num_shards: usize) -> Result<()> {
             seed: rows,
         });
     }
+    if exported.is_some() {
+        let _ = pg.batch_execute("COMMIT").await;
+    }
+    drop(exported); // the snapshot's replication connection may close now
 
     let server = std::sync::Arc::new(crate::sharded::ShardedServer::start_with_pg(
         num_shards,
@@ -238,6 +270,273 @@ pub async fn run_server_full(
     local.run_until(run_inner(cfg, mutators, queries, replica)).await
 }
 
+/// Byte cap for buffering one replication transaction before switching to
+/// streaming apply (`ORBIT_TXN_BUFFER_BYTES`, default 32 MiB). Below the cap a
+/// transaction applies atomically at Commit (no locking); above it, events
+/// apply as they arrive under the node's replica-consistency write lock —
+/// bounded memory instead of a fleet-wide OOM on a giant transaction (audit
+/// Tier 1.2; Zero streams in bounded batches).
+fn txn_buffer_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("ORBIT_TXN_BUFFER_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(32 << 20)
+            .max(64 * 1024)
+    })
+}
+
+/// Per-transaction apply state for a serving node's replication pump.
+///
+/// Fast path: buffer events and apply the whole transaction synchronously at
+/// Commit — atomic by construction (no awaits inside the apply). Oversized
+/// path: once the buffer exceeds the cap, take the node's replica-consistency
+/// WRITE lock, open the storage transaction, drain the buffer, and apply every
+/// further event on arrival. The write lock keeps hydrations and tick flushes
+/// from observing (or sending) a torn mid-transaction state across the socket
+/// awaits between events.
+struct TxnApply {
+    cap: usize,
+    buf: Vec<LogicalEvent>,
+    buf_bytes: usize,
+    streaming: bool,
+    dirty: bool,
+    /// Tables the transaction touched — carried on the tick so client tasks
+    /// whose queries read none of them skip their drain (no-op suppression).
+    tables: std::collections::HashSet<String>,
+    guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+/// Record the table(s) `ev` touches into `out`.
+fn add_event_tables(ev: &LogicalEvent, out: &mut std::collections::HashSet<String>) {
+    match ev {
+        LogicalEvent::Insert { table, .. }
+        | LogicalEvent::Update { table, .. }
+        | LogicalEvent::Delete { table, .. }
+        | LogicalEvent::Relation { table, .. } => {
+            out.insert(table.clone());
+        }
+        LogicalEvent::Truncate { tables } => {
+            out.extend(tables.iter().cloned());
+        }
+        LogicalEvent::Begin | LogicalEvent::Commit | LogicalEvent::Other => {}
+    }
+}
+
+fn is_data_event(ev: &LogicalEvent) -> bool {
+    matches!(
+        ev,
+        LogicalEvent::Insert { .. }
+            | LogicalEvent::Update { .. }
+            | LogicalEvent::Delete { .. }
+            | LogicalEvent::Truncate { .. }
+    )
+}
+
+impl TxnApply {
+    fn new() -> Self {
+        TxnApply {
+            cap: txn_buffer_cap(),
+            buf: Vec::new(),
+            buf_bytes: 0,
+            streaming: false,
+            dirty: false,
+            tables: std::collections::HashSet::new(),
+            guard: None,
+        }
+    }
+
+    /// Feed one in-transaction event.
+    async fn push<B: ReplicaBackend>(
+        &mut self,
+        replica: &B,
+        lmids: &crate::server::LmidMap,
+        ev: LogicalEvent,
+    ) -> Result<()> {
+        self.dirty |= is_data_event(&ev);
+        add_event_tables(&ev, &mut self.tables);
+        if self.streaming {
+            crate::server::capture_lmid(&ev, lmids);
+            return replica.apply(ev);
+        }
+        self.buf_bytes += ev.estimated_bytes();
+        self.buf.push(ev);
+        if self.buf_bytes > self.cap {
+            // Oversized transaction: switch to streaming. Block consistency
+            // readers for the REST of the transaction, open the storage txn,
+            // and drain what we buffered so far.
+            eprintln!(
+                "transaction exceeds {} buffered bytes; streaming apply (hydrations wait until its commit)",
+                self.cap
+            );
+            self.guard = Some(crate::server::replica_apply_lock().write_owned().await);
+            replica.begin_txn()?;
+            for ev in self.buf.drain(..) {
+                crate::server::capture_lmid(&ev, lmids);
+                replica.apply(ev)?;
+            }
+            self.buf_bytes = 0;
+            self.streaming = true;
+        }
+        Ok(())
+    }
+
+    /// Commit the transaction. Returns the touched tables when it contained
+    /// data changes (the tick payload), `None` when clean.
+    fn commit<B: ReplicaBackend>(
+        mut self,
+        replica: &B,
+        lmids: &crate::server::LmidMap,
+        lsn: u64,
+        pos: u64,
+    ) -> Result<Option<crate::server::Tick>> {
+        if !self.streaming {
+            replica.begin_txn()?;
+            for ev in self.buf.drain(..) {
+                crate::server::capture_lmid(&ev, lmids);
+                replica.apply(ev)?;
+            }
+        }
+        replica.apply(LogicalEvent::Commit)?;
+        replica.commit_txn(lsn, pos)?;
+        self.guard.take(); // release consistency writers after the commit
+        Ok(if self.dirty {
+            Some(std::sync::Arc::new(self.tables.into_iter().collect()))
+        } else {
+            None
+        })
+    }
+
+    /// Abandon the transaction. Returns `true` when it had already STREAMED
+    /// changes into live pipelines — storage rolls back, but pipeline pushes
+    /// cannot be un-pushed, so the caller must crash-exit (restart restores a
+    /// consistent replica; clients resync). Buffered-only transactions abort
+    /// for free.
+    fn abort<B: ReplicaBackend>(mut self, replica: &B) -> bool {
+        let streamed = self.streaming;
+        if streamed {
+            replica.rollback_txn();
+        }
+        self.guard.take();
+        streamed
+    }
+}
+
+/// Fresh (or crash-resumed) initial sync: ONE storage transaction per table,
+/// each clearing the table's stale rows, seeding it, and registering it in the
+/// synced-tables registry — a crash resumes at the next unsynced table instead
+/// of redoing everything (audit Tier 1.7; previously one giant all-or-nothing
+/// transaction). When the slot was just created, `exported` pins every SELECT
+/// to the slot's exact consistent snapshot, so the sync and the stream tile
+/// with NO overlap window (Zero: parallel COPY pinned to the slot snapshot).
+/// A crash-resume continues unpinned at "now" — safe because the unconfirmed
+/// slot re-delivers everything since its creation and apply is idempotent.
+pub async fn initial_sync_all<B: ReplicaBackend>(
+    pg: &tokio_postgres::Client,
+    replica: &B,
+    cfg: &ServerConfig,
+    exported: Option<&crate::pg::ExportedSlot>,
+    pos: u64,
+) -> Result<()> {
+    let synced = replica.synced_tables().unwrap_or_default();
+    let todo: Vec<&TableConfig> =
+        cfg.tables.iter().filter(|t| !synced.contains(&t.name)).collect();
+    for t in cfg.tables.iter().filter(|t| synced.contains(&t.name)) {
+        eprintln!("initial sync: {} already synced (crash resume)", t.name);
+    }
+    if todo.is_empty() {
+        return Ok(());
+    }
+    // Pin to the exported snapshot when available. Safe on the shared client:
+    // this runs during single-threaded startup, before any other pg user.
+    let pinned = match exported {
+        Some(e) => {
+            pg.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await?;
+            pg.execute(format!("SET TRANSACTION SNAPSHOT '{}'", e.snapshot).as_str(), &[])
+                .await?;
+            eprintln!(
+                "initial sync pinned to slot snapshot {} (consistent point {})",
+                e.snapshot, e.start_lsn
+            );
+            true
+        }
+        None => false,
+    };
+    let result: Result<()> = async {
+        for t in &todo {
+            replica.begin_txn()?;
+            let seeded: Result<usize> = async {
+                replica.clear_table(&t.name)?;
+                initial_sync_backend(pg, replica, &t.name).await
+            }
+            .await;
+            match seeded {
+                Ok(n) => {
+                    replica.mark_synced(&t.name)?;
+                    replica.commit_txn(0, pos)?;
+                    eprintln!("initial sync: {n} rows from {}", t.name);
+                }
+                Err(e) => {
+                    replica.rollback_txn();
+                    return Err(e.context(format!("initial sync of table {}", t.name)));
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if pinned {
+        let _ = pg.batch_execute("COMMIT").await;
+    }
+    result
+}
+
+/// Backfill tables added to the config after a durable replica was first
+/// synced (audit Tier 0.5): a watermark resume skips initial sync entirely, so
+/// a table newly added to `ORBIT_TABLES` would stream future changes while
+/// silently missing every pre-existing row. Runs in one storage transaction
+/// that PRESERVES the existing watermark; idempotent apply absorbs the overlap
+/// between the backfill SELECT and the stream resume (same discipline as the
+/// slot-creation/snapshot window). Zero's analog is the `BackfillManager`.
+pub async fn backfill_missing_tables<B: ReplicaBackend>(
+    pg: &tokio_postgres::Client,
+    replica: &B,
+    cfg: &ServerConfig,
+) -> Result<()> {
+    let Some(synced) = replica.synced_tables() else {
+        return Ok(()); // backend re-syncs from scratch every boot
+    };
+    let missing: Vec<&TableConfig> =
+        cfg.tables.iter().filter(|t| !synced.contains(&t.name)).collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let lsn = replica.resume_watermark().unwrap_or(0);
+    let pos = replica.resume_pos().unwrap_or(0);
+    replica.begin_txn().context("opening backfill storage transaction")?;
+    for t in &missing {
+        let n = match initial_sync_backend(pg, replica, &t.name)
+            .await
+            .with_context(|| format!("backfilling newly-added table {}", t.name))
+        {
+            Ok(n) => n,
+            Err(e) => {
+                replica.rollback_txn();
+                return Err(e);
+            }
+        };
+        if let Err(e) = replica.mark_synced(&t.name) {
+            replica.rollback_txn();
+            return Err(e);
+        }
+        eprintln!("backfill: {} rows from newly-added table {}", n, t.name);
+    }
+    // Re-commit the SAME watermark: the backfill doesn't advance replication.
+    replica.commit_txn(lsn, pos).context("committing backfill")?;
+    Ok(())
+}
+
 async fn run_inner<B: ReplicaBackend + 'static>(
     cfg: ServerConfig,
     mutators: MutatorRegistry,
@@ -267,39 +566,35 @@ async fn run_inner<B: ReplicaBackend + 'static>(
     create_publication(&pg, &cfg.publication, &table_names)
         .await
         .with_context(|| format!("creating publication for tables {table_names:?} — do they all exist in the database?"))?;
-    let start_lsn = create_slot(&pg, &cfg.slot)
-        .await
-        .context("creating logical replication slot — is the server started with wal_level=logical?")?;
+    let (start_lsn, exported) = crate::pg::ensure_slot_with_snapshot(
+        &pg, &cfg.host, cfg.port, &cfg.user, &cfg.database,
+        cfg.password.as_deref(), cfg.tls, &cfg.slot,
+    )
+    .await
+    .context("creating logical replication slot — is the server started with wal_level=logical?")?;
 
     let replica = Rc::new(backend);
-    // A durable backend that recorded a watermark resumes from the slot instead
-    // of re-syncing; a fresh sync first CLEARS the backend (initial sync only
-    // upserts, so rows deleted upstream while offline would otherwise survive
-    // as phantoms in a durable replica).
+    // A durable backend that recorded a watermark resumes from the slot
+    // instead of re-syncing; otherwise the per-table resumable sync runs,
+    // pinned to the freshly-created slot's exported snapshot when available.
     let resume_watermark = replica.resume_watermark();
     match resume_watermark {
-        Some(w) => eprintln!("durable replica: resuming from watermark {w} (skipping initial sync)"),
+        Some(w) => {
+            eprintln!("durable replica: resuming from watermark {w} (skipping initial sync)");
+            // Tables added to the config AFTER the first sync still need their
+            // pre-existing rows (the stream only carries new changes).
+            backfill_missing_tables(&pg, replica.as_ref(), &cfg).await?;
+        }
         None => {
-            replica.start_fresh();
-            // One storage transaction around the whole sync: a crash mid-sync
-            // rolls back to empty-with-no-watermark (→ clean redo), and a
-            // durable backend commits once instead of once per row. The
-            // watermark stays unset (lsn 0) until the first replicated commit.
-            replica.begin_txn();
-            for t in &cfg.tables {
-                let n = initial_sync_backend(&pg, replica.as_ref(), &t.name)
-                    .await
-                    .with_context(|| format!("initial sync of table {}", t.name))?;
-                eprintln!("initial sync: {} rows from {}", n, t.name);
-            }
-            replica.commit_txn(0, 0);
+            initial_sync_all(&pg, replica.as_ref(), &cfg, exported.as_ref(), 0).await?;
         }
     }
+    drop(exported); // the snapshot's replication connection may close now
     let mutators = Rc::new(mutators);
     let queries = Rc::new(queries);
     let forwarder = Rc::new(crate::forward::Forwarder::new(cfg.forward_config()));
 
-    let (ticks_tx, _) = broadcast::channel::<()>(1024);
+    let (ticks_tx, _) = broadcast::channel::<crate::server::Tick>(1024);
 
     // Replication pump: apply each change once, then notify all clients.
     // Per-client lastMutationIDs, advanced from replicated `orbit_client_mutations`.
@@ -315,6 +610,22 @@ async fn run_inner<B: ReplicaBackend + 'static>(
             }
         }
     }
+    // CVR GC: ephemeral clients (each non-persisted tab gets a random clientID)
+    // leave their materialized views in Postgres forever without a sweep.
+    {
+        let gc_pg = Rc::clone(&pg);
+        spawn_local(async move {
+            loop {
+                match crate::cvr::PgCvrStore::gc_stale_clients(&gc_pg, 7).await {
+                    Ok(n) if n > 0 => eprintln!("cvr gc: swept {n} stale client rows"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("cvr gc failed (retrying next cycle): {e:#}"),
+                }
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
     {
         let replica = replica.clone();
         let ticks_tx = ticks_tx.clone();
@@ -330,44 +641,71 @@ async fn run_inner<B: ReplicaBackend + 'static>(
                     return;
                 }
             };
-            // Buffer each upstream transaction and apply it atomically at its
-            // Commit: the backend wraps it in a storage transaction (durable
-            // backends record the commit LSN as their watermark inside it), the
-            // tick fires once per transaction, and — on a durable resume — whole
-            // transactions at or below the watermark are skipped instead of
-            // being re-applied over newer state. WAL is acknowledged only up to
-            // the last durably-committed transaction.
+            // One transaction at a time, applied atomically at its Commit
+            // (durable backends record the commit LSN as their watermark
+            // inside the same storage transaction; the tick fires once per
+            // transaction). A Begin's position IS the transaction's commit
+            // LSN (`final_lsn`), so re-delivered transactions at or below the
+            // watermark are skipped UPFRONT, and transactions bigger than the
+            // buffer cap stream through bounded memory instead of
+            // accumulating in RAM (audit Tier 1.2). WAL is acknowledged only
+            // up to the last durably-committed transaction.
             let mut dedup_lsn: u64 = resume_watermark.unwrap_or(0);
-            let mut txn_buf: Vec<LogicalEvent> = Vec::new();
+            let mut txn: Option<(u64, TxnApply)> = None;
+            let halt = |msg: String| async move {
+                eprintln!("{msg}; exiting to re-sync (restart me)");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                std::process::exit(1);
+            };
             loop {
                 match stream.next_event().await {
-                    Ok((lsn, LogicalEvent::Commit)) => {
-                        if lsn > dedup_lsn {
-                            replica.begin_txn();
-                            let mut dirty = false;
-                            for ev in txn_buf.drain(..) {
-                                if matches!(
-                                    ev,
-                                    LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
-                                ) {
-                                    dirty = true;
+                    Ok((final_lsn, LogicalEvent::Begin)) => {
+                        if let Some((l, t)) = txn.take() {
+                            // A new Begin with a transaction open means the
+                            // previous one was cut short upstream.
+                            if t.abort(replica.as_ref()) {
+                                halt(format!(
+                                    "transaction at lsn {l} aborted after streaming into live pipelines"
+                                ))
+                                .await;
+                            }
+                        }
+                        if final_lsn > dedup_lsn {
+                            txn = Some((final_lsn, TxnApply::new()));
+                        } // else: whole txn already durable — skip its events
+                    }
+                    Ok((_lsn, LogicalEvent::Commit)) => {
+                        if let Some((final_lsn, t)) = txn.take() {
+                            // Apply errors (SQL failure in a durable backend)
+                            // roll back and halt cleanly: never commit a
+                            // watermark over a torn apply, never panic.
+                            match t.commit(replica.as_ref(), &lmids, final_lsn, 0) {
+                                Ok(tick) => {
+                                    dedup_lsn = final_lsn;
+                                    if let Some(tick) = tick {
+                                        let _ = ticks_tx.send(tick);
+                                    }
                                 }
-                                crate::server::capture_lmid(&ev, &lmids);
-                                replica.apply(ev);
+                                Err(e) => {
+                                    replica.rollback_txn();
+                                    halt(format!(
+                                        "replica apply error at lsn {final_lsn}: {e:#}; rolled back"
+                                    ))
+                                    .await;
+                                }
                             }
-                            replica.apply(LogicalEvent::Commit);
-                            replica.commit_txn(lsn, 0);
-                            dedup_lsn = lsn;
-                            if dirty {
-                                let _ = ticks_tx.send(());
-                            }
-                        } else {
-                            txn_buf.clear(); // re-delivered (already durable): skip whole txn
                         }
                         stream.confirm(dedup_lsn);
                     }
-                    Ok((_lsn, LogicalEvent::Begin)) => txn_buf.clear(),
-                    Ok((_lsn, ev)) => txn_buf.push(ev),
+                    Ok((_lsn, ev)) => {
+                        if let Some((final_lsn, t)) = txn.as_mut() {
+                            if let Err(e) = t.push(replica.as_ref(), &lmids, ev).await {
+                                let l = *final_lsn;
+                                replica.rollback_txn();
+                                halt(format!("replica apply error at lsn {l}: {e:#}; rolled back")).await;
+                            }
+                        }
+                    }
                     Err(e) => {
                         // Crash-only (same policy as the view-syncer's Reset): see
                         // run_sharded_inner — reconnecting in-process risks
@@ -415,10 +753,37 @@ async fn accept_ws_clients<B: ReplicaBackend + 'static>(
     mutators: Rc<MutatorRegistry>,
     queries: Rc<QueryRegistry>,
     forwarder: Rc<crate::forward::Forwarder>,
-    ticks_tx: broadcast::Sender<()>,
+    ticks_tx: broadcast::Sender<crate::server::Tick>,
     lmids: crate::server::LmidMap,
     replica_pos: Option<Rc<std::cell::Cell<u64>>>,
 ) -> Result<()> {
+    // Graceful drain (audit Tier 2 — previously crash-only, so every deploy
+    // was an instant fleet-wide rehydration storm): on SIGTERM, flip /ready to
+    // 503 so the load balancer stops routing new clients here, keep serving
+    // existing connections for ORBIT_DRAIN_SECONDS (default 15; clients keep
+    // getting pokes and their CVR checkpoints stay fresh), then exit cleanly.
+    // New connections are still ACCEPTED during the window (a client that
+    // races the LB update gets served rather than refused).
+    {
+        spawn_local(async move {
+            let Ok(mut term) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            else {
+                return;
+            };
+            term.recv().await;
+            if let Some(m) = crate::metrics::node_metrics() {
+                m.mark_draining();
+            }
+            let secs = std::env::var("ORBIT_DRAIN_SECONDS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(15u64);
+            eprintln!("SIGTERM: draining for {secs}s, then exiting");
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            std::process::exit(0);
+        });
+    }
     loop {
         let (sock, _) = listener.accept().await?;
         let replica = replica.clone();
@@ -515,7 +880,7 @@ impl SnapshotStrategy for JsonSnapshots {
                 let snap = ReplicaSnapshot::from_bytes(&bytes)?;
                 for (table, rows) in snap.tables {
                     for row in rows {
-                        replica.seed(&table, row);
+                        replica.seed(&table, row)?;
                     }
                 }
                 eprintln!("view-syncer restored snapshot @ pos {}", snap.pos);
@@ -538,6 +903,14 @@ pub struct SqliteClusterConfig {
     /// Multipart part & buffer size for snapshot upload/download — the memory
     /// ceiling of a snapshot transfer is ~2× this. Default 8 MiB.
     pub snapshot_part_size: usize,
+    /// Incremental (WAL-segment) backups: each cycle ships only the WAL bytes
+    /// appended since the last one, instead of re-uploading the whole replica
+    /// file (`ORBIT_BACKUP=full` opts out). Default on.
+    pub backup_incremental: bool,
+    /// WAL size that triggers a generation roll (checkpoint + fresh full
+    /// upload) under incremental backups. Bounds both local WAL growth and
+    /// restore replay length. Default 64 MiB (`ORBIT_BACKUP_MAX_WAL_MB`).
+    pub max_wal_bytes: u64,
 }
 
 impl SqliteClusterConfig {
@@ -546,6 +919,8 @@ impl SqliteClusterConfig {
             dir: dir.into(),
             opts: crate::sqlite_source::SqliteReplicaOpts::default(),
             snapshot_part_size: 8 << 20,
+            backup_incremental: true,
+            max_wal_bytes: 64 << 20,
         }
     }
 }
@@ -556,6 +931,68 @@ impl SqliteClusterConfig {
 /// multipart with O(part_size) memory and restored straight to disk.
 pub struct SqliteSnapshots {
     pub cfg: SqliteClusterConfig,
+    /// Incremental-backup shipping state for the current generation
+    /// (replicator-side; view-syncers only restore). `RefCell`: strategies
+    /// live on a single-thread `LocalSet` behind an `Rc`.
+    ship: std::cell::RefCell<Option<crate::walship::ShipState>>,
+}
+
+impl SqliteSnapshots {
+    pub fn new(cfg: SqliteClusterConfig) -> Self {
+        SqliteSnapshots { cfg, ship: std::cell::RefCell::new(None) }
+    }
+
+    /// One incremental-backup cycle (audit Tier 1.4). First call per process
+    /// rolls a generation: checkpoint + ONE full upload. Every later call
+    /// ships only the WAL bytes committed since the previous cycle — a 50 GB
+    /// replica no longer re-ships 50 GB per interval. Rolls a new generation
+    /// when the shipped WAL exceeds `max_wal_bytes` (bounding local WAL growth
+    /// and restore replay) or when the WAL restarted outside our control.
+    async fn write_incremental<O: ObjectStore>(
+        &self,
+        store: &O,
+        replica: &crate::sqlite_source::SqliteReplica,
+        db: &std::path::Path,
+        pos: u64,
+    ) -> Result<u64> {
+        use crate::walship::{self, ShipOutcome};
+        // Manual checkpoint control: the base file must stay byte-stable
+        // between generation rolls. Idempotent and cheap.
+        replica.set_wal_autocheckpoint(0)?;
+        let roll = |prev: Option<crate::walship::BackupManifest>| async move {
+            replica.checkpoint_truncate().context("checkpoint before generation roll")?;
+            walship::new_generation(store, db, pos, self.cfg.snapshot_part_size, prev.as_ref())
+                .await
+        };
+        let current = self.ship.borrow_mut().take();
+        let (state, shipped) = match current {
+            None => {
+                let state = roll(None).await?;
+                let n = std::fs::metadata(db).map(|m| m.len()).unwrap_or(0);
+                (state, n)
+            }
+            Some(mut state) => {
+                if state.shipped_offset > self.cfg.max_wal_bytes {
+                    let prev = state.manifest().clone();
+                    let state = roll(Some(prev)).await?;
+                    let n = std::fs::metadata(db).map(|m| m.len()).unwrap_or(0);
+                    (state, n)
+                } else {
+                    match walship::ship(store, db, &mut state, pos).await? {
+                        ShipOutcome::Shipped { bytes } => (state, bytes),
+                        ShipOutcome::NeedsNewGeneration => {
+                            let prev = state.manifest().clone();
+                            let state = roll(Some(prev)).await?;
+                            let n = std::fs::metadata(db).map(|m| m.len()).unwrap_or(0);
+                            (state, n)
+                        }
+                    }
+                }
+            }
+        };
+        *self.ship.borrow_mut() = Some(state);
+        Ok(shipped)
+    }
 }
 
 /// The object key holding the latest SQLite snapshot file…
@@ -630,6 +1067,9 @@ impl SnapshotStrategy for SqliteSnapshots {
             .db_path()
             .context("file snapshots need a durable (file-backed) replica")?
             .to_owned();
+        if self.cfg.backup_incremental {
+            return self.write_incremental(store, replica, &src, pos).await;
+        }
         // Unique staging name: deploy overlap means two replicators may
         // snapshot concurrently into the same volume.
         let tmp = self.cfg.dir.join(format!(
@@ -656,6 +1096,10 @@ impl SnapshotStrategy for SqliteSnapshots {
     }
 
     async fn stored_pos<O: ObjectStore>(&self, store: &O) -> Result<Option<u64>> {
+        // Incremental manifest first; legacy full-snapshot pos as fallback.
+        if let Some(m) = crate::walship::load_manifest(store).await? {
+            return Ok(Some(m.pos_hint));
+        }
         Ok(store
             .get(SQLITE_SNAPSHOT_POS_KEY)
             .await?
@@ -670,31 +1114,74 @@ impl SnapshotStrategy for SqliteSnapshots {
     ) -> Result<(crate::sqlite_source::SqliteReplica, u64)> {
         std::fs::create_dir_all(&self.cfg.dir).ok();
         self.sweep_staging();
+        // Which config tables a restored replica hasn't initial-synced. A
+        // view-syncer can't backfill from Postgres itself — it must restore a
+        // snapshot taken AFTER the replicator backfilled the new table.
+        let missing = |replica: &crate::sqlite_source::SqliteReplica| -> Vec<String> {
+            match replica.synced_tables() {
+                Some(synced) => cfg
+                    .tables
+                    .iter()
+                    .filter(|t| !synced.contains(&t.name))
+                    .map(|t| t.name.clone())
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
         // Local short-circuit: a durable view-syncer that recorded its applied
         // position resumes by DELTA from its own replica file — no download.
         if self.replica_db().exists() {
             let replica = self.build_replica(cfg);
             if let Some(p) = replica.resume_pos() {
+                let miss = missing(&replica);
+                if miss.is_empty() {
+                    eprintln!(
+                        "view-syncer: resuming from local replica.db @ pos {p} (skipping snapshot download)"
+                    );
+                    return Ok((replica, p));
+                }
+                // Tables were added to the config: the local file predates
+                // them (audit Tier 0.5) — fall through to snapshot restore.
                 eprintln!(
-                    "view-syncer: resuming from local replica.db @ pos {p} (skipping snapshot download)"
+                    "view-syncer: local replica.db missing newly-added tables {miss:?}; re-restoring from snapshot"
                 );
-                return Ok((replica, p));
             }
-            // Foreign or half-built file: close the connection, then clear it.
+            // Foreign, half-built, or table-incomplete file: close the
+            // connection, then clear it.
             drop(replica);
             self.invalidate_local();
         }
         let tmp = self.cfg.dir.join(format!("replica.db.tmp.{}", std::process::id()));
         loop {
-            match crate::objectstore::get_to_file(store, SQLITE_SNAPSHOT_KEY, &tmp).await {
+            // Incremental backups: assemble base + WAL segments from the
+            // manifest. Falls back to the legacy full-snapshot object when no
+            // manifest exists (older replicator still running).
+            let fetched = match crate::walship::restore(store, &tmp).await {
+                Ok(true) => Ok(true),
+                Ok(false) => crate::objectstore::get_to_file(store, SQLITE_SNAPSHOT_KEY, &tmp).await,
+                Err(e) => Err(e),
+            };
+            match fetched {
                 Ok(true) => match validate_sqlite_snapshot(tmp.clone()).await {
                     Ok(pos) => {
                         self.invalidate_local();
                         std::fs::rename(&tmp, self.replica_db())
                             .context("rename snapshot into place")?;
                         let replica = self.build_replica(cfg);
-                        eprintln!("view-syncer restored snapshot @ pos {pos}");
-                        return Ok((replica, pos));
+                        let miss = missing(&replica);
+                        if !miss.is_empty() {
+                            // The replicator hasn't published a snapshot that
+                            // includes the newly-added tables yet — keep
+                            // waiting rather than serving silent empty history.
+                            eprintln!(
+                                "view-syncer: snapshot @ pos {pos} predates newly-added tables {miss:?}; waiting for the replicator to backfill + re-snapshot"
+                            );
+                            drop(replica);
+                            self.invalidate_local();
+                        } else {
+                            eprintln!("view-syncer restored snapshot @ pos {pos}");
+                            return Ok((replica, pos));
+                        }
                     }
                     Err(e) => {
                         // Corrupt / torn / garbage object: never rename it into
@@ -771,7 +1258,7 @@ pub async fn run_replicator_sqlite<O: ObjectStore + 'static>(
             store,
             change_stream_addr,
             snapshot_interval,
-            Rc::new(SqliteSnapshots { cfg: sqlite }),
+            Rc::new(SqliteSnapshots::new(sqlite)),
             replica,
         ))
         .await
@@ -803,9 +1290,12 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
 
     let table_names: Vec<&str> = cfg.tables.iter().map(|t| t.name.as_str()).collect();
     create_publication(&pg, &cfg.publication, &table_names).await?;
-    let start_lsn = create_slot(&pg, &cfg.slot)
-        .await
-        .context("creating logical replication slot — is wal_level=logical?")?;
+    let (start_lsn, exported) = crate::pg::ensure_slot_with_snapshot(
+        &pg, &cfg.host, cfg.port, &cfg.user, &cfg.database,
+        cfg.password.as_deref(), cfg.tls, &cfg.slot,
+    )
+    .await
+    .context("creating logical replication slot — is wal_level=logical?")?;
 
     let replica = Rc::new(replica);
     let store = Rc::new(store);
@@ -825,9 +1315,18 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
             eprintln!("durable change-log DISABLED (ORBIT_DISABLE_CHANGELOG)");
             None
         } else {
+            // The CDC log defaults to the source Postgres, which re-writes
+            // every replicated change into the database it was read from
+            // (audit Tier 1.8 — measured 392 MB of change log vs 375 MB of
+            // data in 12 days). Point ORBIT_CDC_PG at a separate (cheap,
+            // unreplicated) Postgres to take that write load off the source.
+            let cdc_conn = std::env::var("ORBIT_CDC_PG").unwrap_or_else(|_| cfg.conn_str());
+            if std::env::var("ORBIT_CDC_PG").is_ok() {
+                eprintln!("durable change-log using dedicated CDC database (ORBIT_CDC_PG)");
+            }
             Some(Arc::new(
                 crate::changelog::PgChangeLog::open(
-                    cfg.conn_str(),
+                    cdc_conn,
                     format!("orbit_change_log_{}", cfg.slot),
                     cfg.tls,
                 )
@@ -859,17 +1358,13 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
         eprintln!(
             "durable replica: resuming from watermark {apply_watermark} (skipping initial sync)"
         );
+        // Tables added to the config AFTER the first sync still need their
+        // pre-existing rows (the stream only carries new changes).
+        backfill_missing_tables(&pg, replica.as_ref(), &cfg).await?;
     } else {
-        replica.start_fresh();
-        replica.begin_txn();
-        for t in &cfg.tables {
-            let n = initial_sync_backend(&pg, replica.as_ref(), &t.name)
-                .await
-                .with_context(|| format!("initial sync of table {}", t.name))?;
-            eprintln!("initial sync: {} rows from {}", n, t.name);
-        }
-        replica.commit_txn(0, start_seq);
+        initial_sync_all(&pg, replica.as_ref(), &cfg, exported.as_ref(), start_seq).await?;
     }
+    drop(exported); // the snapshot's replication connection may close now
 
     // Ring/broadcast tuning from ORBIT_CHANGE_RING_BYTES / ORBIT_CHANGE_RING_CAPACITY /
     // ORBIT_BROADCAST_CAP; the struct defaults match CHANGE_RING_CAPACITY + 64 MiB.
@@ -891,6 +1386,11 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
             }
         });
     }
+
+    // The change-stream position of the most recent snapshot upload — a
+    // pruning floor (restore reservation): a restoring view-syncer resumes
+    // from at least this position.
+    let last_snapshot_pos = Arc::new(std::sync::atomic::AtomicU64::new(start_seq));
 
     // Refresh the snapshot with the freshly-synced replica at the continued
     // watermark, so view-syncers restore current data aligned with `start_seq`.
@@ -927,17 +1427,24 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
         });
     }
 
-    // Retention: prune log entries well past the in-memory ring window. A
-    // view-syncer behind by more than this re-restores (rare); the rest resume by
-    // delta from the log.
+    // Retention: prune the durable log by SUBSCRIBER-ACK CONSENSUS (audit
+    // Tier 1.6 — a live-but-slow view-syncer is never force-Reset just
+    // because it lagged a fixed window) with two additional floors:
+    //  * the latest object-store snapshot position (restore reservation: a
+    //    node restoring that snapshot will resume from it), and
+    //  * LOG_RETENTION as the HARD upper bound on retention, so a wedged or
+    //    zombie subscriber can't pin the log forever (it re-restores instead).
     if let Some(log) = log.clone() {
         let server = server.clone();
+        let snap_floor = last_snapshot_pos.clone();
         spawn_local(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                let keep_from = server
-                    .current_seq()
-                    .saturating_sub(LOG_RETENTION);
+                let seq = server.current_seq();
+                let hard_floor = seq.saturating_sub(LOG_RETENTION);
+                let consensus = server.min_subscriber_ack().unwrap_or(seq);
+                let reservation = snap_floor.load(std::sync::atomic::Ordering::Relaxed);
+                let keep_from = consensus.min(reservation).max(hard_floor);
                 if keep_from > 0 {
                     if let Err(e) = log.prune_before(keep_from).await {
                         eprintln!("change-log prune failed: {e:#}");
@@ -948,20 +1455,59 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
     }
 
     // Periodic snapshot loop — captures the current change-stream position.
+    // Fixed cadence (a slow cycle doesn't silently degrade the interval to
+    // duration + interval), with a lag warning and WEDGE DETECTION: if no
+    // backup has succeeded for max(5×interval, 5 min), the node crashes out —
+    // silently running without restorable backups is the worst failure mode
+    // (mirrors Zero's litestream backup monitor).
     {
         let store = store.clone();
         let replica = replica.clone();
         let server = server.clone();
         let snap = snap.clone();
         let m = metrics.clone();
+        let snap_pos = last_snapshot_pos.clone();
         spawn_local(async move {
+            let wedge_limit = snapshot_interval
+                .saturating_mul(5)
+                .max(Duration::from_secs(300));
+            let mut ticker = tokio::time::interval(snapshot_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // first tick fires immediately; boot already snapshotted
+            let mut last_success = tokio::time::Instant::now();
             loop {
-                tokio::time::sleep(snapshot_interval).await;
+                ticker.tick().await;
                 let pos = server.current_seq();
+                let started = tokio::time::Instant::now();
                 match snap.write(store.as_ref(), replica.as_ref(), pos).await {
-                    Ok(n) => m.snapshot_bytes.store(n, std::sync::atomic::Ordering::Relaxed),
-                    Err(e) => eprintln!("snapshot failed: {e:#}"),
+                    Ok(n) => {
+                        m.snapshot_bytes.store(n, std::sync::atomic::Ordering::Relaxed);
+                        snap_pos.store(pos, std::sync::atomic::Ordering::Relaxed);
+                        last_success = tokio::time::Instant::now();
+                        let took = started.elapsed();
+                        if took > snapshot_interval {
+                            eprintln!(
+                                "backup cycle took {took:?} (> interval {snapshot_interval:?}); cadence is lagging"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("backup cycle failed: {e:#}");
+                        if last_success.elapsed() > wedge_limit {
+                            eprintln!(
+                                "backup wedged: no successful backup for {:?} (> {:?}); exiting so the orchestrator restarts with a fresh generation",
+                                last_success.elapsed(),
+                                wedge_limit
+                            );
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            std::process::exit(1);
+                        }
+                    }
                 }
+                m.snapshot_age_seconds.store(
+                    last_success.elapsed().as_secs(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         });
     }
@@ -975,7 +1521,6 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
     let (host, port, user, db) = (cfg.host.clone(), cfg.port, cfg.user.clone(), cfg.database.clone());
     let (slot, publication) = (cfg.slot.clone(), cfg.publication.clone());
     let (password, tls_mode) = (cfg.password.clone(), cfg.tls);
-    let mut txn_buf: Vec<(u64, LogicalEvent)> = Vec::new();
     // The stream position recorded with the replica's last committed txn —
     // carried forward across publish-skipped (already-logged) replays.
     let mut last_committed_pos: u64 = start_seq;
@@ -995,55 +1540,83 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
             }
         };
         eprintln!("replicator streaming on slot {slot}; change-stream at {change_stream_addr}");
-        // Buffer each transaction and emit it atomically at Commit. Dedup is at
-        // transaction granularity using the Commit's LSN — which is distinct and
-        // monotonic, unlike per-event `wal_start` (Begin and the first change share
-        // an LSN, and Relation messages carry 0). On restart the slot re-delivers
-        // whole committed transactions; we skip those already durably logged
-        // (commit LSN <= `dedup_lsn`) so each change keeps a stable pos.
-        txn_buf.clear(); // discard any partial txn from a dropped connection
+        // STREAMING per-transaction pipeline (audit Tier 1.2): a Begin's
+        // position is the transaction's COMMIT LSN (`final_lsn`), so both
+        // decisions — publish (> `dedup_lsn`: not yet durably logged) and
+        // apply (> `apply_watermark`: not yet in the replica) — are made
+        // upfront, and every event flows straight through: applied into the
+        // open storage transaction and published to the stream AS IT ARRIVES.
+        // Nothing is buffered, so a 100 MB upstream transaction costs O(one
+        // event) replicator memory instead of being fully resident. The
+        // replicator serves no client pipelines, so a mid-transaction cut is
+        // a plain storage rollback; consumers discard the partial publish at
+        // the re-delivered Begin.
+        //
+        // Crash-recovery invariant: the replica commits synchronously BEFORE
+        // the changelog's async flush, so `apply_watermark >= dedup_lsn` — a
+        // re-delivered txn may need publishing (to fill the log) without
+        // re-applying over newer state.
+        let mut txn: Option<(u64, bool, bool)> = None; // (final_lsn, publish, apply)
         loop {
+            // Apply errors are fatal (rollback + clean error return): never
+            // commit a watermark over a torn apply, never panic.
             match stream.next_event().await {
-                Ok((lsn, LogicalEvent::Commit)) => {
-                    // With a durable replica, "already applied" (its recorded
-                    // watermark) and "already published/durably logged"
-                    // (`dedup_lsn`, the changelog checkpoint) can diverge after
-                    // a crash. Invariant: the replica commits synchronously
-                    // BEFORE the changelog's async flush, so
-                    // `apply_watermark >= dedup_lsn` — a re-delivered txn may
-                    // need publishing (to fill the log) without re-applying
-                    // over newer state.
-                    let publish = lsn > dedup_lsn;
-                    let apply = lsn > apply_watermark;
-                    if apply {
-                        replica.begin_txn();
-                    }
-                    for (l, e) in txn_buf.drain(..) {
+                Ok((final_lsn, LogicalEvent::Begin)) => {
+                    if let Some((l, _, apply)) = txn.take() {
                         if apply {
-                            replica.apply(e.clone());
+                            replica.rollback_txn();
+                        }
+                        eprintln!("discarding partial transaction at lsn {l} (upstream re-sent Begin)");
+                    }
+                    let publish = final_lsn > dedup_lsn;
+                    let apply = final_lsn > apply_watermark;
+                    if publish || apply {
+                        if apply {
+                            if let Err(err) = replica.begin_txn() {
+                                replica.rollback_txn();
+                                return Err(err.context(format!(
+                                    "replica begin_txn failed at lsn {final_lsn} (restart to re-sync)"
+                                )));
+                            }
                         }
                         if publish {
-                            // Awaits only when the durable log's byte budget is
-                            // full — the intended backpressure point that parks
-                            // WAL consumption (see changelog module doc).
-                            server.publish(l, e).await;
+                            server.publish(final_lsn, LogicalEvent::Begin).await;
                         }
-                    }
-                    if publish {
-                        server.publish(lsn, LogicalEvent::Commit).await;
-                        dedup_lsn = lsn;
-                    }
-                    if apply {
-                        replica.apply(LogicalEvent::Commit);
-                        // The pump is single-threaded, so right after
-                        // publishing, `current_seq()` is exactly this commit's
-                        // stream position. On a publish-skip replay, carry the
-                        // previous position (a safe, idempotent resume point).
-                        let pos =
-                            if publish { server.current_seq() } else { last_committed_pos };
-                        replica.commit_txn(lsn, pos);
-                        apply_watermark = lsn;
-                        last_committed_pos = pos;
+                        txn = Some((final_lsn, publish, apply));
+                    } // else: whole txn already applied AND logged — skip its events
+                }
+                Ok((_lsn, LogicalEvent::Commit)) => {
+                    if let Some((final_lsn, publish, apply)) = txn.take() {
+                        if publish {
+                            server.publish(final_lsn, LogicalEvent::Commit).await;
+                            dedup_lsn = final_lsn;
+                        }
+                        if apply {
+                            if let Err(err) = replica
+                                .apply(LogicalEvent::Commit)
+                                .and_then(|()| {
+                                    // The pump is single-threaded, so right after
+                                    // publishing, `current_seq()` is exactly this
+                                    // commit's stream position. On a publish-skip
+                                    // replay, carry the previous position (a safe,
+                                    // idempotent resume point).
+                                    let pos = if publish {
+                                        server.current_seq()
+                                    } else {
+                                        last_committed_pos
+                                    };
+                                    replica.commit_txn(final_lsn, pos)?;
+                                    apply_watermark = final_lsn;
+                                    last_committed_pos = pos;
+                                    Ok(())
+                                })
+                            {
+                                replica.rollback_txn();
+                                return Err(err.context(format!(
+                                    "replica commit failed at lsn {final_lsn}; rolled back (restart to re-sync)"
+                                )));
+                            }
+                        }
                     }
                     // Ack only durably-logged WAL: with a durable log, the
                     // writer's flushed watermark; without one (ring-only mode,
@@ -1056,8 +1629,31 @@ async fn run_replicator_inner<O: ObjectStore + 'static, S: SnapshotStrategy + 's
                         None => stream.confirm(dedup_lsn),
                     }
                 }
-                Ok((lsn, ev)) => txn_buf.push((lsn, ev)),
+                Ok((l, ev)) => {
+                    if let Some((final_lsn, publish, apply)) = txn.as_ref() {
+                        if *apply {
+                            if let Err(err) = replica.apply(ev.clone()) {
+                                let fl = *final_lsn;
+                                replica.rollback_txn();
+                                return Err(err.context(format!(
+                                    "replica apply failed at lsn {fl}; rolled back (restart to re-sync)"
+                                )));
+                            }
+                        }
+                        if *publish {
+                            // Awaits only when the durable log's byte budget is
+                            // full — the intended backpressure point that parks
+                            // WAL consumption (see changelog module doc).
+                            server.publish(l, ev).await;
+                        }
+                    }
+                }
                 Err(e) => {
+                    if let Some((_, _, apply)) = txn.take() {
+                        if apply {
+                            replica.rollback_txn();
+                        }
+                    }
                     eprintln!("replication stream error ({e:#}); reconnecting in 2s");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     break;
@@ -1109,7 +1705,7 @@ pub async fn run_view_syncer_sqlite<O: ObjectStore + 'static>(
             change_stream_addr,
             mutators,
             queries,
-            Rc::new(SqliteSnapshots { cfg: sqlite }),
+            Rc::new(SqliteSnapshots::new(sqlite)),
         ))
         .await
 }
@@ -1164,7 +1760,7 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
     let mutators = Rc::new(mutators);
     let queries = Rc::new(queries);
     let forwarder = Rc::new(crate::forward::Forwarder::new(cfg.forward_config()));
-    let (ticks_tx, _) = broadcast::channel::<()>(1024);
+    let (ticks_tx, _) = broadcast::channel::<crate::server::Tick>(1024);
     // Per-client lastMutationIDs, advanced from replicated `orbit_client_mutations`
     // events forwarded through the change-stream.
     let lmids: crate::server::LmidMap = Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
@@ -1227,51 +1823,86 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
                     }
                 };
                 let reconnect_watermark = watermark;
-                let mut dirty = false;
-                // Buffer each transaction and apply it in one synchronous slice
-                // (no awaits between events): a concurrent `subscribe` hydration
-                // on this LocalSet can then never read a torn mid-transaction
-                // state that existed in no Postgres snapshot.
-                let mut txn_buf: Vec<(u64, LogicalEvent)> = Vec::new();
+                let mut last_ack = std::time::Instant::now();
+                // One transaction at a time. Small transactions buffer and
+                // apply in one synchronous slice at Commit (no awaits between
+                // events → a concurrent `subscribe` hydration on this LocalSet
+                // can never read a torn mid-transaction state). Transactions
+                // beyond the buffer cap STREAM through bounded memory under
+                // the node's replica-consistency write lock, which parks
+                // hydrations and tick flushes for the transaction's duration
+                // instead (audit Tier 1.2 — previously every view-syncer held
+                // the entire transaction in RAM simultaneously).
+                let mut txn: Option<TxnApply> = None;
                 loop {
                     match client.next().await {
                         Ok(Some(ChangeMsg::Change { pos, event })) => {
                             if matches!(event, LogicalEvent::Begin) {
-                                txn_buf.clear();
-                            }
-                            let is_commit = matches!(event, LogicalEvent::Commit);
-                            txn_buf.push((pos, event));
-                            if !is_commit {
+                                if let Some(t) = txn.take() {
+                                    if t.abort(replica.as_ref()) {
+                                        // Streamed pushes can't be un-pushed
+                                        // from live pipelines: crash-only.
+                                        eprintln!("partial streamed transaction cut by upstream; exiting to re-restore snapshot");
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                        std::process::exit(1);
+                                    }
+                                }
+                                txn = Some(TxnApply::new());
                                 continue;
                             }
-                            // One storage transaction per upstream transaction:
-                            // a durable backend records its applied position
-                            // (`commit_txn(0, watermark)`) atomically with the
-                            // rows, enabling delta resume from the local file.
-                            replica.begin_txn();
-                            for (p, ev) in txn_buf.drain(..) {
-                                if matches!(
-                                    ev,
-                                    LogicalEvent::Insert { .. } | LogicalEvent::Update { .. } | LogicalEvent::Delete { .. }
-                                ) {
-                                    dirty = true;
+                            if !matches!(event, LogicalEvent::Commit) {
+                                // Tolerate a resume that lands mid-stream
+                                // without a Begin (legacy replicators):
+                                // open a transaction implicitly.
+                                let t = txn.get_or_insert_with(TxnApply::new);
+                                if let Err(e) = t.push(replica.as_ref(), &lmids, event).await {
+                                    replica.rollback_txn();
+                                    eprintln!("replica apply error: {e:#}; rolled back; exiting to re-restore snapshot");
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    std::process::exit(1);
                                 }
-                                crate::server::capture_lmid(&ev, &lmids);
-                                replica.apply(ev);
-                                watermark = p;
+                                continue;
                             }
-                            replica.commit_txn(0, watermark);
+                            // Commit: one storage transaction per upstream
+                            // transaction — a durable backend records its
+                            // applied position (`commit_txn(0, watermark)`)
+                            // atomically with the rows, enabling delta resume
+                            // from the local file.
+                            let Some(t) = txn.take() else {
+                                watermark = pos;
+                                continue;
+                            };
+                            match t.commit(replica.as_ref(), &lmids, 0, pos) {
+                                Ok(tick) => {
+                                    watermark = pos;
+                                    if let Some(tick) = tick {
+                                        let _ = ticks_tx.send(tick);
+                                    }
+                                }
+                                Err(e) => {
+                                    // Same crash-only policy as Reset: rollback,
+                                    // exit, restore fresh — never serve a torn or
+                                    // silently-stale replica.
+                                    replica.rollback_txn();
+                                    eprintln!("replica apply error: {e:#}; rolled back; exiting to re-restore snapshot");
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    std::process::exit(1);
+                                }
+                            }
                             replica_pos.set(watermark);
                             metrics.replica_pos.store(watermark, std::sync::atomic::Ordering::Relaxed);
+                            // Throttled ack: tells the replicator how far this
+                            // node has durably applied, so log pruning keeps
+                            // what live subscribers still need (Tier 1.6).
+                            if last_ack.elapsed() >= Duration::from_secs(2) {
+                                let _ = client.ack(watermark).await;
+                                last_ack = std::time::Instant::now();
+                            }
                             // Mixed-version fallback: an old replicator never
                             // sends CaughtUp — the first applied live commit
                             // still proves we're current.
                             metrics.mark_ready(crate::metrics::ReadyComponent::CaughtUp);
                             stuck_failures = 0;
-                            if dirty {
-                                let _ = ticks_tx.send(());
-                                dirty = false;
-                            }
                         }
                         Ok(Some(ChangeMsg::CaughtUp { .. })) => {
                             // Backlog replayed — this node serves current data.
@@ -1311,6 +1942,17 @@ async fn run_view_syncer_inner<O: ObjectStore + 'static, S: SnapshotStrategy + '
                             eprintln!("change-stream read error: {e:#}; reconnecting");
                             break;
                         }
+                    }
+                }
+                // Disconnected mid-transaction: a buffered transaction aborts
+                // for free (replay resumes from the committed watermark); a
+                // STREAMED one has already pushed into live pipelines and
+                // cannot be un-pushed — crash-only.
+                if let Some(t) = txn.take() {
+                    if t.abort(replica.as_ref()) {
+                        eprintln!("disconnected mid streamed transaction; exiting to re-restore snapshot");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        std::process::exit(1);
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
